@@ -16,7 +16,7 @@ release-wiring work to completion.
 
 The build-pipeline files exist **only** on the fork's `main` branch:
 `release.yml`, `appstore.yml`, `sync-upstream.yml`, and vendored build-only files
-(e.g. `LICENSE-GPL3.txt`). They are **not** on `add-pcap-builds` and we must
+(e.g. the generated `COMBINED-LICENSE.txt`). They are **not** on `add-pcap-builds` and we must
 **not** merge `origin/main` to pull them in.
 
 Work therefore splits by file type:
@@ -218,7 +218,7 @@ can verify locally (build/logic); 🧪 = needs your hands-on test on that OS.
 
 ## Licensing summary (clean except Windows-Npcap)
 
-- IRIS core: **BSD-3-Clause** (`LICENSE`; `LICENSE-GPL3.txt` is for the CHD path, orthogonal).
+- IRIS core: **BSD-3-Clause** (`LICENSE`). The CHD path (`libchdman-rs` >= 0.288.8 and the MAME CHD core it vendors) is also **BSD-3-Clause** — see `LICENSE-libchdman-rs.txt`. (Earlier `0.287.0-l7` builds were GPL-3.0 via `LICENSE-GPL3.txt`; no longer required.)
 - `pcap` crate: **MIT OR Apache-2.0**.
 - libpcap (Linux/macOS): **BSD-3-Clause** — bundle in AppImage / depend in deb/rpm; ships in macOS.
 - Windows **Npcap**: proprietary, **redistribution forbidden** — never bundle; user installs it.

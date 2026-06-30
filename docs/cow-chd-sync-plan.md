@@ -136,7 +136,7 @@ only the sync *presentation* differs per frontend.
 - How MAME does writable CHDs (the model we follow): compressed CHD → read-only,
   writes go to an uncompressed differencing CHD (`.dif`) with the original as
   parent; never auto-merged. Uncompressed CHD → in place.
-- `libchdman-rs` (pinned `0.287.0-l7`, `prebuilt`) already provides everything
+- `libchdman-rs` (pinned `0.288.8`, `prebuilt`) already provides everything
   in-process (no shelling to `chdman`):
   - `HdImage::open(path)` — writable in place; **succeeds only for uncompressed**.
   - `HdImage::open_with_diff(parent, diff)` — open parent read-only, create an

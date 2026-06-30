@@ -1423,7 +1423,7 @@ impl App {
                 ui.separator();
                 ui.label(RichText::new("Legal").strong());
                 if ui.button("Licenses…")
-                    .on_hover_text("BSD 3-Clause (IRIS) — plus GPL-3.0 for the CHD backend when built in")
+                    .on_hover_text("BSD 3-Clause (IRIS, and the CHD backend when built in)")
                     .clicked()
                 {
                     self.show_license = true;
@@ -2443,10 +2443,10 @@ impl App {
     /// Paths are relative to this source file (`iris-gui/src/main.rs`).
     fn license_window(&mut self, ctx: &egui::Context) {
         const LICENSE_BSD: &str = include_str!("../../LICENSE");
-        // The CHD backend (libchdman-rs) is GPL-3.0, so any CHD build is conveyed
-        // under GPL-3.0 — mirrors the release pipeline shipping LICENSE-GPL3.txt
-        // alongside LICENSE. Shown only when CHD support is actually built in.
-        const LICENSE_GPL3: &str = include_str!("../../LICENSE-GPL3.txt");
+        // The CHD backend (libchdman-rs >= 0.288.8) is BSD-3-Clause, as is the
+        // MAME CHD core it vendors, so a CHD build stays fully BSD-3-Clause.
+        // Shown only when CHD support is actually built in.
+        const LICENSE_CHD: &str = include_str!("../../LICENSE-libchdman-rs.txt");
         if !self.show_license { return; }
         let chd = iris::build_features::CHD;
         let mut open = true;
@@ -2461,8 +2461,8 @@ impl App {
                 if chd {
                     ui.label(
                         "This build includes CHD disk support via libchdman-rs, which is licensed \
-                         under the GNU GPL-3.0 — so the combined binary is conveyed under GPL-3.0. \
-                         Both licenses apply and are shown below.");
+                         under the BSD 3-Clause License (as is the MAME CHD core it vendors), so \
+                         the whole binary stays BSD 3-Clause. Its notice is shown below.");
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -2481,14 +2481,9 @@ impl App {
                     if chd {
                         ui.add_space(12.0);
                         ui.separator();
-                        ui.label(RichText::new("CHD backend (libchdman-rs) — GNU GPL-3.0").strong());
-                        ui.horizontal(|ui| {
-                            ui.label("Full text also at");
-                            ui.hyperlink_to("gnu.org/licenses/gpl-3.0",
-                                "https://www.gnu.org/licenses/gpl-3.0.html");
-                        });
+                        ui.label(RichText::new("CHD backend (libchdman-rs) — BSD 3-Clause").strong());
                         ui.add_space(2.0);
-                        ui.label(RichText::new(LICENSE_GPL3).monospace());
+                        ui.label(RichText::new(LICENSE_CHD).monospace());
                     }
                 });
             });

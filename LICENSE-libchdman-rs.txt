@@ -1,0 +1,58 @@
+Third-party license — CHD disk-image backend
+=============================================
+
+The optional `--features chd` build links the `libchdman-rs` crate, a Rust
+wrapper around MAME's CHD (Compressed Hunks of Data) core. As of
+libchdman-rs 0.288.8 the crate and the CHD core files it vendors are
+distributed under the BSD 3-Clause License (the same family as IRIS itself),
+so enabling CHD support no longer subjects the combined binary to the GPL.
+
+The MAME project as a whole is distributed under GPL-2.0-or-later, but that is
+an aggregate license. The specific CHD core files vendored and compiled by
+libchdman-rs each carry an individual `// license:BSD-3-Clause` SPDX header,
+and the bundled compression codecs are likewise permissive (zlib and
+Zstandard — BSD-3-Clause, libFLAC — BSD-3-Clause, LZMA — Public Domain,
+utf8proc — MIT).
+
+--------------------------------------------------------------------------------
+libchdman-rs (Rust wrapper + prebuilt static archives)
+  https://github.com/danifunker/libchdman-rs
+  https://crates.io/crates/libchdman-rs
+
+BSD 3-Clause License
+
+Copyright (c) 2026 Dani Sarfati (danifunker)
+
+--------------------------------------------------------------------------------
+MAME CHD core (vendored and compiled by libchdman-rs)
+
+BSD 3-Clause License
+
+Copyright (c) Aaron Giles and the MAME contributors
+
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
