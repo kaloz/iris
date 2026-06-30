@@ -26,6 +26,18 @@
   #define LicenseFile "..\COMBINED-LICENSE.txt"
 #endif
 
+; Target architecture of the bundled iris-gui.exe. CI passes /DTargetArch=x64 or
+; /DTargetArch=arm64; the installer then refuses to run on the wrong arch (the
+; payload is arch-specific). Maps to the Inno Setup architecture identifiers.
+#ifndef TargetArch
+  #define TargetArch "x64"
+#endif
+#if TargetArch == "arm64"
+  #define ArchIdentifier "arm64"
+#else
+  #define ArchIdentifier "x64compatible"
+#endif
+
 #define MyAppName "IRIS"
 #define MyAppPublisher "Dani Sarfati"
 #define MyAppURL "https://github.com/danifunker/iris"
@@ -41,6 +53,10 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases
 LicenseFile={#LicenseFile}
+; Restrict to the arch of the bundled binary (x64compatible covers x64 hosts and
+; x64-on-arm64 emulation; arm64 is native ARM64). 64-bit install mode either way.
+ArchitecturesAllowed={#ArchIdentifier}
+ArchitecturesInstallIn64BitMode={#ArchIdentifier}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ; Use the "auto" Program Files constant so the destination follows the install
