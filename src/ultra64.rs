@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use shared_memory::ShmemConf;
 use raw_sync::{events::{Event, EventImpl, EventInit, EventState}, Timeout};
+// Only used for the POSIX `shm_unlink` stale-cleanup below (itself `cfg(unix)`).
+// Windows shared memory is OS-refcounted and released when handles close.
 #[cfg(unix)]
 use libc;
 
