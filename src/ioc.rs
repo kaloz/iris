@@ -88,6 +88,23 @@ pub mod map_regs {
     // dispatched via lcl2_intr → fires as L0/IP2 (VECTOR_GIOEXP0 = 22 = lcl_id 2, level 6).
     pub const GIO_EXP0: u8  = 1 << 6;
     pub const GIO_EXP1: u8  = 1 << 7;
+    // IP22 fullhouse: same MAP bits 6–7 are GFX FIFO drain feedback (not expansion).
+    pub const GFX_DRAIN0: u8 = 1 << 6;
+    pub const GFX_DRAIN1: u8 = 1 << 7;
+}
+
+/// IP22 fullhouse EXTIO register (Linux `sgioc->extio`). Shared GIO interrupt
+/// lines from the graphics slot (SG) and expansion slot 0 (S0) are latched here;
+/// `gc_select` bit 0 chooses which slot feeds L0/L1 FIFO/GFX/retrace bits.
+pub mod extio_regs {
+    pub const SG_RETRACE: u32 = 1 << 8;
+    pub const SG_IRQ_1: u32   = 1 << 9;  // gfx.int → L0 GRAPHICS
+    pub const SG_IRQ_2: u32   = 1 << 10; // gfx.fifofull → L0 FIFO_FULL
+    pub const S0_RETRACE: u32 = 1 << 12;
+    pub const S0_IRQ_1: u32   = 1 << 13;
+    pub const S0_IRQ_2: u32   = 1 << 14;
+    pub const SG_MASK: u32    = SG_RETRACE | SG_IRQ_1 | SG_IRQ_2;
+    pub const S0_MASK: u32    = S0_RETRACE | S0_IRQ_1 | S0_IRQ_2;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,6 +132,10 @@ pub enum IocInterrupt {
     KbMouse,
     GioExp0,    // LIO_GIO_EXP0 = bit 6 — GIO expansion slot 0 (Indy IP24)
     GioExp1,    // LIO_GIO_EXP1 = bit 7 — GIO expansion slot 1
+    /// IP22 fullhouse: vertical retrace from expansion slot 0 (extio S0_RETRACE).
+    GioExp0Retrace,
+    GfxDrain0,  // LIO_DRAIN0 = bit 6 — GFX FIFO drain (Indigo2 fullhouse)
+    GfxDrain1,  // LIO_DRAIN1 = bit 7 — second head drain (Indigo2 fullhouse)
     Mappable0,  // Timer 0
     Mappable1,  // Timer 1
     Mappable2,
@@ -137,6 +158,10 @@ struct IocState {
 
     // Misc Registers
     gc_select: u8,
+    /// Fullhouse EXTIO shadow — shared GIO IRQ latch before gc_select mux.
+    extio: u32,
+    /// IP22 fullhouse (Indigo2) — enables EXTIO/gc_select IRQ mux.
+    fullhouse: bool,
     gen_cntl: u8,
     panel: u8,
     read_reg: u8,
@@ -228,6 +253,8 @@ impl Ioc {
             map_pol: 0,
             err_stat: 0,
             gc_select: 0,
+            extio: 0,
+            fullhouse: !guinness,
             gen_cntl: 0,
             panel: 1, // Power State (Bit 0) = 1 (On)
             read_reg: 0x70, // Ethernet/SCSI Power Good (Bits 6,5,4 = 1)
@@ -302,16 +329,34 @@ impl Ioc {
         let mut state = self.state.lock();
         match source {
             // Local 0
-            IocInterrupt::Graphics => if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS },
+            IocInterrupt::Graphics => {
+                if self.guinness {
+                    if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS }
+                } else {
+                    state.set_extio_sg(extio_regs::SG_IRQ_1, active);
+                }
+            }
             IocInterrupt::Parallel => if active { state.l0_stat |= l0_regs::PARALLEL } else { state.l0_stat &= !l0_regs::PARALLEL },
             IocInterrupt::McDma => if active { state.l0_stat |= l0_regs::MC_DMA } else { state.l0_stat &= !l0_regs::MC_DMA },
             IocInterrupt::Ethernet => if active { state.l0_stat |= l0_regs::ETHERNET } else { state.l0_stat &= !l0_regs::ETHERNET },
             IocInterrupt::Scsi1 => if active { state.l0_stat |= l0_regs::SCSI1 } else { state.l0_stat &= !l0_regs::SCSI1 },
             IocInterrupt::Scsi0 => if active { state.l0_stat |= l0_regs::SCSI0 } else { state.l0_stat &= !l0_regs::SCSI0 },
-            IocInterrupt::FifoFull => if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL },
+            IocInterrupt::FifoFull => {
+                if self.guinness {
+                    if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL }
+                } else {
+                    state.set_extio_sg(extio_regs::SG_IRQ_2, active);
+                }
+            }
 
             // Local 1
-            IocInterrupt::VerticalRetrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
+            IocInterrupt::VerticalRetrace => {
+                if self.guinness {
+                    if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE }
+                } else {
+                    state.set_extio_sg(extio_regs::SG_RETRACE, active);
+                }
+            }
             IocInterrupt::VideoVsync => if active { state.l1_stat |= l1_regs::VIDEO_VSYNC } else { state.l1_stat &= !l1_regs::VIDEO_VSYNC },
             IocInterrupt::AcFail => if active { state.l1_stat |= l1_regs::AC_FAIL } else { state.l1_stat &= !l1_regs::AC_FAIL },
             IocInterrupt::HpcDma => if active { state.l1_stat |= l1_regs::HPC_DMA } else { state.l1_stat &= !l1_regs::HPC_DMA },
@@ -323,9 +368,32 @@ impl Ioc {
             IocInterrupt::Serial  => if active { state.map_stat |= map_regs::SERIAL    } else { state.map_stat &= !map_regs::SERIAL    },
             IocInterrupt::KbMouse => if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
             IocInterrupt::GioExp0 => {
-                if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
+                if self.guinness {
+                    if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
+                } else {
+                    state.set_extio_s0(extio_regs::S0_IRQ_1, active);
+                }
             }
-            IocInterrupt::GioExp1 => if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 },
+            IocInterrupt::GioExp0Retrace => {
+                if !self.guinness {
+                    state.set_extio_s0(extio_regs::S0_RETRACE, active);
+                }
+            }
+            IocInterrupt::GioExp1 => {
+                if self.guinness {
+                    if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 }
+                }
+            }
+            IocInterrupt::GfxDrain0 => {
+                if !self.guinness {
+                    if active { state.map_stat |= map_regs::GFX_DRAIN0 } else { state.map_stat &= !map_regs::GFX_DRAIN0 }
+                }
+            }
+            IocInterrupt::GfxDrain1 => {
+                if !self.guinness {
+                    if active { state.map_stat |= map_regs::GFX_DRAIN1 } else { state.map_stat &= !map_regs::GFX_DRAIN1 }
+                }
+            }
             IocInterrupt::Mappable0 => if active { state.map_stat |= 1 << 0 } else { state.map_stat &= !(1 << 0) },
             IocInterrupt::Mappable1 => if active { state.map_stat |= 1 << 1 } else { state.map_stat &= !(1 << 1) },
             IocInterrupt::Mappable2 => if active { state.map_stat |= 1 << 2 } else { state.map_stat &= !(1 << 2) },
@@ -432,8 +500,8 @@ impl Device for Ioc {
             let _ = writeln!(writer, "  MAP_POL={:02x}  ERR_STAT={:02x}", s.map_pol, s.err_stat);
             let _ = writeln!(writer, "  CPU IP lines: IP2={} IP3={} IP4=TMR0:{} IP5=TMR1:{} IP6=ERR:{}",
                 ip2, ip3, ip4, ip5, ip6);
-            let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
-                s.sys_id, s.gc_select, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
+            let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} extio={:08x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
+                s.sys_id, s.gc_select, s.extio, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
             if let Some(ints) = &s.interrupts {
                 let raw = ints.load(Ordering::SeqCst);
                 let _ = writeln!(writer, "  Atomic interrupts word: {:016x}  (IP2={} IP3={} IP4={} IP5={} IP6={} IP7=TMR:{})",
@@ -568,7 +636,10 @@ impl BusDevice for Ioc {
                 state.map_stat &= !(val & 0x3);
             }
 
-            IOC_GC_SELECT => state.gc_select = val,
+            IOC_GC_SELECT => {
+                state.gc_select = val;
+                state.apply_extio_fanout();
+            }
             IOC_GEN_CNTL => state.gen_cntl = val,
             IOC_PANEL => {
                 // Bits 6, 4, 1 are W1C (Write 1 to Clear)
@@ -640,6 +711,41 @@ impl BusDevice for Ioc {
 }
 
 impl IocState {
+    fn set_extio_sg(&mut self, mask: u32, active: bool) {
+        if active { self.extio |= mask; } else { self.extio &= !mask; }
+        self.apply_extio_fanout();
+    }
+
+    fn set_extio_s0(&mut self, mask: u32, active: bool) {
+        if active { self.extio |= mask; } else { self.extio &= !mask; }
+        self.apply_extio_fanout();
+    }
+
+    /// Route shared GIO IRQ lines through gc_select (bit 0: 0 = SG/gfx slot, 1 = S0).
+    fn apply_extio_fanout(&mut self) {
+        if !self.fullhouse {
+            return;
+        }
+        let sel = self.extio
+            & if self.gc_select & 1 == 0 { extio_regs::SG_MASK } else { extio_regs::S0_MASK };
+
+        if sel & (extio_regs::SG_IRQ_2 | extio_regs::S0_IRQ_2) != 0 {
+            self.l0_stat |= l0_regs::FIFO_FULL;
+        } else {
+            self.l0_stat &= !l0_regs::FIFO_FULL;
+        }
+        if sel & (extio_regs::SG_IRQ_1 | extio_regs::S0_IRQ_1) != 0 {
+            self.l0_stat |= l0_regs::GRAPHICS;
+        } else {
+            self.l0_stat &= !l0_regs::GRAPHICS;
+        }
+        if sel & (extio_regs::SG_RETRACE | extio_regs::S0_RETRACE) != 0 {
+            self.l1_stat |= l1_regs::VERTICAL_RETRACE;
+        } else {
+            self.l1_stat &= !l1_regs::VERTICAL_RETRACE;
+        }
+    }
+
     fn update_interrupts(&mut self) {
         // 1. Update Mappable Interrupts (MAP_INT0, MAP_INT1)
         let map_int0 = (self.map_stat & self.map_mask0) != 0;
@@ -721,6 +827,7 @@ impl Resettable for Ioc {
         state.map_pol = 0;
         state.err_stat = 0;
         state.gc_select = 0;
+        state.extio = 0;
         state.gen_cntl = 0;
         state.panel = 1;        // power-on: power state bit = 1
         state.read_reg = 0x70;  // ethernet/SCSI power good
@@ -742,7 +849,8 @@ impl Saveable for Ioc {
         macro_rules! u8f { ($f:ident) => { tbl.insert(stringify!($f).into(), hex_u8(state.$f)); } }
         u8f!(l0_stat); u8f!(l0_mask); u8f!(l1_stat); u8f!(l1_mask);
         u8f!(map_stat); u8f!(map_mask0); u8f!(map_mask1); u8f!(map_pol); u8f!(err_stat);
-        u8f!(gc_select); u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
+        u8f!(gc_select); tbl.insert("extio".into(), toml::Value::String(format!("0x{:08x}", state.extio)));
+        u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
         u8f!(dma_sel); u8f!(reset_reg); u8f!(write_reg);
         toml::Value::Table(tbl)
     }
@@ -754,8 +862,17 @@ impl Saveable for Ioc {
         }}
         ldu8!(l0_stat); ldu8!(l0_mask); ldu8!(l1_stat); ldu8!(l1_mask);
         ldu8!(map_stat); ldu8!(map_mask0); ldu8!(map_mask1); ldu8!(map_pol); ldu8!(err_stat);
-        ldu8!(gc_select); ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
+        ldu8!(gc_select);
+        if let Some(x) = get_field(v, "extio") {
+            if let Some(s) = x.as_str() {
+                state.extio = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(state.extio);
+            } else if let Some(n) = x.as_integer() {
+                state.extio = n as u32;
+            }
+        }
+        ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
         ldu8!(dma_sel); ldu8!(reset_reg); ldu8!(write_reg);
+        state.apply_extio_fanout();
         state.update_interrupts();
         Ok(())
     }

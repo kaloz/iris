@@ -5,11 +5,9 @@
 /// `videopanel` clients write CDMC registers to adjust brightness, hue,
 /// saturation, gamma, etc.
 ///
-/// Fake device: register storage + I2C state machine only.  No real image
-/// processing — VINO upstream gets pixels from the configured `VideoSource`
-/// regardless of CDMC settings.  Honest stub: lets IRIX drivers probe and
-/// configure without errors; visual effect of register changes is not (yet)
-/// reflected in the captured pixels.
+/// Fake device: register storage + I2C state machine.  `apply_uyvy_field` applies
+/// gain/balance/saturation/shutter exposure to host camera pixels via
+/// `CdmcAdjustedSource` in `video_source.rs`.
 ///
 /// I2C address: 0x56 write / 0x57 read (7-bit address 0x2B).
 ///
@@ -205,6 +203,47 @@ impl Cdmc {
 
     pub fn i2c_stop(&self) {
         self.state.lock().i2c_state = I2cState::Idle;
+    }
+
+    /// Snapshot of image-control registers for the video pixel pipeline.
+    pub fn regs_copy(&self) -> [u8; reg::COUNT] {
+        self.state.lock().regs
+    }
+
+    /// Apply CDMC brightness / colour balance to a packed UYVY field in-place.
+    pub fn apply_uyvy_field(pixels: &mut [u8], regs: &[u8; reg::COUNT]) {
+        // GAIN 0x00..=0xFF maps roughly to 0.5×..1.5× luma; 0x80 = unity.
+        let gain = regs[reg::GAIN as usize] as i32;
+        let luma_scale = (gain as f32 - 128.0) / 128.0 + 1.0;
+        let red_bias = (regs[reg::RED_BAL as usize] as i32 - 128) as f32 / 128.0;
+        let blue_bias = (regs[reg::BLUE_BAL as usize] as i32 - 128) as f32 / 128.0;
+        let red_sat = (regs[reg::RED_SAT as usize] as i32 - 128) as f32 / 256.0;
+        let blue_sat = (regs[reg::BLUE_SAT as usize] as i32 - 128) as f32 / 256.0;
+        let shutter = ((regs[reg::SHUTTER_HI as usize] as u16) << 8)
+            | regs[reg::SHUTTER_LO as usize] as u16;
+        // Shutter 0 = auto; non-zero scales exposure down (preview approximation).
+        let exposure = if shutter == 0 {
+            1.0f32
+        } else {
+            (65535.0 / shutter as f32).clamp(0.25, 2.0)
+        };
+
+        for c in pixels.chunks_mut(4) {
+            let u = c[0] as f32;
+            let y = c[1] as f32;
+            let v = c[2] as f32;
+            let y2 = c[3] as f32;
+
+            let y_adj = ((y - 16.0) * luma_scale * exposure + 16.0).clamp(0.0, 235.0);
+            let y2_adj = ((y2 - 16.0) * luma_scale * exposure + 16.0).clamp(0.0, 235.0);
+            let u_adj = (u + blue_bias * 32.0 + blue_sat * (u - 128.0)).clamp(0.0, 255.0);
+            let v_adj = (v + red_bias * 32.0 + red_sat * (v - 128.0)).clamp(0.0, 255.0);
+
+            c[0] = u_adj as u8;
+            c[1] = y_adj as u8;
+            c[2] = v_adj as u8;
+            c[3] = y2_adj as u8;
+        }
     }
 
     // ── Register write ────────────────────────────────────────────────────

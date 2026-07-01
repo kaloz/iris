@@ -74,3 +74,9 @@ if is_compilable_for_tier(&delay_d, tier) && !delay_can_fault {
 in_delay_slot. exec.step() re-executes as a non-delay-slot instruction.
 handle_exception sets cp0_epc to the instruction PC (not the branch PC) and
 doesn't set the BD bit. On ERET, the branch is permanently skipped.
+
+## Phase 3 TOML toggle
+
+`[jit] compile_stores = true` clears `IRIS_JIT_NO_STORES` at startup via `JitConfig::apply_env()`.
+Leave **false** (default) until the memory undo-log research branch lands — see isolation matrix above.
+When enabled, monitor with `perf snapshot` and GL smoke (`glxgears`, `medialab`).

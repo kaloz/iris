@@ -16,6 +16,7 @@ pub mod build_features {
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.
     pub const LIGHTNING: bool = cfg!(feature = "lightning");
+    pub const IDLE_PAUSE: bool = cfg!(feature = "idle-pause");
     /// The emulated CPU, fixed at build time (the cache model differs deeply
     /// between the R4400 and R5000, so it's a compile-time choice, not a runtime
     /// setting). `r5k` selects the R5000; `r5ksc`/`r5ksc_triton` add a secondary
@@ -74,10 +75,13 @@ pub mod hal2;
 pub mod ps2;
 pub mod ui;
 pub mod rex3;
+pub mod rex3_simd;
 pub mod compositor;
 pub mod gl_compositor;
+pub mod headless_gl;
 pub mod debug_overlay;
 pub mod vc2;
+pub mod vc2_timings;
 pub mod xmap9;
 pub mod cmap;
 pub mod bt445;
@@ -89,9 +93,13 @@ pub mod sgi_vh;
 pub mod chunk_store;
 pub mod validate;
 pub mod registry;
+pub mod thread_affinity;
+pub mod perf_monitor;
 pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;
+#[cfg(feature = "idle-pause")]
+pub mod idle_park;
 pub mod vga_font;
 pub mod cdmc;
 #[cfg(feature = "camera")]
@@ -99,9 +107,14 @@ pub mod camera;
 pub mod saa7191;
 pub mod video_source;
 pub mod vino;
+pub mod xz;
+pub mod mgras;
 pub mod ultra_proto;
 pub mod ultra64;
 #[cfg(feature = "jit")]
 pub mod jit;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
+
+#[cfg(test)]
+mod platform_profile_tests;

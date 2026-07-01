@@ -1,11 +1,22 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use iris::config::{
-    ForwardBind, ForwardProto, MachineConfig, NetMode, NfsConfig, PortForwardConfig,
-    ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
+    ForwardBind, ForwardProto, GraphicsBoard, JitConfig, MachineConfig, MachineProfile, NetMode,
+    NfsConfig, PortForwardConfig, ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::nfsudp::NfsVersion;
+use iris::vc2_timings::NewportResolution;
+
+use crate::ram::{ram_summary, RAM_PRESETS};
+
+/// Memory-tab context: whether the VM is running and what banks were last started with.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryUiContext {
+    pub running: bool,
+    pub started_banks: Option<[u32; 4]>,
+}
 
 /// A host network interface candidate for the PCAP backend selector. This is a
 /// GUI-local, feature-independent copy of `iris::net_pcap::NetInterface` so the
@@ -117,34 +128,71 @@ impl Tab {
     }
 }
 
-/// IRIS_JIT* environment variables exposed as GUI fields. These get exported
-/// into the process env before `Machine::new` is called (whether iris is
-/// hosted in-process or spawned). All optional; empty means "leave default".
-#[derive(Debug, Clone, Default)]
+/// Legacy GUI JIT wrapper — maps to [`JitConfig`] in `MachineConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct JitEnv {
     pub iris_jit: bool,
     pub max_tier: Option<u8>,
     pub verify: bool,
     pub no_stores: bool,
+    #[serde(default)]
     pub probe: String,
+    #[serde(default)]
     pub trace_file: String,
+    #[serde(default)]
     pub profile_file: String,
     pub no_idle: bool,
+    #[serde(default)]
     pub debug_log: String,
+    #[serde(default)]
+    pub gui_gl_capture: bool,
+}
+
+impl From<&JitConfig> for JitEnv {
+    fn from(c: &JitConfig) -> Self {
+        Self {
+            iris_jit: c.enabled,
+            max_tier: Some(c.max_tier),
+            verify: c.verify,
+            no_stores: !c.compile_stores,
+            probe: c.probe.to_string(),
+            trace_file: c.trace_file.clone(),
+            profile_file: c.profile_file.clone(),
+            no_idle: c.no_idle,
+            debug_log: c.debug_log.clone(),
+            gui_gl_capture: c.gui_gl_capture,
+        }
+    }
+}
+
+impl From<&JitEnv> for JitConfig {
+    fn from(e: &JitEnv) -> Self {
+        let mut c = JitConfig {
+            enabled: e.iris_jit,
+            max_tier: e.max_tier.unwrap_or(2),
+            verify: e.verify,
+            compile_stores: !e.no_stores,
+            no_idle: e.no_idle,
+            gui_gl_capture: e.gui_gl_capture,
+            trace_file: e.trace_file.clone(),
+            profile_file: e.profile_file.clone(),
+            debug_log: e.debug_log.clone(),
+            ..JitConfig::default()
+        };
+        if let Ok(p) = e.probe.parse::<u32>() {
+            c.probe = p;
+        }
+        c
+    }
 }
 
 impl JitEnv {
-    /// Apply to current process env. Called by iris-gui before Machine::new.
     pub fn export(&self) {
-        if self.iris_jit { std::env::set_var("IRIS_JIT", "1"); }
-        if let Some(t) = self.max_tier { std::env::set_var("IRIS_JIT_MAX_TIER", t.to_string()); }
-        if self.verify    { std::env::set_var("IRIS_JIT_VERIFY", "1"); }
-        if self.no_stores { std::env::set_var("IRIS_JIT_NO_STORES", "1"); }
-        if !self.probe.is_empty()         { std::env::set_var("IRIS_JIT_PROBE", &self.probe); }
-        if !self.trace_file.is_empty()    { std::env::set_var("IRIS_JIT_TRACE", &self.trace_file); }
-        if !self.profile_file.is_empty()  { std::env::set_var("IRIS_JIT_PROFILE", &self.profile_file); }
-        if self.no_idle { std::env::set_var("IRIS_NO_IDLE", "1"); }
-        if !self.debug_log.is_empty() { std::env::set_var("IRIS_DEBUG_LOG", &self.debug_log); }
+        JitConfig::from(self).apply_env();
+    }
+
+    pub fn premiere_defaults() -> Self {
+        JitEnv::from(&JitConfig::premiere_defaults())
     }
 }
 
@@ -171,7 +219,11 @@ pub enum ConfigAction {
     EnablePacketCapture,
     /// User picked a disc image for a CD-ROM while the machine is running —
     /// send Cmd::LoadDisc immediately without waiting for restart.
-    LoadDisc { id: u8, path: String },
+    LoadDisc { id: u8, path: String, remount: bool },
+    /// Export TOML and spawn headless iris with ci=true, then iris-ci ping.
+    TestCi,
+    /// Spawn ensure-build.bat for CLI or GUI premiere profile.
+    RebuildProfile { gui: bool },
 }
 
 /// Everything a config tab hands back to the app for one frame.
@@ -190,10 +242,10 @@ pub fn show_tab(
     ui: &mut Ui,
     tab: Tab,
     cfg: &mut MachineConfig,
-    jit: &mut JitEnv,
     host: &[crate::netplan::HostIface],
     disk_folders: &[String],
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
+    mem_ctx: MemoryUiContext,
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
@@ -202,17 +254,60 @@ pub fn show_tab(
             let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces);
             TabOutcome { action: net.action.clone(), net, ..Default::default() }
         }
-        Tab::Memory  => { show_memory(ui, cfg); TabOutcome::default() }
-        Tab::Display => { show_display(ui, cfg); TabOutcome::default() }
+        Tab::Memory  => { show_memory(ui, cfg, mem_ctx); TabOutcome::default() }
+        Tab::Display => { show_display(ui, cfg, mem_ctx.running); TabOutcome::default() }
         Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
-        Tab::Debug   => { show_debug(ui, cfg, jit); TabOutcome::default() }
-        Tab::Ci      => { show_ci(ui, cfg); TabOutcome::default() }
+        Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
+        Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() }
     }).inner
 }
 
 fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     let mut action = ConfigAction::None;
     ui.heading("General");
+    ui.label(format!("Platform: {}", cfg.machine.profile.label()));
+    ComboBox::from_id_salt("machine_profile")
+        .selected_text(cfg.machine.profile.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut cfg.machine.profile, MachineProfile::IndyIp24, MachineProfile::IndyIp24.label());
+            ui.selectable_value(&mut cfg.machine.profile, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip22.label());
+        });
+    ui.label(
+        RichText::new(
+            "IRIX Software Manager and hinv report IP22 as the platform family on Indy — that is normal. \
+             IP24 is this board's product name.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.label(
+        RichText::new(
+            "The main viewport is the Newport framebuffer (X11 / gfx), not the serial console. \
+             PROM and login appear on the monitor (127.0.0.1:8888) or IRIX serial until X starts.",
+        )
+        .weak()
+        .small(),
+    );
+    if cfg.machine.profile == MachineProfile::Indigo2Ip22 {
+        ui.label(
+            RichText::new(
+                "Fullhouse layout: MC SYSID 0x10, dual GIO64, Newport XL @ gfx slot. \
+                 Same IRIX disk images as Indy. With Guest resolution, iris bootstraps \
+                 1280×1024 until IRIX programs the display.",
+            )
+            .weak()
+            .small(),
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.label("Newport heads");
+        ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
+        if cfg.graphics.heads == 2 {
+            ui.label(RichText::new("(dual-head: second REX3 @ GIO slot 1)").weak().small());
+        }
+    });
+    show_resolution_picker(ui, cfg, false);
+    ui.add_space(4.0);
     Grid::new("general_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("PROM image");
         path_row(ui, "prom", &mut cfg.prom, Pick::OpenFile, PROM_FILTERS);
@@ -260,12 +355,64 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
                  'ultra64' fork running alongside IRIS; load ROMs with `gload` from \
                  IRIX. Applies on next Start. See docs/ultra64.md.",
             );
+        ui.label(
+            RichText::new(
+                "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
+                 Platform, resolution, and Ultra64 apply on the next Stop → Start.",
+            )
+            .weak()
+            .small(),
+        );
     }
 
     action
 }
 
-fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
+    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
+    ui.horizontal(|ui| {
+        ui.label("Display resolution");
+        if !newport {
+            ui.label(
+                RichText::new("(Newport only — enable graphics, board = newport)")
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
+        ComboBox::from_id_salt("graphics_resolution")
+            .selected_text(cfg.graphics.resolution.label())
+            .show_ui(ui, |ui| {
+                for mode in [
+                    NewportResolution::Guest,
+                    NewportResolution::Res1024x768,
+                    NewportResolution::Res1280x960,
+                    NewportResolution::Res1280x1024,
+                ] {
+                    ui.selectable_value(&mut cfg.graphics.resolution, mode, mode.label());
+                }
+            });
+    });
+    if newport {
+        ui.label(
+            RichText::new(
+                "Presets program VC2 at VM Start (standard Indy 4:3 / 5:4 modes). \
+                 Guest leaves timing to IRIX/setmon. Widescreen (1080p) is not supported on Newport hardware.",
+            )
+            .weak()
+            .small(),
+        );
+        if running {
+            ui.label(
+                RichText::new("Stop the VM — resolution applies on next Start.")
+                    .color(Color32::from_rgb(220, 170, 90))
+                    .small(),
+            );
+        }
+    }
+}
+
+fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
     ui.heading("Processor");
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("CPU");
@@ -280,26 +427,69 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig) {
     ui.separator();
 
     ui.heading("Memory");
+    if mem_ctx.running {
+        ui.label(
+            RichText::new("Stop the VM to change RAM — edits apply at the next Start.")
+                .color(Color32::from_rgb(220, 170, 90)),
+        );
+        if let Some(started) = mem_ctx.started_banks {
+            if started != cfg.banks {
+                ui.label(format!(
+                    "Running guest: {} · Config (pending): {}",
+                    ram_summary(&started),
+                    ram_summary(&cfg.banks),
+                ));
+            } else {
+                ui.label(format!("Running guest: {}", ram_summary(&started)));
+            }
+        }
+    } else {
+        ui.label(RichText::new("Applied at next Start").weak());
+        ui.label(
+            RichText::new(
+                "Authentic Indy max is 256 MB. IRIX 6.5 supports 384 MB; IRIX 5.3 up to 512 MB \
+                 (emulator extended layout).",
+            )
+            .weak()
+            .small(),
+        );
+    }
+    ui.add_space(4.0);
+    ui.label("Quick presets:");
+    ui.horizontal_wrapped(|ui| {
+        for &p in RAM_PRESETS {
+            if ui
+                .add_enabled(!mem_ctx.running, egui::Button::new(format!("{p} MB")))
+                .on_disabled_hover_text("Stop the VM to change RAM")
+                .clicked()
+            {
+                cfg.banks = crate::dialogs::new_machine::distribute_ram(p);
+            }
+        }
+    });
     ui.label("RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128)");
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
         for i in 0..4 {
             ui.label(format!("Bank {i}"));
             let cur = cfg.banks[i];
-            ComboBox::from_id_salt(("bank", i)).selected_text(format!("{cur} MB"))
-                .show_ui(ui, |ui| {
-                    for &sz in VALID_BANK_SIZES {
-                        ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"));
-                    }
-                });
+            ui.add_enabled_ui(!mem_ctx.running, |ui| {
+                ComboBox::from_id_salt(("bank", i)).selected_text(format!("{cur} MB"))
+                    .show_ui(ui, |ui| {
+                        for &sz in VALID_BANK_SIZES {
+                            ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"));
+                        }
+                    });
+            });
             ui.end_row();
         }
     });
-    let total: u32 = cfg.banks.iter().sum();
-    ui.label(format!("Total: {total} MB"));
+    ui.label(format!("Total: {}", ram_summary(&cfg.banks)));
 }
 
-fn show_display(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     ui.heading("Display");
+    show_resolution_picker(ui, cfg, running);
+    ui.add_space(6.0);
     Grid::new("disp_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Window scale");
         ComboBox::from_id_salt("scale").selected_text(format!("{}×", cfg.scale))
@@ -318,6 +508,27 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig) {
         ui.checkbox(&mut cfg.no_audio, "");
         ui.end_row();
     });
+    if !cfg.no_audio {
+        ui.separator();
+        ui.heading("Audio (HAL2)");
+        ui.label(
+            RichText::new("Underrun count: monitor telnet 127.0.0.1:8888 → hal2 status")
+                .weak()
+                .small(),
+        );
+        Grid::new("audio_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Pre-buffer (ms)");
+            ui.add(DragValue::new(&mut cfg.audio.prebuf_ms).range(5..=200));
+            ui.end_row();
+            ui.label("cpal buffer (frames)");
+            let mut frames = cfg.audio.cpal_buffer_frames.unwrap_or(0);
+            if ui.add(DragValue::new(&mut frames).range(0..=8192)).changed() {
+                cfg.audio.cpal_buffer_frames = if frames == 0 { None } else { Some(frames) };
+            }
+            ui.end_row();
+        });
+        ui.label(RichText::new("44100 Hz preferred when host supports it (see hal2 status).").weak().small());
+    }
 }
 
 fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) {
@@ -367,7 +578,9 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 // count-driven queue decides whether this replaces the current
                 // disc or joins the changer cycle.
                 if dev.cdrom && e.picked && !dev.path.is_empty() {
-                    action = ConfigAction::LoadDisc { id, path: dev.path.clone() };
+                    action = ConfigAction::LoadDisc {
+                        id, path: dev.path.clone(), remount: true,
+                    };
                 }
                 ui.end_row();
                 if dev.path.ends_with(".chd") && !build_features::CHD {
@@ -1128,7 +1341,43 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     action
 }
 
-fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig, jit: &mut JitEnv) {
+fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
+    let mut action = ConfigAction::None;
+    ui.heading("Build features");
+    Grid::new("build_features_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("CPU");
+        ui.label(build_features::CPU);
+        ui.end_row();
+        ui.label("MIPS JIT");
+        ui.label(if build_features::JIT { "enabled at compile time" } else { "not built" });
+        ui.end_row();
+        ui.label("REX3 JIT");
+        ui.label(if build_features::REX_JIT { "enabled at compile time" } else { "not built" });
+        ui.end_row();
+        ui.label("Lightning");
+        ui.label(if build_features::LIGHTNING { "yes (no GDB)" } else { "no" });
+        ui.end_row();
+        ui.label("Idle pause");
+        ui.label(if build_features::IDLE_PAUSE { "yes" } else { "no" });
+        ui.end_row();
+        ui.label("CHD / PCAP / Camera");
+        ui.label(format!(
+            "CHD={} PCAP={} Camera={}",
+            build_features::CHD,
+            build_features::PCAP,
+            build_features::CAMERA,
+        ));
+        ui.end_row();
+    });
+    ui.label(
+        RichText::new(
+            "Status-bar MIPS = host emulation throughput. IRIX System Manager MHz \
+             (from hinv) is guest inventory — changing it does not make IRIX faster.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.separator();
     ui.heading("Debug / JIT");
     if build_features::LIGHTNING {
         ui.label(RichText::new(
@@ -1147,63 +1396,159 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig, jit: &mut JitEnv) {
         });
     }
     ui.separator();
+    ui.label("Capture (iris-gui framebuffer path)");
+    Grid::new("capture_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("OpenGL capture (IRIS_GUI_GL)");
+        ui.checkbox(&mut cfg.jit.gui_gl_capture, "")
+            .on_hover_text("Use GlCompositor on the refresh thread (faster GL demos in GUI). CLI iris.exe is still fastest for recording.");
+        ui.end_row();
+    });
+    ui.label(
+        RichText::new("After audio-heavy demos: telnet 127.0.0.1:8888 → hal2 status (cpal underruns).")
+            .weak()
+            .small(),
+    );
+    ui.separator();
     ui.label("JIT (requires `cargo build --features jit`)");
     Grid::new("jit_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Enable JIT (IRIS_JIT=1)");
-        ui.checkbox(&mut jit.iris_jit, "");
+        ui.checkbox(&mut cfg.jit.enabled, "");
         ui.end_row();
 
         ui.label("Max tier (0=ALU, 1=Loads, 2=Full)");
-        let mut t = jit.max_tier.unwrap_or(2);
+        let mut t = cfg.jit.max_tier;
         if ui.add(DragValue::new(&mut t).range(0..=2)).changed() {
-            jit.max_tier = Some(t);
+            cfg.jit.max_tier = t;
         }
         ui.end_row();
 
         ui.label("Verify against interpreter");
-        ui.checkbox(&mut jit.verify, "");
+        ui.checkbox(&mut cfg.jit.verify, "");
         ui.end_row();
 
-        ui.label("Disable JIT stores (diagnostic)");
-        ui.checkbox(&mut jit.no_stores, "");
+        ui.label("Compile JIT stores (experimental)");
+        ui.checkbox(&mut cfg.jit.compile_stores, "")
+            .on_hover_text("When enabled, MIPS JIT may compile stores (write-log rollback path)");
         ui.end_row();
 
         ui.label("Probe interval");
-        ui.add(TextEdit::singleline(&mut jit.probe).hint_text("default 200").desired_width(120.0));
+        ui.add(DragValue::new(&mut cfg.jit.probe).range(50..=5000).speed(10));
+        ui.end_row();
+
+        ui.label("Probe min");
+        ui.add(DragValue::new(&mut cfg.jit.probe_min).range(10..=1000).speed(5));
         ui.end_row();
 
         ui.label("Trace file");
-        path_row(ui, "jit_trace", &mut jit.trace_file, Pick::SaveFile, ANY_FILTERS);
+        path_row(ui, "jit_trace", &mut cfg.jit.trace_file, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
 
         ui.label("Profile file");
-        path_row(ui, "jit_profile", &mut jit.profile_file, Pick::SaveFile, ANY_FILTERS);
+        path_row(ui, "jit_profile", &mut cfg.jit.profile_file, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
     ui.separator();
     Grid::new("misc_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Disable idle park (IRIS_NO_IDLE)");
-        ui.checkbox(&mut jit.no_idle, "");
+        ui.checkbox(&mut cfg.jit.no_idle, "");
         ui.end_row();
         ui.label("Devlog spec (IRIS_DEBUG_LOG)");
-        ui.add(TextEdit::singleline(&mut jit.debug_log).hint_text("all, or e.g. mc,mips").desired_width(280.0));
+        ui.add(TextEdit::singleline(&mut cfg.jit.debug_log).hint_text("all, or e.g. mc,mips").desired_width(280.0));
         ui.end_row();
     });
+    ui.separator();
+    ui.label(RichText::new("Build profiles (from repo root):").strong());
+    ui.horizontal(|ui| {
+        if ui.button("Rebuild Premiere CLI…").on_hover_text("lightning,rex-jit,jit,idle-pause").clicked() {
+            action = ConfigAction::RebuildProfile { gui: false };
+        }
+        if ui.button("Rebuild Premiere GUI…").on_hover_text("--features premiere").clicked() {
+            action = ConfigAction::RebuildProfile { gui: true };
+        }
+    });
+    ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,jit,idle-pause");
+    ui.monospace("cargo build -p iris-gui --release --features premiere");
+    ui.monospace("cargo build -p iris-gui --release --features iris/r5k,iris/r5ksc  # R5000SC");
+    ui.separator();
+    ui.heading("Host performance");
+    Grid::new("perf_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("Thread affinity");
+        ui.checkbox(&mut cfg.perf.thread_affinity, "");
+        ui.end_row();
+        ui.label("MIPS CPU core");
+        let mut cpu = cfg.perf.cpu_core.unwrap_or(0) as i32;
+        if ui.add(DragValue::new(&mut cpu).range(0..=63)).changed() {
+            cfg.perf.cpu_core = Some(cpu as u32);
+        }
+        ui.end_row();
+        ui.label("REX3 processor core");
+        let mut rex = cfg.perf.rex3_core.unwrap_or(1) as i32;
+        if ui.add(DragValue::new(&mut rex).range(0..=63)).changed() {
+            cfg.perf.rex3_core = Some(rex as u32);
+        }
+        ui.end_row();
+        ui.label("REX3 refresh core");
+        let mut refc = cfg.perf.refresh_core.unwrap_or(2) as i32;
+        if ui.add(DragValue::new(&mut refc).range(0..=63)).changed() {
+            cfg.perf.refresh_core = Some(refc as u32);
+        }
+        ui.end_row();
+    });
+    action
 }
 
-fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading("CI / Automation");
+    ui.label("Export TOML then run iris with ci=true — same hardware as GUI. Windows default socket: 127.0.0.1:19851");
     Grid::new("ci_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Enable CI mode");
         ui.checkbox(&mut cfg.ci, "");
         ui.end_row();
-        ui.label("CI socket path");
-        path_row(ui, "ci_socket", &mut cfg.ci_socket, Pick::SaveFile, SOCKET_FILTERS);
+        ui.label("CI socket (Unix path or host:port)");
+        ui.add(TextEdit::singleline(&mut cfg.ci_socket).desired_width(280.0));
         ui.end_row();
         ui.label("Keep window visible (--ci-display)");
         ui.checkbox(&mut cfg.ci_display, "");
         ui.end_row();
+        ui.label("Serial transcript log");
+        let mut log = cfg.serial_log.clone().unwrap_or_default();
+        if ui.add(TextEdit::singleline(&mut log).desired_width(280.0)).changed() {
+            cfg.serial_log = if log.is_empty() { None } else { Some(log) };
+        }
+        ui.end_row();
+        ui.label("Defer SCSI interrupts");
+        ui.checkbox(&mut cfg.scsi_deferred_int, "")
+            .on_hover_text("Required for OpenBSD/NetBSD; disable if SCSI timeouts");
+        ui.end_row();
+        ui.label("Lock aspect ratio");
+        ui.checkbox(&mut cfg.lock_aspect_ratio, "");
+        ui.end_row();
+        ui.label("Scroll pixels per line");
+        ui.add(DragValue::new(&mut cfg.mouse_scroll_pixels_per_line).speed(1.0).range(5.0..=200.0));
+        ui.end_row();
     });
+    ui.add_space(8.0);
+    let mut action = ConfigAction::None;
+    if ui.button("Test CI connection (iris-ci ping)").clicked() {
+        let socket = cfg.ci_socket.clone();
+        std::thread::spawn(move || {
+            let status = std::process::Command::new("target/release/iris-ci.exe")
+                .arg("ping")
+                .env("IRIS_CI_SOCKET", &socket)
+                .output();
+            match status {
+                Ok(o) if o.status.success() => eprintln!("iris-ci ping: OK"),
+                Ok(o) => eprintln!("iris-ci ping failed: {}", String::from_utf8_lossy(&o.stderr)),
+                Err(e) => eprintln!("iris-ci ping: {e} (build iris-ci and start iris with ci=true)"),
+            }
+        });
+        ui.ctx().request_repaint();
+    }
+    if ui.button("Test in CI (export + headless boot + ping)").clicked() {
+        action = ConfigAction::TestCi;
+    }
+    ui.label(RichText::new("Export TOML, start iris with ci=true, then ping.").weak().small());
+    action
 }
 
 /// Serialize `cfg` back to TOML string in the same style as iris.toml.

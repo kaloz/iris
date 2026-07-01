@@ -20,11 +20,18 @@
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
+const DEFAULT_SOCKET: &str = "/tmp/iris.sock";
+#[cfg(windows)]
+const DEFAULT_SOCKET: &str = "127.0.0.1:19851";
+#[cfg(not(any(unix, windows)))]
 const DEFAULT_SOCKET: &str = "/tmp/iris.sock";
 const PROMPT_RE: &str = "IRIS"; // Match "IRIS N# " — N is a counter that increments
 const RC_MARKER: &str = "IRIS-CI-RC=";
@@ -322,21 +329,48 @@ struct Opts {
 /// terminated response line, then drop the stream — the server's reader
 /// loop sees EOF and exits cleanly.
 fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
-    let s = UnixStream::connect(&opts.socket)?;
+    let addr = opts.socket.to_string_lossy();
+    if iris::config::ci_socket_is_tcp(&addr) {
+        send_tcp(&iris::config::ci_socket_tcp_addr(&addr), cmd, args)
+    } else {
+        #[cfg(unix)]
+        {
+            send_unix(&opts.socket, cmd, args)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(Error::Iris(format!(
+                "CI socket {} is not TCP; on this platform use host:port (default {})",
+                addr, DEFAULT_SOCKET
+            )))
+        }
+    }
+}
+
+fn send_tcp(addr: &str, cmd: &str, args: Value) -> Result<Value> {
+    let s = TcpStream::connect(addr)?;
     s.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    let mut writer = s.try_clone()?;
+    let mut reader = BufReader::new(s);
+    exchange(&mut reader, &mut writer, cmd, args)
+}
+
+#[cfg(unix)]
+fn send_unix(socket: &PathBuf, cmd: &str, args: Value) -> Result<Value> {
+    let s = UnixStream::connect(socket)?;
+    s.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    let mut writer = s.try_clone()?;
+    let mut reader = BufReader::new(s);
+    exchange(&mut reader, &mut writer, cmd, args)
+}
+
+fn exchange(reader: &mut impl BufRead, writer: &mut impl Write, cmd: &str, args: Value) -> Result<Value> {
     let req = json!({"cmd": cmd, "args": args});
     let line = format!("{}\n", serde_json::to_string(&req).expect("json"));
-    {
-        let mut writer = s.try_clone()?;
-        writer.write_all(line.as_bytes())?;
-        writer.flush()?;
-    }
-    // Read exactly one line of response.
-    let mut reader = BufReader::new(s.try_clone()?);
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
     let mut buf = String::new();
     reader.read_line(&mut buf)?;
-    // Tell the server we're done so its read loop exits.
-    let _ = s.shutdown(Shutdown::Both);
     let trimmed = buf.trim();
     if trimmed.is_empty() {
         return Err(Error::Iris("empty response".into()));

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
+use crate::config::AudioConfig;
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -106,18 +108,34 @@ const MODE_STEREO: usize = 2;
 const MODE_QUAD:   usize = 3;
 
 // Pre-buffer: accumulate this many ms of audio samples before pushing to the ring.
-// This gives the CPU time to fill its circular DMA buffer before we start draining it,
-// preventing initial underrun.
-const PREBUF_MS: u64 = 20;
-// Ring buffer capacity as a multiple of PREBUF_MS.  Must absorb OS scheduling jitter.
-// Expressed as a multiplier of PREBUF_MS stereo samples.
+// Overridable via `[audio] prebuf_ms` in iris.toml (default 20).
+// Ring buffer capacity as a multiple of prebuf_ms.  Must absorb OS scheduling jitter.
 const RING_BUF_MULTIPLIER: usize = 16;
 
 // Consecutive dry reads before giving up prebuf and opening stream anyway.
 const DRY_LIMIT: u32 = 100;
 
 // Sample rates to try when opening the persistent output stream, in order.
-const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
+// Prefer 44100 to match IRIX BRES master and skip resampling on most hosts.
+const PREFERRED_RATES: &[u32] = &[44100, 48000, 22050];
+
+// Max stereo frames to drain per timer tick when catching up after scheduling jitter.
+const MAX_FRAMES_PER_TICK: u32 = 8;
+
+#[cfg(windows)]
+mod win_timer {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(u_period: u32) -> u32;
+        fn timeEndPeriod(u_period: u32) -> u32;
+    }
+    pub fn begin_1ms() {
+        unsafe { timeBeginPeriod(1); }
+    }
+    pub fn end_1ms() {
+        unsafe { timeEndPeriod(1); }
+    }
+}
 
 // ─── Audio output (owned by Codec A, opened once at start, closed at stop) ───
 
@@ -127,6 +145,7 @@ const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 struct AudioOut {
     stream_rate: u32,
     producer: Producer<i16>,
+    underruns: Arc<AtomicU64>,
     // Keep stream alive; dropped when AudioOut is dropped at stop().
     _stream: cpal::Stream,
 }
@@ -157,7 +176,7 @@ impl Resampler {
 
     fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
 
-    /// Push one input stereo pair. Returns 0, 1, or 2 output pairs via the closure.
+    /// Push one input stereo pair.
     fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
         self.last_l = l;
         self.last_r = r;
@@ -190,13 +209,12 @@ struct CodecAState {
     prebuf: Vec<i16>,
     dry: u32,
     nonzero_seen: bool,
-    timer_id: Option<TimerId>,
 }
 
 impl CodecAState {
     fn new() -> Self {
         Self { out: None, resampler: None, prebuffering: true, prebuf: Vec::new(),
-               dry: 0, nonzero_seen: false, timer_id: None }
+               dry: 0, nonzero_seen: false }
     }
     fn reset_audio(&mut self) {
         // Keep `out` — stream stays open.  Just reset codec-side state.
@@ -216,10 +234,36 @@ impl CodecAState {
             }
         }
     }
+
+    /// Flush fractional resampler state directly to the ring (end-of-stream tail).
+    fn flush_resampler_tail(&mut self) {
+        let (l, r) = match self.resampler.as_mut() {
+            Some(rs) if !rs.passthrough() && rs.acc > 0 => {
+                let pair = (rs.last_l, rs.last_r);
+                rs.acc = 0;
+                pair
+            }
+            _ => return,
+        };
+        if let Some(o) = &mut self.out {
+            let _ = o.producer.push(l);
+            let _ = o.producer.push(r);
+        }
+    }
 }
 
 struct CodecBState {
+    out: Option<AudioOut>,
+    resampler: Option<Resampler>,
     timer_id: Option<TimerId>,
+}
+
+impl CodecBState {
+    fn push_to_ring(&mut self, l: i16, r: i16) {
+        if let (Some(rs), Some(o)) = (&mut self.resampler, &mut self.out) {
+            rs.push(l, r, &mut o.producer);
+        }
+    }
 }
 
 struct AesTxState {
@@ -279,40 +323,62 @@ pub struct Hal2 {
     state: Arc<Mutex<Hal2State>>,
     dma_clients: Vec<Arc<dyn DmaClient>>,
     timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
-    // Per-channel mutable state
+    audio_config: AudioConfig,
+    underruns: Arc<AtomicU64>,
     ca_state: Arc<Mutex<CodecAState>>,
     cb_state: Arc<Mutex<CodecBState>>,
     at_state: Arc<Mutex<AesTxState>>,
     ar_state: Arc<Mutex<AesRxState>>,
+    ca_pump_stop: Arc<AtomicBool>,
+    ca_pump_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 // ─── cpal helpers ─────────────────────────────────────────────────────────────
 
-fn prebuf_samples(rate: u32) -> usize {
-    (rate as usize * 2 * PREBUF_MS as usize) / 1000
+fn prebuf_samples(rate: u32, prebuf_ms: u64) -> usize {
+    (rate as usize * 2 * prebuf_ms as usize) / 1000
 }
 
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
 /// The stream plays silence when the ring buffer is empty.
-fn open_persistent_output() -> Option<AudioOut> {
+fn open_persistent_output(cfg: &AudioConfig, underruns: Arc<AtomicU64>) -> Option<AudioOut> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
 
     for &rate in PREFERRED_RATES {
+        let buffer_size = cfg.cpal_buffer_frames
+            .map(|n| cpal::BufferSize::Fixed(n))
+            .unwrap_or(cpal::BufferSize::Default);
         let config = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(rate),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size,
         };
-        let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
+        let ring_size = prebuf_samples(rate, cfg.prebuf_ms) * RING_BUF_MULTIPLIER;
         let err_fn = |err: cpal::StreamError| { eprintln!("HAL2: cpal stream error: {:?}", err); };
+        let underruns_cb = underruns.clone();
 
         // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
         let (producer, stream) = {
             let (p, mut c) = RingBuffer::<i16>::new(ring_size);
             let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut last_l: i16 = 0;
+                let mut last_r: i16 = 0;
+                let mut next_left = true;
                 for sample in data.iter_mut() {
-                    *sample = c.pop().unwrap_or(0) as f32 / 32768.0;
+                    match c.pop() {
+                        Ok(v) => {
+                            if next_left { last_l = v; } else { last_r = v; }
+                            next_left = !next_left;
+                            *sample = v as f32 / 32768.0;
+                        }
+                        Err(_) => {
+                            underruns_cb.fetch_add(1, Ordering::Relaxed);
+                            let v = if next_left { last_l } else { last_r };
+                            next_left = !next_left;
+                            *sample = v as f32 / 32768.0;
+                        }
+                    }
                 }
             };
             match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
@@ -320,9 +386,24 @@ fn open_persistent_output() -> Option<AudioOut> {
                 Err(_) => {
                     // f32 failed, try i16
                     let (p, mut c) = RingBuffer::<i16>::new(ring_size);
+                    let underruns_cb = underruns.clone();
                     let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        let mut last_l: i16 = 0;
+                        let mut last_r: i16 = 0;
+                        let mut next_left = true;
                         for sample in data.iter_mut() {
-                            *sample = c.pop().unwrap_or(0);
+                            match c.pop() {
+                                Ok(v) => {
+                                    if next_left { last_l = v; } else { last_r = v; }
+                                    next_left = !next_left;
+                                    *sample = v;
+                                }
+                                Err(_) => {
+                                    underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                    *sample = if next_left { last_l } else { last_r };
+                                    next_left = !next_left;
+                                }
+                            }
                         }
                     };
                     match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
@@ -341,6 +422,7 @@ fn open_persistent_output() -> Option<AudioOut> {
         return Some(AudioOut {
             stream_rate: rate,
             producer,
+            underruns,
             _stream: stream,
         });
     }
@@ -353,7 +435,7 @@ fn open_persistent_output() -> Option<AudioOut> {
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
 
 impl Hal2 {
-    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
+    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>, audio_config: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(Hal2State {
                 isr: 0,
@@ -374,10 +456,14 @@ impl Hal2 {
             })),
             dma_clients,
             timer_manager: Arc::new(std::sync::OnceLock::new()),
+            audio_config,
+            underruns: Arc::new(AtomicU64::new(0)),
             ca_state: Arc::new(Mutex::new(CodecAState::new())),
-            cb_state: Arc::new(Mutex::new(CodecBState { timer_id: None })),
+            cb_state: Arc::new(Mutex::new(CodecBState { out: None, resampler: None, timer_id: None })),
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
+            ca_pump_stop: Arc::new(AtomicBool::new(true)),
+            ca_pump_handle: Mutex::new(None),
         }
     }
 
@@ -411,10 +497,68 @@ impl Hal2 {
         self.ar_state.lock().loopback.clear();
     }
 
-    // ── Codec A output timer ──────────────────────────────────────────────────
+    // ── Codec A output (HAL2-Pump thread — spin-wait, no thread::sleep) ─────
+
+    fn codeca_dma_tick(
+        ca_state: &Arc<Mutex<CodecAState>>,
+        dma_client: &Arc<dyn DmaClient>,
+        mode: usize,
+        rate: u32,
+        pitch_rate: u32,
+        prebuf_ms: u64,
+    ) {
+        let mut st = ca_state.lock();
+
+        let stream_rate = match st.out.as_ref() {
+            Some(o) => o.stream_rate,
+            None => {
+                let _ = read_frame_from(dma_client, mode);
+                return;
+            }
+        };
+
+        if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
+            st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
+        }
+
+        let prebuf_target = prebuf_samples(rate, prebuf_ms);
+        for _ in 0..MAX_FRAMES_PER_TICK {
+            match read_frame_from(dma_client, mode) {
+                Some((l, r)) => {
+                    st.dry = 0;
+                    if !st.nonzero_seen && (l != 0 || r != 0) {
+                        st.nonzero_seen = true;
+                    }
+                    if st.prebuffering {
+                        st.prebuf.push(l);
+                        st.prebuf.push(r);
+                        if st.prebuf.len() >= prebuf_target {
+                            let samples = std::mem::take(&mut st.prebuf);
+                            st.push_to_ring(&samples);
+                            st.prebuffering = false;
+                        }
+                    } else {
+                        st.push_to_ring(&[l, r]);
+                    }
+                }
+                None => {
+                    st.dry += 1;
+                    if st.nonzero_seen && st.dry == 1 {
+                        st.flush_resampler_tail();
+                    }
+                    if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
+                        let samples = std::mem::take(&mut st.prebuf);
+                        st.push_to_ring(&samples);
+                        st.prebuffering = false;
+                        st.dry = 0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
 
     fn arm_codeca(&self) {
-        let Some(tm) = self.timer_manager.get() else { return; };
         self.disarm_codeca();
 
         let (dma_ch, mode, rate, pitch_rate) = {
@@ -432,76 +576,41 @@ impl Hal2 {
         let period = Duration::from_secs_f64(1.0 / pitch_rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
+        let prebuf_ms = self.audio_config.prebuf_ms;
+        let stop = self.ca_pump_stop.clone();
+        stop.store(false, Ordering::Relaxed);
 
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            let mut st = ca_state.lock();
-
-            // No audio output — still drain DMA so the kernel doesn't hang
-            // waiting for PDMA_CTRL_ACT to clear.
-            let stream_rate = match st.out.as_ref() {
-                Some(o) => o.stream_rate,
-                None => {
-                    let _ = read_frame_from(&dma_client, mode);
-                    return TimerReturn::Continue;
-                }
-            };
-
-            // (Re)build resampler if codec rate changed.
-            // Use codec B rate as the declared input rate (experiment).
-            if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
-                st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
-                dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
-            }
-
-            let frame = read_frame_from(&dma_client, mode);
-
-            match frame {
-                Some((l, r)) => {
-                    st.dry = 0;
-                    if !st.nonzero_seen && (l != 0 || r != 0) {
-                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
-                        st.nonzero_seen = true;
-                    }
-                    if st.prebuffering {
-                        // Accumulate before feeding the ring to prevent underrun.
-                        st.prebuf.push(l);
-                        st.prebuf.push(r);
-                        if st.prebuf.len() >= prebuf_samples(rate) {
-                            let samples = std::mem::take(&mut st.prebuf);
-                            st.push_to_ring(&samples);
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
-                            st.prebuffering = false;
+        let handle = thread::Builder::new()
+            .name("HAL2-Pump".into())
+            .spawn(move || {
+                let mut next = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    if now >= next {
+                        Self::codeca_dma_tick(&ca_state, &dma_client, mode, rate, pitch_rate, prebuf_ms);
+                        next += period;
+                        if next < now {
+                            next = now + period;
                         }
                     } else {
-                        // Active: push directly.
-                        st.push_to_ring(&[l, r]);
+                        // Match hptimer: spin for sub-200µs waits (44.1 kHz ≈ 23µs).
+                        std::hint::spin_loop();
                     }
                 }
-                None => {
-                    st.dry += 1;
-                    if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
-                        // Flush whatever we buffered so far rather than waiting forever.
-                        let samples = std::mem::take(&mut st.prebuf);
-                        st.push_to_ring(&samples);
-                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
-                        st.prebuffering = false;
-                        st.dry = 0;
-                    }
-                }
-            }
+            })
+            .ok();
 
-            TimerReturn::Continue
-        });
-
-        self.ca_state.lock().timer_id = Some(id);
+        if let Some(h) = handle {
+            *self.ca_pump_handle.lock() = Some(h);
+        }
     }
 
     fn disarm_codeca(&self) {
-        let id = self.ca_state.lock().timer_id.take();
-        if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+        self.ca_pump_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.ca_pump_handle.lock().take() {
+            let _ = h.join();
         }
-        self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
+        self.ca_state.lock().reset_audio();
     }
 
     // ── Codec B input (silence writer) timer ─────────────────────────────────
@@ -510,26 +619,44 @@ impl Hal2 {
         let Some(tm) = self.timer_manager.get() else { return; };
         self.disarm_codecb();
 
-        let (dma_ch, mode, rate) = {
+        let (dma_ch, mode, rate, quad_dual) = {
             let s = self.state.lock();
             let (ch, clk, mode) = s.codecb_cfg();
             let rate = s.bres_rate(clk);
-            (ch, mode, rate)
+            let quad_dual = s.isr & isr::CODEC_MODE as u16 != 0;
+            (ch, mode, rate, quad_dual)
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
         let period = Duration::from_secs_f64(1.0 / rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
+        let cb_state = self.cb_state.clone();
+        let audio_cfg = self.audio_config.clone();
+        let underruns = self.underruns.clone();
 
         let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            let _ = dma_client.write(0, false);
-            if mode == MODE_STEREO || mode == MODE_QUAD {
+            if quad_dual {
+                let mut st = cb_state.lock();
+                if st.out.is_none() {
+                    st.out = open_persistent_output(&audio_cfg, underruns.clone());
+                }
+                if let Some((l, r)) = read_frame_from(&dma_client, mode) {
+                    let stream_rate = st.out.as_ref().map(|o| o.stream_rate).unwrap_or(rate);
+                    if st.resampler.as_ref().map_or(true, |r| r.in_rate != rate) {
+                        st.resampler = Some(Resampler::new(rate, stream_rate));
+                    }
+                    st.push_to_ring(l, r);
+                }
+            } else {
                 let _ = dma_client.write(0, false);
-            }
-            if mode == MODE_QUAD {
-                let _ = dma_client.write(0, false);
-                let _ = dma_client.write(0, false);
+                if mode == MODE_STEREO || mode == MODE_QUAD {
+                    let _ = dma_client.write(0, false);
+                }
+                if mode == MODE_QUAD {
+                    let _ = dma_client.write(0, false);
+                    let _ = dma_client.write(0, false);
+                }
             }
             TimerReturn::Continue
         });
@@ -542,6 +669,8 @@ impl Hal2 {
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
         }
+        let mut st = self.cb_state.lock();
+        st.resampler = None;
     }
 
     // ── AES TX drain timer (no cpal output) ──────────────────────────────────
@@ -947,6 +1076,10 @@ impl Hal2 {
         BUS_OK
     }
 
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
     pub fn register_locks(self: &Arc<Self>) {
         use crate::locks::register_lock_fn;
         let me = self.clone(); register_lock_fn("hal2::state",    move || me.state.is_locked());
@@ -985,7 +1118,7 @@ fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16
 
 impl Default for Hal2 {
     fn default() -> Self {
-        Self::new(Vec::new())
+        Self::new(Vec::new(), AudioConfig::default())
     }
 }
 
@@ -993,8 +1126,10 @@ impl Device for Hal2 {
     fn step(&self, _cycles: u64) {}
 
     fn start(&self) {
-        // Open persistent audio output once.  Codec A timer will push into it.
-        let audio = open_persistent_output();
+        #[cfg(windows)]
+        win_timer::begin_1ms();
+        let underruns = self.underruns.clone();
+        let audio = open_persistent_output(&self.audio_config, underruns);
         if audio.is_none() {
             eprintln!("HAL2: no audio output available");
         }
@@ -1007,8 +1142,11 @@ impl Device for Hal2 {
 
     fn stop(&self) {
         self.disarm_all();
-        // Drop the audio output stream.
+        // Drop the audio output streams.
         self.ca_state.lock().out = None;
+        self.cb_state.lock().out = None;
+        #[cfg(windows)]
+        win_timer::end_1ms();
     }
 
     fn is_running(&self) -> bool {
@@ -1073,14 +1211,22 @@ impl Device for Hal2 {
                 drop(s);
 
                 let ca = self.ca_state.lock();
-                writeln!(writer, "Codec A out: {}  pitch: {}  prebuf: {}  prebuffering: {}  timer: {}",
+                writeln!(writer, "Codec A out: {}  pitch: {}  prebuf: {}  prebuffering: {}",
                     ca.out.as_ref().map_or("none".to_string(), |o| format!("{}Hz", o.stream_rate)),
                     ca.resampler.as_ref().map_or("none".to_string(), |r| format!("{}Hz", r.in_rate)),
                     ca.prebuf.len() / 2,
                     ca.prebuffering,
-                    ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
+                ).unwrap();
+                writeln!(writer, "Codec A pump: {}  prebuf_ms={}",
+                    if self.ca_pump_handle.lock().is_some() { "HAL2-Pump active" } else { "stopped" },
+                    self.audio_config.prebuf_ms,
                 ).unwrap();
                 drop(ca);
+                writeln!(writer, "cpal underruns (samples): {}  prebuf_ms={}  cpal_buffer={}",
+                    self.underruns.load(Ordering::Relaxed),
+                    self.audio_config.prebuf_ms,
+                    self.audio_config.cpal_buffer_frames.map_or("default".to_string(), |n| n.to_string()),
+                ).unwrap();
 
                 writeln!(writer, "Codec B timer: {}",
                     self.cb_state.lock().timer_id.map_or("none".to_string(), |id| format!("{:#x}", id))).unwrap();

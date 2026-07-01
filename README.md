@@ -100,6 +100,10 @@ before.
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
 
+**Windows 11 (this fork):** build scripts, JIT/premiere workflow, iris-gui RAM
+presets, GUI↔TOML sync, and R5000/extended-RAM notes are in
+[wsl/README.md](wsl/README.md).
+
 
 ## PCAP bridged networking (`--features pcap`)
 

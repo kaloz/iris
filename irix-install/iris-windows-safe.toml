@@ -1,0 +1,51 @@
+# Stable premiere config: Loads-tier JIT only (see wsl\run-iris-premiere-safe.bat).
+# Same hardware as iris-windows.toml; use that file for max Full-tier performance.
+
+headless = false
+no_audio = false
+banks    = [128, 128, 0, 0]
+nvram    = "irix-install/nvram-irix65.bin"
+scale    = 1
+
+[machine]
+profile = "indy_ip24"
+
+[jit]
+enabled         = true
+probe           = 500
+probe_min       = 100
+max_tier        = 1
+compile_stores  = false
+gui_gl_capture  = false
+
+[perf]
+thread_affinity = false
+
+[audio]
+prebuf_ms = 40
+
+[scsi.1]
+path    = "irix-install/scsi1.raw"
+cdrom   = false
+overlay = true
+
+[scsi.4]
+path  = 'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso'
+cdrom = true
+discs = [
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-1_812-0759-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-2_812-0760-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-applications-june-1998_812-0761-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-foundation_812-0757-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-libraries_812-0766-002.iso',
+]
+
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
+
+[nfs]
+shared_dir = "shared"

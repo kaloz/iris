@@ -277,9 +277,7 @@ Example from Test_Rx_Clock: `IDR0 = 0x213` → channel 3, BRES clock 2, stereo.
   is unlikely to cause failures in practice, but is not strictly correct.
 - **`HAL2_DMA_ENDIAN_W`** — always treated as big-endian (correct default).
 - **`HAL2_RELAY_CONTROL_W`** — headphone relay, no analog hardware to emulate.
-- **Dual-stream quad mode** (`ISR.CODEC_MODE = 1`) — both Codec A and Codec B would
-  need independent output streams running simultaneously.  Currently only Codec A's
-  stream is opened; Codec B input is drained to silence.
+- **Dual-stream quad mode** (`ISR.CODEC_MODE = 1`) — Codec B can open a second cpal stream when quad layout is enabled; rear channels play from Codec B DMA.
 - **AES TX/RX clock locking** — AESRX recovered clock as BRES master (mode `0x2` in
   CTRL1) is not implemented; the emulator falls back to 44100 Hz.
 - **Codec CTRL2 (gain/atten/mute)** — not emulated; all analog processing is bypassed.

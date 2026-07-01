@@ -10,15 +10,17 @@ mod input;
 mod macos_sandbox;
 mod netfix;
 mod netplan;
+mod ram;
 mod safe_stop;
 mod scsi_menu;
 mod serial_console;
 mod settings;
 mod single_instance;
 
-use config_ui::{cfg_to_toml, show_tab, ConfigAction, JitEnv, Tab};
+use config_ui::{cfg_to_toml, show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
+use ram::{ram_summary, RAM_PRESETS};
 use eframe::egui;
 use egui::{Color32, RichText, ViewportCommand};
 use handle::{Cmd, EmulatorHandle, Evt, NetState};
@@ -153,7 +155,8 @@ struct App {
     cfg_dirty: bool,
     /// Timestamp of the most recent edit; used to debounce auto-save.
     cfg_dirty_since: Option<std::time::Instant>,
-    jit: JitEnv,
+    /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
+    started_banks: Option<[u32; 4]>,
     tab: Tab,
     emu: EmulatorHandle,
     toast: Option<(String, std::time::Instant)>,
@@ -197,9 +200,12 @@ struct App {
     /// egui texture holding the most recent REX3 framebuffer. Allocated
     /// lazily on the first frame that needs it.
     fb_tex: Option<egui::TextureHandle>,
+    /// Second Newport head when `graphics.heads == 2`.
+    fb_tex_head1: Option<egui::TextureHandle>,
     /// Sequence number of the last frame we uploaded; used to skip the
     /// upload when the renderer hasn't produced a new frame.
     last_fb_seq: u64,
+    last_fb_seq_head1: u64,
     /// Filter the framebuffer texture is currently uploaded with: `true` =
     /// NEAREST (crisp; used at integer device-pixel scales), `false` = LINEAR
     /// (smooths the uneven pixel doubling at fractional scales). Tracked so we
@@ -451,7 +457,7 @@ impl App {
             cfg_path,
             cfg_dirty: false,
             cfg_dirty_since: None,
-            jit: JitEnv::default(),
+            started_banks: None,
             tab: Tab::General,
             emu: EmulatorHandle::spawn(),
             toast: None,
@@ -472,7 +478,9 @@ impl App {
             save_state_name: "snap1".into(),
             restore_state_name: "snap1".into(),
             fb_tex: None,
+            fb_tex_head1: None,
             last_fb_seq: 0,
+            last_fb_seq_head1: 0,
             fb_nearest: true,
             fb_scale: 0.0,
             pending_fb_snap: false,
@@ -578,6 +586,100 @@ impl App {
         }
     }
 
+    /// Export config + enable premiere JIT defaults for CLI recording workflow.
+    fn prepare_for_premiere(&mut self) {
+        if self.emu.is_running() {
+            self.toast("Stop the VM first — premiere CLI uses its own iris.exe process");
+            return;
+        }
+        self.cfg.scale = 1;
+        self.cfg.jit = iris::config::JitConfig::premiere_defaults();
+        self.mark_dirty();
+        if self.cfg_dirty { self.flush_machine(); }
+        let path = PathBuf::from("irix-install/iris-windows.toml");
+        match cfg_to_toml(&self.cfg) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&path, s) {
+                    self.toast(format!("export failed: {e}"));
+                    return;
+                }
+                self.cfg_path = Some(path);
+                self.cfg_dirty = false;
+            }
+            Err(e) => {
+                self.toast(format!("serialize failed: {e}"));
+                return;
+            }
+        }
+        let _ = self.prefs.save();
+        self.toast(
+            "Premiere ready: iris-windows.toml exported. Warm JIT (wsl\\warm-jit-profiles.ps1), \
+             then run wsl\\run-iris-premiere.bat for 3D recording.",
+        );
+    }
+
+    fn spawn_rebuild_profile(&mut self, gui: bool) {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let bat = if gui {
+            root.join("wsl").join("ensure-build.bat")
+        } else {
+            root.join("wsl").join("ensure-build.bat")
+        };
+        let arg = if gui { "gui" } else { "cli" };
+        if gui {
+            std::env::set_var("IRIS_GUI_FEATURES", "premiere");
+        }
+        match std::process::Command::new("cmd")
+            .args(["/c", bat.to_string_lossy().as_ref(), arg])
+            .current_dir(&root)
+            .spawn()
+        {
+            Ok(_) => self.toast(format!("Rebuilding {} in background — watch terminal", arg)),
+            Err(e) => self.toast(format!("Rebuild failed to start: {e}")),
+        }
+    }
+
+    fn test_ci_launch(&mut self) {
+        if self.emu.is_running() {
+            self.toast("Stop the embedded VM first — CI test spawns a separate iris.exe");
+            return;
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.ci = true;
+        cfg.headless = true;
+        let path = PathBuf::from("irix-install/iris-ci-test.toml");
+        match cfg_to_toml(&cfg) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&path, s) {
+                    self.toast(format!("export failed: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                self.toast(format!("serialize failed: {e}"));
+                return;
+            }
+        }
+        let socket = cfg.ci_socket.clone();
+        let config = path.to_string_lossy().to_string();
+        self.toast("CI test: starting headless iris…");
+        std::thread::spawn(move || {
+            let _child = std::process::Command::new("target/release/iris.exe")
+                .args(["--config", &config])
+                .spawn();
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            let out = std::process::Command::new("target/release/iris-ci.exe")
+                .arg("ping")
+                .env("IRIS_CI_SOCKET", &socket)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => eprintln!("CI test: ping OK"),
+                Ok(o) => eprintln!("CI test ping failed: {}", String::from_utf8_lossy(&o.stderr)),
+                Err(e) => eprintln!("CI test: {e}"),
+            }
+        });
+    }
+
     fn start_emulator(&mut self) {
         // Flush any pending edits before the machine starts so the on-disk
         // copy matches what we're about to boot. This also harvests a
@@ -626,7 +728,7 @@ impl App {
         if !std::path::Path::new(&self.cfg.prom).exists() {
             self.toast(format!("'{}' not found — using embedded PROM", self.cfg.prom));
         }
-        self.jit.export();
+        self.cfg.jit.apply_env();
         // Latch the networking backend the machine is being started with, so the
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
@@ -637,6 +739,7 @@ impl App {
         } else {
             (iris::config::NetMode::Nat, None)
         });
+        self.started_banks = Some(self.cfg.banks);
         self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
         // Don't resize the window when the VM launches — its size is latched at
         // app load (the saved window size, or the first-launch fit to vm_scale)
@@ -861,9 +964,16 @@ impl App {
                     // Fresh run: re-arm the one-shot PCAP permission prompt so a
                     // pcap-mode machine that can't open its capture re-prompts.
                     self.pcap_perm_prompted = false;
+                    // Stop drops the machine and its 8881 listener; reconnect the
+                    // in-app viewer so it attaches to the new VM, not a dead socket.
+                    if self.serial_console.is_some() {
+                        self.serial_console = Some(serial_console::SerialConsole::connect());
+                    }
                     self.toast("emulator started");
                 }
-                Evt::Stopped   => self.toast("emulator stopped"),
+                Evt::Stopped   => {
+                    self.toast("emulator stopped");
+                }
                 Evt::PowerOff  => self.toast("guest powered off (safe to stop)"),
                 Evt::StateSaved(n)    => self.toast(format!("state saved: {n}")),
                 Evt::StateRestored(n) => self.toast(format!("state restored: {n}")),
@@ -989,6 +1099,10 @@ impl App {
                         }
                         ui.close_menu();
                     }
+                    if ui.button("Prepare for premiere…").clicked() {
+                        self.prepare_for_premiere();
+                        ui.close_menu();
+                    }
                 }
                 // App Store sandbox: grant a whole folder (recursive) so the
                 // disk-sync fold — which writes a temp beside the base and
@@ -1105,15 +1219,42 @@ impl App {
             });
             ui.menu_button("Memory  ▶", |ui| {
                 ui.set_min_width(220.0);
-                let total: u32 = self.cfg.banks.iter().sum();
-                ui.label(RichText::new(format!("Total: {total} MB")).strong());
+                let running = self.emu.is_running();
+                let summary = ram_summary(&self.cfg.banks);
+                ui.label(RichText::new(format!("Config: {summary}")).strong());
+                if running {
+                    if let Some(started) = self.started_banks {
+                        if started != self.cfg.banks {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Running: {} (Stop to apply edits)",
+                                    ram_summary(&started)
+                                ))
+                                .color(Color32::YELLOW),
+                            );
+                        } else {
+                            ui.label(RichText::new(format!("Running: {}", ram_summary(&started))).weak());
+                        }
+                    }
+                    ui.label(
+                        RichText::new("RAM changes apply after Stop → Start")
+                            .weak()
+                            .small(),
+                    );
+                } else {
+                    ui.label(RichText::new("Applied at next Start").weak().small());
+                }
                 ui.separator();
                 ui.label("Quick presets (auto-distributed):");
-                for &p in &[32u32, 64, 96, 128, 192, 256] {
-                    if ui.button(format!("{p} MB")).clicked() {
+                for &p in RAM_PRESETS {
+                    if ui
+                        .add_enabled(!running, egui::Button::new(format!("{p} MB")))
+                        .on_disabled_hover_text("Stop the VM to change RAM")
+                        .clicked()
+                    {
                         self.cfg.banks = distribute_ram(p);
                         self.mark_dirty();
-                        self.toast(format!("RAM set to {p} MB ({:?})", self.cfg.banks));
+                        self.toast(format!("RAM set to {} ({:?})", ram_summary(&self.cfg.banks), self.cfg.banks));
                         ui.close_menu();
                     }
                 }
@@ -1122,7 +1263,11 @@ impl App {
                 for i in 0..4 {
                     ui.menu_button(format!("Bank {i}: {} MB", self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
-                            if ui.button(format!("{sz} MB")).clicked() {
+                            if ui
+                                .add_enabled(!running, egui::Button::new(format!("{sz} MB")))
+                                .on_disabled_hover_text("Stop the VM to change RAM")
+                                .clicked()
+                            {
                                 self.cfg.banks[i] = sz;
                                 self.mark_dirty();
                                 ui.close_menu();
@@ -1137,6 +1282,54 @@ impl App {
                     scsi_menu::ScsiAction::None => {}
                     scsi_menu::ScsiAction::CreateBlank { id } => {
                         self.create_disk.open_for(id);
+                    }
+                    scsi_menu::ScsiAction::InsertDisc { id, path } => {
+                        if let Some(msg) = scsi_menu::apply(
+                            &mut self.cfg,
+                            scsi_menu::ScsiAction::InsertDisc { id, path: path.clone() },
+                        ) {
+                            self.mark_dirty();
+                            self.toast(msg);
+                        }
+                        if self.emu.is_running() {
+                            self.emu.send(Cmd::LoadDisc { id, path, remount: true });
+                        } else {
+                            self.toast("Disc saved — Stop→Start to load into SCSI drive");
+                        }
+                    }
+                    scsi_menu::ScsiAction::AttachCdromWithDisc { id, path } => {
+                        if let Some(msg) = scsi_menu::apply(
+                            &mut self.cfg,
+                            scsi_menu::ScsiAction::AttachCdromWithDisc { id, path: path.clone() },
+                        ) {
+                            self.mark_dirty();
+                            self.toast(msg);
+                        }
+                        if self.emu.is_running() {
+                            self.emu.send(Cmd::LoadDisc { id, path, remount: true });
+                        }
+                    }
+                    scsi_menu::ScsiAction::Eject { id } => {
+                        if let Some(msg) = scsi_menu::apply(
+                            &mut self.cfg,
+                            scsi_menu::ScsiAction::Eject { id },
+                        ) {
+                            self.mark_dirty();
+                            self.toast(msg);
+                        }
+                        if self.emu.is_running() {
+                            self.emu.send(Cmd::EjectCdrom { id });
+                        }
+                    }
+                    scsi_menu::ScsiAction::RemountInIrix { id } => {
+                        if self.emu.is_running() {
+                            self.emu.send(Cmd::RemountCdrom { id });
+                            self.toast(format!(
+                                "SCSI #{id}: remount sent — keep a shell focused on the console"
+                            ));
+                        } else {
+                            self.toast("Mount /CDROM: start the VM first");
+                        }
                     }
                     other => {
                         if let Some(msg) = scsi_menu::apply(&mut self.cfg, other) {
@@ -1520,7 +1713,11 @@ impl App {
         };
         ui.label(status);
         if running && !halted {
-            ui.label(format!("{:.0} MIPS", self.emu.status.mips));
+            ui.label(format!("{:.0} MIPS", self.emu.status.mips))
+                .on_hover_text(
+                    "MIPS = instructions per wall-clock second on your PC (real emulation speed).\n\
+                     IRIX System Manager \"MHz\" from hinv is inventory from the PROM — not host performance.",
+                );
         }
         // Networking indicator — ONE badge that shows both liveness (the dot's
         // colour) and the active backend (the label: NAT / PCAP). Grey while
@@ -1648,6 +1845,107 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.graphics.heads == 2 {
+            self.framebuffer_panel_dual(ui);
+            return;
+        }
+        self.framebuffer_panel_single(ui);
+    }
+
+    /// Dual Newport heads: side-by-side viewports (head 0 captures input).
+    fn framebuffer_panel_dual(&mut self, ui: &mut egui::Ui) {
+        let seq0 = self.emu.frame_sink.seq();
+        let seq1 = self.emu.frame_sink_head1.seq();
+        if seq0 == 0 && seq1 == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Emulator running — waiting for first REX3 frame…")
+                    .color(Color32::LIGHT_GRAY));
+            });
+            return;
+        }
+        ui.columns(2, |cols| {
+            cols[0].vertical(|ui| {
+                ui.label(RichText::new("Head 0").small().weak());
+                if seq0 > 0 {
+                    Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb");
+                    if let Some(tex) = &self.fb_tex {
+                        let size = fb_fit_size(ui.available_size(), tex.size_vec2());
+                        ui.centered_and_justified(|ui| {
+                            let response = ui.add(
+                                egui::Image::new((tex.id(), size))
+                                    .fit_to_exact_size(size)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if response.clicked() {
+                                response.request_focus();
+                                self.input_state.captured = true;
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(RichText::new("waiting…").weak());
+                }
+            });
+            cols[1].vertical(|ui| {
+                ui.label(RichText::new("Head 1").small().weak());
+                if seq1 > 0 {
+                    Self::upload_fb_texture(
+                        ui,
+                        &self.emu.frame_sink_head1,
+                        &mut self.fb_tex_head1,
+                        &mut self.last_fb_seq_head1,
+                        "rex3_fb_h1",
+                    );
+                    if let Some(tex) = &self.fb_tex_head1 {
+                        let size = fb_fit_size(ui.available_size(), tex.size_vec2());
+                        ui.centered_and_justified(|ui| {
+                            ui.add(egui::Image::new((tex.id(), size)).fit_to_exact_size(size));
+                        });
+                    }
+                } else {
+                    ui.label(RichText::new("waiting…").weak());
+                }
+            });
+        });
+    }
+
+    fn upload_fb_texture(
+        ui: &egui::Ui,
+        sink: &crate::framebuffer::FrameSink,
+        tex_slot: &mut Option<egui::TextureHandle>,
+        last_seq: &mut u64,
+        tex_id: &str,
+    ) {
+        let seq = sink.seq();
+        if seq == 0 { return; }
+        let want_nearest = match tex_slot.as_ref().map(|t| t.size_vec2()) {
+            Some(px) if px.x >= 1.0 && px.y >= 1.0 => {
+                let scale = ui.available_size().y * ui.ctx().pixels_per_point() / px.y;
+                is_integer_scale(scale)
+            }
+            _ => true,
+        };
+        if tex_slot.is_none() || seq != *last_seq {
+            let frame = sink.snapshot();
+            if frame.width == 0 || frame.height == 0 { return; }
+            let opts = if want_nearest {
+                egui::TextureOptions::NEAREST
+            } else {
+                egui::TextureOptions::LINEAR
+            };
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width, frame.height],
+                &frame.rgba,
+            );
+            match tex_slot {
+                Some(t) => t.set(img, opts),
+                None => *tex_slot = Some(ui.ctx().load_texture(tex_id, img, opts)),
+            }
+            *last_seq = frame.seq;
+        }
+    }
+
+    fn framebuffer_panel_single(&mut self, ui: &mut egui::Ui) {
         // Lock-free check first: only clone + re-upload the (multi-MB)
         // framebuffer when REX3 has actually produced a new frame. Cloning on
         // every 60 fps repaint regardless was ~300 MB/s of pointless copying
@@ -1685,21 +1983,46 @@ impl App {
         if self.fb_tex.is_none() || seq != self.last_fb_seq || want_nearest != self.fb_nearest {
             let frame = self.emu.frame_sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width, frame.height], &frame.rgba);
+
             let opts = if want_nearest {
                 egui::TextureOptions::NEAREST
             } else {
                 egui::TextureOptions::LINEAR
             };
-            match &mut self.fb_tex {
-                Some(t) => t.set(img, opts),
-                None => {
-                    self.fb_tex = Some(ui.ctx().load_texture("rex3_fb", img, opts));
+
+            let partial = frame.dirty_h > 0
+                && frame.dirty_h < frame.height as u32
+                && self.fb_tex.is_some();
+
+            if partial {
+                let y = frame.dirty_y as usize;
+                let h = frame.dirty_h as usize;
+                let w = frame.width;
+                let start = y * w * 4;
+                let end = (y + h) * w * 4;
+                if end <= frame.rgba.len() {
+                    let partial_img = egui::ColorImage::from_rgba_unmultiplied(
+                        [w, h],
+                        &frame.rgba[start..end],
+                    );
+                    if let Some(tex) = &mut self.fb_tex {
+                        tex.set_partial([0, y], partial_img, opts);
+                    }
+                    self.last_fb_seq = frame.seq;
+                    self.fb_nearest = want_nearest;
                 }
+            } else {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width, frame.height], &frame.rgba);
+                match &mut self.fb_tex {
+                    Some(t) => t.set(img, opts),
+                    None => {
+                        self.fb_tex = Some(ui.ctx().load_texture("rex3_fb", img, opts));
+                    }
+                }
+                self.last_fb_seq = frame.seq;
+                self.fb_nearest = want_nearest;
             }
-            self.last_fb_seq = frame.seq;
-            self.fb_nearest = want_nearest;
         }
 
         // Consume the snap request before the immutable borrow of self.fb_tex.
@@ -1874,15 +2197,29 @@ impl App {
             }
         }
 
-        let out = show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.net_ifaces, &self.prefs.disk_folders, &self.pcap_ifaces);
+        let banks_before = self.cfg.banks;
+        let jit_before = self.cfg.jit.clone();
+        let cfg_before = toml::to_string(&self.cfg).unwrap_or_default();
+        let out = show_tab(
+            ui,
+            self.tab,
+            &mut self.cfg,
+            &self.net_ifaces,
+            &self.prefs.disk_folders,
+            &self.pcap_ifaces,
+            MemoryUiContext {
+                running: self.emu.is_running(),
+                started_banks: self.started_banks,
+            },
+        );
         match out.action {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
             ConfigAction::EnablePacketCapture => self.run_enable_packet_capture(),
-            ConfigAction::LoadDisc { id, path } => {
+            ConfigAction::LoadDisc { id, path, remount } => {
                 if self.emu.is_running() {
-                    self.emu.send(Cmd::LoadDisc { id, path: path.clone() });
+                    self.emu.send(Cmd::LoadDisc { id, path: path.clone(), remount });
                     let filename = std::path::Path::new(&path)
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -1890,14 +2227,25 @@ impl App {
                     self.toast(format!("SCSI #{}: loaded {}", id, filename));
                 }
             }
+            ConfigAction::TestCi => self.test_ci_launch(),
+            ConfigAction::RebuildProfile { gui } => self.spawn_rebuild_profile(gui),
             ConfigAction::None => {}
         }
         if out.disks_changed { self.mark_dirty(); }
+        if self.cfg.banks != banks_before {
+            self.mark_dirty();
+        }
+        if self.cfg.jit != jit_before {
+            self.mark_dirty();
+        }
         // A disk image was just picked: check up front whether its folder is
         // grantable, so the user handles permissions at assignment time rather
         // than discovering at exit that the disk can't be compacted.
         if out.disk_picked { self.check_chd_folder_grants(); }
         if out.net.changed { self.mark_dirty(); }
+        if toml::to_string(&self.cfg).unwrap_or_default() != cfg_before {
+            self.mark_dirty();
+        }
         if out.net.forwards_changed && self.emu.is_running() {
             // Rebind the running NAT's listeners so a forward added/removed now
             // takes effect without a restart (latest-wins coalesces in the NAT).
@@ -2216,8 +2564,8 @@ impl App {
                     ui.label(RichText::new("The serial console is NOT the network").strong());
                     ui.label("• Help > Diagnostics > Serial console is the guest's serial terminal — for login");
                     ui.label("   and the PROM monitor — and works the same with or without guest networking.");
-                    ui.label("• It's carried over host loopback TCP (127.0.0.1:8881 = console, 8888 = PROM");
-                    ui.label("   monitor) only as the in-app viewer's transport; that loopback is not the");
+                    ui.label("• It's carried over host loopback TCP (127.0.0.1:8881 = guest serial / ttyd1;");
+                    ui.label("   8888 is the IRIS debug monitor, not the guest console). That loopback is not the");
                     ui.label("   guest's network connection.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Guest IP & subnets").strong());
@@ -2588,15 +2936,19 @@ impl App {
         ui.add_space(4.0);
 
         let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
-        ui.label(format!("Machine: {name}"));
+        let profile = self.cfg.machine.profile.label();
+        ui.label(format!("Machine: {name} · {profile}"));
         if self.cfg_dirty {
             ui.label(RichText::new("(autosave pending…)").weak().small());
         }
         ui.add_space(8.0);
 
-        let total_ram: u32 = self.cfg.banks.iter().sum();
+        let ram_line = ram_summary(&self.cfg.banks);
         ui.label(RichText::new("Machine summary").strong());
         egui::Grid::new("summary_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Platform");
+            ui.label(self.cfg.machine.profile.label());
+            ui.end_row();
             ui.label("PROM");
             ui.label(if std::path::Path::new(&self.cfg.prom).exists() {
                 abs_path(&self.cfg.prom)
@@ -2607,9 +2959,16 @@ impl App {
             ui.label("NVRAM");
             ui.label(abs_path(&self.cfg.nvram));
             ui.end_row();
-            ui.label("RAM");
-            ui.label(format!("{total_ram} MB ({:?})", self.cfg.banks));
+            ui.label("RAM (config)");
+            ui.label(ram_line);
             ui.end_row();
+            if let Some(started) = self.started_banks {
+                if started != self.cfg.banks {
+                    ui.label("RAM (last Start)");
+                    ui.label(ram_summary(&started));
+                    ui.end_row();
+                }
+            }
             ui.label("Drives");
             ui.vertical(|ui| {
                 let mut ids: Vec<u8> = self.cfg.scsi.keys().copied().collect();
@@ -2665,7 +3024,11 @@ impl App {
         self.run_state_label(ui);
         ui.separator();
         let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
-        ui.label(format!("Machine: {name}{}", if self.cfg_dirty { " *" } else { "" }));
+        let profile = self.cfg.machine.profile.label();
+        ui.label(format!(
+            "Machine: {name} · {profile}{}",
+            if self.cfg_dirty { " *" } else { "" }
+        ));
         ui.label(format!("Dirty COW: {}", self.emu.status.dirty_cow));
         if let Some((msg, when)) = self.toast.clone() {
             if when.elapsed().as_secs() < 5 {
@@ -2745,7 +3108,7 @@ impl eframe::App for App {
 
                 if let Some(id) = cdrom_id {
                     if let Some(path) = scsi_menu::pick_iso("Load CD-ROM disc") {
-                        self.emu.send(Cmd::LoadDisc { id, path });
+                        self.emu.send(Cmd::LoadDisc { id, path, remount: true });
                     }
                 } else {
                     self.toast("No CD-ROM drive attached");
@@ -2815,7 +3178,15 @@ impl eframe::App for App {
                 if self.pending_launcher_fit
                     && ui.ctx().input(|i| i.viewport().monitor_size).is_some()
                 {
-                    Self::snap_window_to_fb(ui.ctx(), egui::vec2(1280.0, 1024.0), ui.available_size(), self.prefs.vm_scale);
+                    Self::snap_window_to_fb(
+                        ui.ctx(),
+                        egui::vec2(
+                            self.cfg.graphics.host_display_size().0 as f32,
+                            self.cfg.graphics.host_display_size().1 as f32,
+                        ),
+                        ui.available_size(),
+                        self.prefs.vm_scale,
+                    );
                     self.pending_launcher_fit = false;
                 }
                 // Emulator not running: make sure a leftover mouse capture is

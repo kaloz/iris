@@ -310,28 +310,44 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
             }
         }
 
-        // 4. Run the fetched callback
+        // 4. Run the fetched callback (with late catch-up for recurring timers).
+        const MAX_CATCHUP: u32 = 8;
         if let Some((idx, generation, cb_opt, _og_period, _og_expiration)) = to_call {
             if let Some(mut cb) = cb_opt {
-                let result = cb.call();
+                let mut result = cb.call();
+                let mut catch_up = 0u32;
 
-                // Lock again to apply the result.
-                let mut guard = inner.lock();
-                if guard.stop {
-                    break;
-                }
+                loop {
+                    let mut guard = inner.lock();
+                    if guard.stop {
+                        break;
+                    }
 
-                if let Some(slot) = guard.slots.get_mut(idx) {
-                    if slot.generation == generation && slot.timer.is_some() {
+                    if let Some(slot) = guard.slots.get_mut(idx) {
+                        if slot.generation != generation || slot.timer.is_none() {
+                            break;
+                        }
                         let t = slot.timer.as_mut().unwrap();
                         t.callback = Some(cb);
 
+                        let period = t.period;
+                        let enabled = t.enabled;
                         match result {
                             TimerReturn::Continue => {
-                                if let Some(period) = t.period {
+                                if let Some(period) = period {
                                     t.next_expiration += period;
+                                    let now = Instant::now();
+                                    if catch_up + 1 < MAX_CATCHUP
+                                        && enabled
+                                        && t.next_expiration <= now
+                                    {
+                                        catch_up += 1;
+                                        cb = t.callback.take().unwrap();
+                                        drop(guard);
+                                        result = cb.call();
+                                        continue;
+                                    }
                                 } else {
-                                    // One shot dies on Continue
                                     guard.deallocate(((generation as u64) << 32) | (idx as u64));
                                 }
                             }
@@ -347,10 +363,11 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                             }
                             TimerReturn::RescheduleRecurring(new_period) => {
                                 t.period = Some(new_period);
-                                t.next_expiration += new_period; // Advance by the new period
+                                t.next_expiration += new_period;
                             }
                         }
                     }
+                    break;
                 }
             }
             continue; // Re-evaluate time continuously
@@ -366,14 +383,21 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
 
                 let delay = target - sleep_now;
 
-                if delay > Duration::from_micros(200) {
-                    // Park with a safe threshold
+                if delay > Duration::from_micros(500) {
+                    // Park with a safe threshold for long waits.
                     let park_duration = delay - Duration::from_micros(100);
                     thread::park_timeout(park_duration);
+                } else if delay > Duration::from_micros(200) {
+                    // Medium wait: short park then spin the remainder.
+                    thread::park_timeout(delay - Duration::from_micros(50));
                 } else {
-                    // Short sleep instead of spin — yields the core without
-                    // burning CPU while waiting for the timer to fire.
-                    thread::sleep(Duration::from_micros(50));
+                    // Audio-scale waits (~23 µs at 44.1 kHz): spin to avoid 50 µs sleep floor.
+                    let deadline = Instant::now() + delay;
+                    while Instant::now() < deadline
+                        && !new_timer_added.load(Ordering::Acquire)
+                    {
+                        std::hint::spin_loop();
+                    }
                 }
             }
         } else {

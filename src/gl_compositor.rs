@@ -192,6 +192,9 @@ pub struct GlCompositor {
     last_ramdac_hash: u64,
     last_xmap_hash:   u64,
     last_cursor_hash: u64,
+
+    /// Reusable PBO for async readback (iris-gui GL capture path).
+    readback_pbo: std::cell::RefCell<Option<(glow::Buffer, usize)>>,
 }
 
 impl GlCompositor {
@@ -212,6 +215,7 @@ impl GlCompositor {
             last_ramdac_hash: u64::MAX,
             last_xmap_hash:   u64::MAX,
             last_cursor_hash: u64::MAX,
+            readback_pbo: std::cell::RefCell::new(None),
         }
     }
 
@@ -331,6 +335,69 @@ impl GlCompositor {
         true
     }
 
+    fn upload_fb_u32_rows(
+        gl: &glow::Context,
+        tex: glow::Texture,
+        data: &[u32],
+        w: i32,
+        x0: usize,
+        x1: usize,
+        y0: usize,
+        y1: usize,
+    ) {
+        let row_h = (y1 - y0) as i32;
+        let col_w = (x1 - x0) as i32;
+        if row_h <= 0 || col_w <= 0 {
+            return;
+        }
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+            let start = y0 * FB_W as usize + x0;
+            let byte_len = if row_h <= 1 {
+                col_w as usize * 4
+            } else {
+                (row_h as usize - 1) * FB_W as usize * 4 + col_w as usize * 4
+            };
+            let bytes = std::slice::from_raw_parts(
+                data[start..].as_ptr() as *const u8,
+                byte_len,
+            );
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D, 0, x0 as i32, y0 as i32, col_w, row_h,
+                glow::RED_INTEGER, glow::UNSIGNED_INT,
+                glow::PixelUnpackData::Slice(bytes),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
+    fn upload_fb_u8_rows(
+        gl: &glow::Context,
+        tex: glow::Texture,
+        data: &[u8],
+        w: i32,
+        y0: usize,
+        y1: usize,
+    ) {
+        let row_h = (y1 - y0) as i32;
+        if row_h <= 0 {
+            return;
+        }
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+            let start = y0 * FB_W as usize;
+            let bytes = &data[start..start + (y1 - y0) * FB_W as usize];
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D, 0, 0, y0 as i32, w, row_h,
+                glow::RED_INTEGER, glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(bytes),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
     fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], w: i32, h: i32) {
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -439,10 +506,32 @@ impl Compositor for GlCompositor {
         let fbo        = self.fbo.unwrap();
         let vao        = self.vao.unwrap();
 
-        // ── Upload per-frame buffers ───────────────────────────────────────────
-        Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, w, h);
-        Self::upload_fb_u32(gl, tex_aux, src.fb_aux, w, h);
-        Self::upload_fb_u8 (gl, tex_did, src.did,    w, h);
+        // ── Upload per-frame buffers (partial when dirty region is a strict subset) ─
+        let partial_y = src.dirty_y1 > src.dirty_y0
+            && (src.dirty_y0 > 0 || src.dirty_y1 < src.height);
+        let partial_x = src.dirty_x1 > src.dirty_x0
+            && (src.dirty_x0 > 0 || src.dirty_x1 < src.width);
+        let partial = partial_y || partial_x;
+        if partial {
+            Self::upload_fb_u32_rows(
+                gl, tex_rgb, src.fb_rgb, w,
+                src.dirty_x0, src.dirty_x1, src.dirty_y0, src.dirty_y1,
+            );
+            Self::upload_fb_u32_rows(
+                gl, tex_aux, src.fb_aux, w,
+                src.dirty_x0, src.dirty_x1, src.dirty_y0, src.dirty_y1,
+            );
+        } else {
+            Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, w, h);
+            Self::upload_fb_u32(gl, tex_aux, src.fb_aux, w, h);
+        }
+        if !src.status_bar_only {
+            if partial_y {
+                Self::upload_fb_u8_rows(gl, tex_did, src.did, w, src.dirty_y0, src.dirty_y1);
+            } else {
+                Self::upload_fb_u8(gl, tex_did, src.did, w, h);
+            }
+        }
 
         // ── Upload lookup tables (skip if unchanged) ───────────────────────────
         let cmap_hash = hash_u32_slice(src.cmap);
@@ -553,6 +642,9 @@ impl Compositor for GlCompositor {
             if let Some(f) = self.fbo.take()        { gl.delete_framebuffer(f); }
             if let Some(p) = self.program.take()    { gl.delete_program(p); }
             if let Some(v) = self.vao.take()        { gl.delete_vertex_array(v); }
+            if let Some((pbo, _)) = self.readback_pbo.borrow_mut().take() {
+                gl.delete_buffer(pbo);
+            }
         }
         self.last_cmap_hash   = u64::MAX;
         self.last_ramdac_hash = u64::MAX;
@@ -567,12 +659,74 @@ impl Compositor for GlCompositor {
     fn readback_to_screen(&self, dst: &mut [u32], width: usize, height: usize, gl: &glow::Context) {
         let Some(fbo) = self.fbo else { return; };
         let row_bytes = width * 4;
-        let mut tight: Vec<u8> = vec![0u8; row_bytes * height];
+        let total_bytes = row_bytes * height;
+        let mut tight: Vec<u8> = vec![0u8; total_bytes];
         unsafe {
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
-            gl.read_pixels(0, 0, width as i32, height as i32,
-                glow::RGBA, glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(&mut tight));
+
+            let mut pbo_guard = self.readback_pbo.borrow_mut();
+            let use_pbo = if let Some((pbo, cap)) = pbo_guard.as_mut() {
+                if *cap < total_bytes {
+                    gl.delete_buffer(*pbo);
+                    *pbo_guard = None;
+                    false
+                } else {
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(*pbo));
+                    gl.read_pixels(
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(&mut []),
+                    );
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(*pbo));
+                    let mapped = gl.map_buffer_range(
+                        glow::PIXEL_PACK_BUFFER,
+                        0,
+                        total_bytes as i32,
+                        glow::MAP_READ_BIT,
+                    );
+                    if !mapped.is_null() {
+                        std::ptr::copy_nonoverlapping(
+                            mapped,
+                            tight.as_mut_ptr(),
+                            total_bytes,
+                        );
+                        let _ = gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                    }
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                    true
+                }
+            } else {
+                false
+            };
+
+            if !use_pbo {
+                gl.read_pixels(
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(&mut tight),
+                );
+                if pbo_guard.is_none() {
+                    if let Ok(pbo) = gl.create_buffer() {
+                        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                        gl.buffer_data_size(
+                            glow::PIXEL_PACK_BUFFER,
+                            total_bytes as i32,
+                            glow::DYNAMIC_READ,
+                        );
+                        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                        *pbo_guard = Some((pbo, total_bytes));
+                    }
+                }
+            }
+
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
         }
         // FBO gl_FragCoord.y=0 = display row 0 (top); glReadPixels row 0 = that same bottom.

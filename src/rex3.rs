@@ -30,6 +30,8 @@ pub trait Renderer: Send {
         sbtex:         &mut crate::disp::StatusBarTexture,
         stats:         &crate::disp::BarStats,
         need_readback: bool,
+        live_fb_rgb:   Option<&[u32]>,
+        live_fb_aux:   Option<&[u32]>,
     );
 
     fn resize(&mut self, _width: usize, _height: usize) {}
@@ -1049,6 +1051,8 @@ pub struct Rex3 {
     pub cmap1: Mutex<Cmap>,
     pub bt445: Mutex<Bt445>,
     clock: AtomicU64,
+    /// REX3 refresh thread iterations (~display vsync cadence).
+    refresh_frames: AtomicU64,
     running: AtomicBool,
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -1068,8 +1072,18 @@ pub struct Rex3 {
     /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
     /// true so the first frame always renders.
     fb_dirty: AtomicBool,
+    /// Tile dirty tracking: min/max X/Y touched since last refresh (Phase 3).
+    dirty_x_min: AtomicU32,
+    dirty_x_max: AtomicU32,
+    dirty_y_min: AtomicU32,
+    dirty_y_max: AtomicU32,
+    /// Rows filled via rex3_simd fastclear path (monitor `perf snapshot`).
+    pub simd_fill_rows: AtomicU64,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub graphics_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub gfx_drain_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
     /// Payload of GFIFO_DISP_SYNC pushed to the GFIFO on each such write.
     pub xmap_fence: AtomicU32,
@@ -1190,6 +1204,7 @@ impl Rex3 {
             cmap1: Mutex::new(Cmap::new(1)),
             bt445: Mutex::new(Bt445::new()),
             clock: AtomicU64::new(0),
+            refresh_frames: AtomicU64::new(0),
             running: AtomicBool::new(false),
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
@@ -1199,8 +1214,16 @@ impl Rex3 {
             #[cfg(feature = "idle-pause")]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
+            dirty_x_min: AtomicU32::new(u32::MAX),
+            dirty_x_max: AtomicU32::new(0),
+            dirty_y_min: AtomicU32::new(u32::MAX),
+            dirty_y_max: AtomicU32::new(0),
+            simd_fill_rows: AtomicU64::new(0),
             screen,
             vblank_cb: Mutex::new(None),
+            fifo_full_cb: Mutex::new(None),
+            graphics_cb: Mutex::new(None),
+            gfx_drain_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
             debug: Arc::new(AtomicBool::new(false)),
@@ -1294,6 +1317,81 @@ impl Rex3 {
 
     pub fn set_vblank_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.vblank_cb.lock() = Some(cb);
+    }
+
+    pub fn set_fifo_full_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
+        *self.fifo_full_cb.lock() = Some(cb);
+    }
+
+    pub fn set_graphics_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
+        *self.graphics_cb.lock() = Some(cb);
+    }
+
+    pub fn set_gfx_drain_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
+        *self.gfx_drain_cb.lock() = Some(cb);
+    }
+
+    /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
+    pub fn apply_display_resolution(&self, mode: crate::vc2_timings::NewportResolution) {
+        if mode.is_guest() {
+            return;
+        }
+        {
+            let mut vc2 = self.vc2.lock();
+            crate::vc2_timings::apply_newport_resolution(&mut vc2, mode);
+        }
+        // Idle background until the guest paints (compositor uses host-only
+        // direct-colour fallback while xmap is still zero — see CaptureRenderer).
+        if let Some((w, h)) = mode.visible_size() {
+            const FILL: u32 = 0x0060_0000; // dark blue, Newport BGR (B<<16|G<<8|R)
+            let w = w as usize;
+            let h = h as usize;
+            unsafe {
+                let fb = &mut *self.fb_rgb.get();
+                for y in 0..h.min(1024) {
+                    let row = y * 2048;
+                    fb[row..row + w.min(2048)].fill(FILL);
+                }
+            }
+        }
+        self.fb_dirty.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn gfifo_hw_level(pending: usize) -> u32 {
+        if pending == 0 {
+            0
+        } else {
+            (pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH) as u32).max(1)
+        }
+    }
+
+    /// Recompute GFIFO threshold interrupts and drive IOC callback lines.
+    fn update_gfifo_irqs(&self) {
+        let pending = self.gfifo.len();
+        let level = Self::gfifo_hw_level(pending);
+        let cfg = self.config.config.load(Ordering::Relaxed);
+        let threshold = (cfg >> CONFIG_GFIFODEPTH_SHIFT) & 0x1F;
+        let above_int = cfg & CONFIG_GFIFOABOVEINT != 0;
+
+        let above = above_int && level >= threshold;
+        if above {
+            self.config.status.fetch_or(STATUS_GFIFO_INT, Ordering::Relaxed);
+        } else {
+            self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed);
+        }
+
+        if let Some(cb) = self.fifo_full_cb.lock().clone() {
+            cb(above);
+        }
+        if let Some(cb) = self.gfx_drain_cb.lock().clone() {
+            // Drain interrupt: FIFO has dropped below the high-water threshold.
+            cb(above_int && !above);
+        }
+        let gfx_idle = !self.gfxbusy.load(Ordering::Acquire) && pending == 0;
+        if let Some(cb) = self.graphics_cb.lock().clone() {
+            cb(gfx_idle);
+        }
     }
 
     #[cfg(feature = "developer")]
@@ -1463,6 +1561,13 @@ impl Rex3 {
     }
 
     fn draw_block(&self, ctx: &mut Rex3Context) {
+        if crate::rex3_simd::try_fastclear_block(self, ctx) {
+            return;
+        }
+        if crate::rex3_simd::try_src_block_rgb(self, ctx) {
+            return;
+        }
+
         let _w = (ctx.xend - ctx.xstart).abs();
         let _h = (ctx.yend - ctx.ystart).abs();
 
@@ -1568,6 +1673,9 @@ impl Rex3 {
     }
 
     fn draw_span(&self, ctx: &mut Rex3Context) {
+        if crate::rex3_simd::try_src_span_rgb(self, ctx) {
+            return;
+        }
         if  ctx.drawmode0.lronly() && (ctx.bresoctinc1.octant() & OCTANT_XDEC) != 0{
             return;
         }
@@ -1653,7 +1761,114 @@ impl Rex3 {
         }
     }
 
+    /// Fractional d correction for F_LINE/A_LINE from 21.11 endpoint sub-pixel position.
+    /// Fractional nibble is bits [10:7] of the 21.11 coordinate (16.4(7) layout).
+    fn fline_apply_fract(
+        ctx: &Rex3Context,
+        d: &mut i32,
+        x: &mut i32,
+        y: &mut i32,
+        incrx2: i32,
+        incry2: i32,
+        y_major: bool,
+    ) {
+        let octant = ctx.bresoctinc1.octant() & 7;
+        let x1p = ctx.xstart >> 11;
+        let y1p = ctx.ystart >> 11;
+        let x2p = ctx.xend >> 11;
+        let y2p = ctx.yend >> 11;
+        let mut dx = (x1p - x2p).abs();
+        let mut dy = (y1p - y2p).abs();
+        let mut xf = ((ctx.xstart >> 7) & 0xF) as i32;
+        let mut yf = ((ctx.ystart >> 7) & 0xF) as i32;
+
+        match octant {
+            1 => {
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut dx, &mut dy);
+            }
+            3 => {
+                xf = 0x10 - xf;
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut dx, &mut dy);
+            }
+            7 => { xf = 0x10 - xf; }
+            6 => {
+                xf = 0x10 - xf;
+                yf = 0x10 - yf;
+            }
+            2 => {
+                let t = 0x10 - xf;
+                xf = 0x10 - yf;
+                yf = t;
+                std::mem::swap(&mut dx, &mut dy);
+            }
+            0 => {
+                let t = 0x10 - yf;
+                yf = xf;
+                xf = t;
+                std::mem::swap(&mut dx, &mut dy);
+            }
+            4 => { yf = 0x10 - yf; }
+            _ => {}
+        }
+
+        *d += 2 * (((dx * yf) >> 4) - ((dy * xf) >> 4));
+        let major_delta = if y_major { dy } else { dx };
+        let e = *d - 2 * major_delta;
+        if e > 0 {
+            *d = e;
+            let x_major = !y_major;
+            if x_major {
+                *y -= incry2;
+            } else {
+                *x += incrx2;
+            }
+        }
+    }
+
     fn draw_iline(&self, ctx: &mut Rex3Context) {
+        self.draw_line_bresenham(ctx, false, false, false);
+    }
+
+    fn draw_fline(&self, ctx: &mut Rex3Context) {
+        self.draw_line_bresenham(ctx, true, false, false);
+    }
+
+    fn draw_aline(&self, ctx: &mut Rex3Context) {
+        let mut extra_skip_first = false;
+        let mut extra_skip_last = false;
+        if ctx.drawmode0.endptfilter() {
+            // Basic endpoint filter: consult AWEIGHT LUT for sub-pixel coverage.
+            let xsf = (ctx.xstart >> 7) & 0xF;
+            let ysf = (ctx.ystart >> 7) & 0xF;
+            let xef = (ctx.xend >> 7) & 0xF;
+            let yef = (ctx.yend >> 7) & 0xF;
+            if xsf != 0 || ysf != 0 {
+                let wi = ((xsf + ysf) as usize).min(15);
+                let w = (ctx.aweight0 >> (wi * 4)) & 0xF;
+                if w == 0 {
+                    extra_skip_first = true;
+                }
+            }
+            if xef != 0 || yef != 0 {
+                let wi = ((xef + yef) as usize).min(15);
+                let w = (ctx.aweight1 >> (wi * 4)) & 0xF;
+                if w == 0 {
+                    extra_skip_last = true;
+                }
+            }
+        }
+        self.draw_line_bresenham(ctx, true, extra_skip_first, extra_skip_last);
+    }
+
+    fn draw_line_bresenham(
+        &self,
+        ctx: &mut Rex3Context,
+        fract: bool,
+        extra_skip_first: bool,
+        extra_skip_last: bool,
+    ) {
         // Bresenham octant table (aped from MAME do_iline s_bresenham_infos).
         // Fields: (incrx1, incrx2, incry1, incry2, y_major)
         // MAME applies y as `y -= incry`, so positive incry moves y in the negative direction.
@@ -1691,16 +1906,25 @@ impl Rex3 {
             if raw & (1 << 26) != 0 { (raw | 0xF800_0000) as i32 } else { raw as i32 }
         };
 
+        if fract && ctx.drawmode0.dosetup() {
+            Self::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
+        }
+
         // pixel_count = major_axis_length + 1 (both endpoints inclusive).
-        let major = if y_major { (y2 - y).abs() } else { (x2 - x).abs() };
+        // max(|dx|,|dy|): continuation GOs (dosetup clear) must still walk the full
+        // segment when persisted octant y_major disagrees with start→end (e.g. a
+        // degenerate setup GO followed by a horizontal stipple continuation).
+        let adx = (x2 - x).abs();
+        let ady = (y2 - y).abs();
+        let major = adx.max(ady);
         let mut pixel_count = major + 1;
         if ctx.drawmode0.length32() && pixel_count > 32 {
             pixel_count = 32;
         }
 
         let iterate_one = !ctx.drawmode0.stoponx() && !ctx.drawmode0.stopony();
-        let mut skip_first = ctx.drawmode0.skipfirst();
-        let mut skip_last = ctx.drawmode0.skiplast();
+        let mut skip_first = ctx.drawmode0.skipfirst() || extra_skip_first;
+        let mut skip_last = ctx.drawmode0.skiplast() || extra_skip_last;
         if iterate_one {
             pixel_count = 1;
             skip_first = false;
@@ -1710,6 +1934,7 @@ impl Rex3 {
         let proc_fn    = unsafe { *self.px_proc.get() };
         let shade_fn   = unsafe { *self.px_shade.get() };
         let pattern_fn = unsafe { *self.px_pattern.get() };
+        let lsadvlast  = ctx.drawmode0.lsadvlast();
 
         macro_rules! bres_step {
             () => {
@@ -1733,7 +1958,9 @@ impl Rex3 {
             }
 
             shade_fn(ctx);
-            pattern_fn(ctx);
+            if !is_last || lsadvlast {
+                pattern_fn(ctx);
+            }
 
             // On the last pixel of a full-line draw, verify Bresenham landed on x2,y2.
             // Skip in step mode (pixel_count==1) where we draw only one intermediate pixel.
@@ -1837,14 +2064,15 @@ impl Rex3 {
     //   LSRCOUNT  (down counter, 0..LSREPEAT-1): decremented each pixel.
     //   When LSRCOUNT == 0 after decrement → advance pat_bit, reload LSRCOUNT = LSREPEAT-1.
     //   LSLENGTH  (4 bits): pattern length = lslength + 17 (range 17..32).
-    //   pat_bit wraps: when it would go below (32 - length), reset to 31.
+    //   At pattern end the hardware recirculates by rotating LSPATTERN left (ROL).
     //   LSREPEAT==0 is treated as 1 (no-repeat is the degenerate case).
 
     fn iterate_pattern_noop(_ctx: &mut Rex3Context) {}
 
     #[inline(always)]
     fn advance_zpat(ctx: &mut Rex3Context) {
-        ctx.zpat_bit = ctx.zpat_bit.wrapping_sub(1) & 31;
+        // Hardware recirculates MSB-first: rotate left through the 32-bit pattern.
+        ctx.zpat_bit = ctx.zpat_bit.wrapping_add(1) & 31;
     }
 
     #[inline(always)]
@@ -1857,9 +2085,10 @@ impl Rex3 {
             let length = ctx.lsmode.lslength() as u8 + 17; // 17..=32
             let wrap_point = 32u8.saturating_sub(length);  // bit index of pattern end
             if ctx.pat_bit == wrap_point {
-                ctx.pat_bit = 31; // recirculate
+                // Recirculate: rotate pattern left, keep cursor at wrap_point.
+                ctx.lspattern = ctx.lspattern.rotate_left(1);
             } else {
-                ctx.pat_bit = ctx.pat_bit.wrapping_sub(1) & 31;
+                ctx.pat_bit = ctx.pat_bit.wrapping_add(1) & 31;
             }
         } else {
             ctx.lsmode.set_lsrcount(ctx.lsmode.lsrcount() - 1);
@@ -2301,7 +2530,7 @@ impl Rex3 {
     }
 
     /// Replicate colorvram to fill plane-depth slots, matching MAME get_default_color() with fastclear=1.
-    fn fastclear_color(ctx: &Rex3Context) -> u32 {
+    pub(crate) fn fastclear_color(ctx: &Rex3Context) -> u32 {
         let v = ctx.colorvram;
         match ctx.drawmode1.drawdepth() {
             0 => { let c = v & 0xf; c | (c << 4) | (c << 8) | (c << 16) }
@@ -2578,10 +2807,10 @@ impl Rex3 {
         dlog_dev!(LogModule::Dcb, "DCB Write: Val {:08x} Mode {:08x} (Addr {} CRS {} DW {})", val, dcb.dcbmode, addr, dcb.crs(), data_width);
 
         // DCBMODE bit 28 "Swap Byte Ordering": swap within the data width.
-        // DW_3 is ambiguous — skipped for now.
         if (dcb.dcbmode & DCBMODE_SWAPENDIAN) != 0 {
             val = match data_width {
                 DCBMODE_DATAWIDTH_2 => ((val & 0x00FF00FF) << 8) | ((val >> 8) & 0x00FF00FF),
+                DCBMODE_DATAWIDTH_3 => ((val & 0x0000FF) << 16) | (val & 0x00FF00) | ((val >> 16) & 0x0000FF),
                 DCBMODE_DATAWIDTH_4 => val.swap_bytes(),
                 _                   => val,
             };
@@ -2915,6 +3144,7 @@ impl Rex3 {
             });
         }
         self.gfifo.push(addr, val);
+        self.update_gfifo_irqs();
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
@@ -2936,7 +3166,67 @@ impl Rex3 {
         }
     }
 
+    pub fn dirty_y_range(&self) -> (u32, u32) {
+        (
+            self.dirty_y_min.load(Ordering::Relaxed),
+            self.dirty_y_max.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn dirty_x_range(&self) -> (u32, u32) {
+        (
+            self.dirty_x_min.load(Ordering::Relaxed),
+            self.dirty_x_max.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn note_fb_x(&self, x: i32) {
+        if x < 0 || x >= REX3_SCREEN_WIDTH as i32 {
+            return;
+        }
+        let x = x as u32;
+        let mut min = self.dirty_x_min.load(Ordering::Relaxed);
+        while x < min {
+            match self.dirty_x_min.compare_exchange_weak(min, x, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => min = v,
+            }
+        }
+        let mut max = self.dirty_x_max.load(Ordering::Relaxed);
+        while x > max {
+            match self.dirty_x_max.compare_exchange_weak(max, x, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => max = v,
+            }
+        }
+    }
+
+    pub(crate) fn note_fb_y(&self, y: i32) {
+        if y < 0 || y >= REX3_SCREEN_HEIGHT as i32 {
+            return;
+        }
+        let y = y as u32;
+        let mut min = self.dirty_y_min.load(Ordering::Relaxed);
+        while y < min {
+            match self.dirty_y_min.compare_exchange_weak(min, y, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => min = v,
+            }
+        }
+        let mut max = self.dirty_y_max.load(Ordering::Relaxed);
+        while y > max {
+            match self.dirty_y_max.compare_exchange_weak(max, y, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => max = v,
+            }
+        }
+    }
+
     pub fn calculate_fb_address(&self, x: i32, y: i32, ctx: &Rex3Context, is_write: bool) -> Option<u32> {
+        if is_write {
+            self.note_fb_x(x);
+            self.note_fb_y(y);
+        }
         // 1. XYOFFSET (Draw only, not SCR2SCR source)
         let opcode = ctx.drawmode0.opcode();
         let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
@@ -3078,8 +3368,9 @@ impl Rex3 {
                 // (context registers + FB) only after both process_register and execute_go
                 // have completed.
                 self.gfifo.consume();
+                self.update_gfifo_irqs();
 
-                if exit { 
+                if exit {
                     self.gfxbusy.store(false, Ordering::Release);
                     self.gfifo.flush_head();
                     break; 
@@ -3088,6 +3379,7 @@ impl Rex3 {
                 if is_busy {
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
+                    self.update_gfifo_irqs();
                 }
                 self.gfifo.flush_head();
                 // Nothing in the ring — back off. Spin-hint/yield while a burst
@@ -3122,22 +3414,41 @@ impl Rex3 {
         let ctx = unsafe { &mut *self.context.get() };
         let opcode = ctx.drawmode0.opcode();
 
-        // FIXME: unclear whether pat_bit/zpat_bit should reset to 31 on every GO or carry
-        // over across primitives.  GL stippled line loops likely want continuity between
-        // segments; resetting here would break that.  Need a real test app on hardware to
-        // verify.  For now reset to 31
-        ctx.pat_bit  = 31;
-        ctx.zpat_bit = 31;
+        // Pattern bit positions reset only on DOSETUP (new primitive).  Connected
+        // stippled line segments keep pat_bit across GO via LSSAVE/LSRESTORE.
+        if ctx.drawmode0.dosetup() {
+            ctx.pat_bit  = 31;
+            ctx.zpat_bit = 31;
+        }
         // lsrcount is live state inside the lsmode register — do NOT reset it here.
         // The ARCS diag writes a pattern to lsmode, issues a GO, then reads it back and
         // expects the value unchanged.  Resetting lsrcount on GO would corrupt the readback.
         // GL manages lsrcount explicitly via LSSAVE/LSRESTORE for connected stippled lines.
-        // FIXME: also unclear whether pattern advance is ROL (rotate-left, hardware
-        // recirculation) or ROR as currently implemented.  Suspect ROL based on
-        // "recirculating iterator" language in the spec.  Verify with test app on real Indy.
 
         if ctx.drawmode0.dosetup() {
             self.setup(ctx);
+        } else {
+            // Continuation GO: re-derive Bresenham when the segment axis disagrees with
+            // the persisted octant (e.g. degenerate setup point, then horizontal cont).
+            let adrmode = ctx.drawmode0.adrmode() << 2;
+            let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
+                || adrmode == DRAWMODE0_ADRMODE_F_LINE
+                || adrmode == DRAWMODE0_ADRMODE_A_LINE;
+            if is_line {
+                let xs = ctx.xstart >> 11;
+                let ys = ctx.ystart >> 11;
+                let xe = ctx.xend >> 11;
+                let ye = ctx.yend >> 11;
+                let adx = (xe - xs).abs();
+                let ady = (ye - ys).abs();
+                if adx != ady {
+                    let seg_x_major = adx > ady;
+                    let oct_x_major = (ctx.bresoctinc1.octant() & OCTANT_XMAJOR) != 0;
+                    if seg_x_major != oct_x_major {
+                        self.setup(ctx);
+                    }
+                }
+            }
         }
 
         if devlog_is_active(LogModule::Rex3) {
@@ -3287,11 +3598,12 @@ impl Rex3 {
 
         if opcode != DRAWMODE0_OPCODE_NOOP {
             let adrmode = ctx.drawmode0.adrmode() << 2;
-            if adrmode == DRAWMODE0_ADRMODE_I_LINE
-                || adrmode == DRAWMODE0_ADRMODE_F_LINE
-                || adrmode == DRAWMODE0_ADRMODE_A_LINE
-            {
+            if adrmode == DRAWMODE0_ADRMODE_I_LINE {
                 self.draw_iline(ctx);
+            } else if adrmode == DRAWMODE0_ADRMODE_F_LINE {
+                self.draw_fline(ctx);
+            } else if adrmode == DRAWMODE0_ADRMODE_A_LINE {
+                self.draw_aline(ctx);
             } else if adrmode == DRAWMODE0_ADRMODE_BLOCK {
                 self.log_block(ctx, opcode);
                 self.draw_block(ctx);
@@ -3422,9 +3734,11 @@ impl Rex3 {
         // Idle-skip bookkeeping (see the should_render gate below).
         let mut last_topscan: usize = usize::MAX;
         let mut frames_since_render: u32 = u32::MAX;
+        let mut full_presents: u32 = 0;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
+            self.refresh_frames.fetch_add(1, Ordering::Relaxed);
 
             // Poll and clear activity bits; preserve persistent LED bits.
             let bar_stats = crate::disp::BarStats {
@@ -3432,6 +3746,7 @@ impl Rex3 {
                 hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
                 cycles:       self.cycles.load(Ordering::Relaxed),
                 fasttick:     self.fasttick_count.load(Ordering::Relaxed),
+                refresh_frames: self.refresh_frames.load(Ordering::Relaxed),
                 #[cfg(feature = "developer")]
                 decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
                 #[cfg(not(feature = "developer"))]
@@ -3464,10 +3779,17 @@ impl Rex3 {
             {
                 let target = self.xmap_fence.load(Ordering::Acquire);
                 let backoff = crossbeam_utils::Backoff::new();
+                let fence_wait_start = std::time::Instant::now();
                 loop {
                     let current = self.gfifo_fence.load(Ordering::Acquire);
                     // Wrapping comparison: current >= target
                     if current.wrapping_sub(target) < 0x8000_0000 {
+                        break;
+                    }
+                    // Don't stall the refresh thread forever if the GFIFO consumer
+                    // is behind (e.g. guest reprogramming XMAP while idle).
+                    if fence_wait_start.elapsed() > std::time::Duration::from_millis(50) {
+                        self.gfifo_fence.store(target, Ordering::Release);
                         break;
                     }
                     backoff.snooze();
@@ -3501,7 +3823,8 @@ impl Rex3 {
             let dbg_overlay = self.draw_debug.load(Ordering::Relaxed)
                 || self.show_cmap.load(Ordering::Relaxed)
                 || self.show_disp_debug.load(Ordering::Relaxed);
-            let should_render = self.fb_dirty.swap(false, Ordering::Acquire)
+            let fb_was_dirty = self.fb_dirty.swap(false, Ordering::Acquire);
+            let should_render = fb_was_dirty
                 || palette_dirty
                 || dbg_overlay
                 || topscan != last_topscan
@@ -3514,6 +3837,38 @@ impl Rex3 {
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
                 screen.topscan = topscan;
+                screen.status_bar_only = full_presents > 0
+                    && !fb_was_dirty
+                    && !palette_dirty
+                    && !dbg_overlay
+                    && !self.screenshot_pending.load(Ordering::Relaxed);
+                if screen.status_bar_only {
+                    let h = screen.height.max(1);
+                    let w = screen.width.max(1);
+                    screen.dirty_y0 = h.saturating_sub(crate::disp::STATUS_BAR_HEIGHT);
+                    screen.dirty_y1 = h;
+                    screen.dirty_x0 = 0;
+                    screen.dirty_x1 = w;
+                } else {
+                    let y0 = self.dirty_y_min.swap(u32::MAX, Ordering::Relaxed);
+                    let y1 = self.dirty_y_max.swap(0, Ordering::Relaxed);
+                    if y0 != u32::MAX && y1 >= y0 {
+                        screen.dirty_y0 = y0 as usize;
+                        screen.dirty_y1 = (y1 as usize + 1).min(screen.height.max(1));
+                    } else {
+                        screen.dirty_y0 = 0;
+                        screen.dirty_y1 = screen.height.max(1);
+                    }
+                    let x0 = self.dirty_x_min.swap(u32::MAX, Ordering::Relaxed);
+                    let x1 = self.dirty_x_max.swap(0, Ordering::Relaxed);
+                    if x0 != u32::MAX && x1 >= x0 {
+                        screen.dirty_x0 = x0 as usize;
+                        screen.dirty_x1 = (x1 as usize + 1).min(screen.width.max(1));
+                    } else {
+                        screen.dirty_x0 = 0;
+                        screen.dirty_x1 = screen.width.max(1);
+                    }
+                }
 
                 // Push debug state into overlay
                 overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
@@ -3530,9 +3885,17 @@ impl Rex3 {
                 self.diag.fetch_or(Self::DIAG_LOCK_RENDERER, Ordering::Relaxed);
                 let mut renderer = self.renderer.lock();
 
+                let h = screen.height.max(1);
+                let w = screen.width.max(1);
+                let partial_fb = fb_was_dirty
+                    && (screen.dirty_y1.saturating_sub(screen.dirty_y0) < h
+                        || screen.dirty_x1.saturating_sub(screen.dirty_x0) < w);
+                let copy_full_fb = fb_was_dirty && !partial_fb;
+
                 let resized = screen.refresh(
                     &**fb_rgb,
                     &**fb_aux,
+                    copy_full_fb,
                     &self.vc2,
                     &self.xmap0,
                     &self.cmap0,
@@ -3569,8 +3932,22 @@ impl Rex3 {
                 if screen.width > 0 && screen.height > 0 {
                     if let Some(ref mut r) = *renderer {
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                        r.present(&mut *screen, &mut overlay, &mut status_bar, &mut sbtex, &bar_stats, take_screenshot);
+                        let borrow = screen.fb_borrowed;
+                        r.present(
+                            &mut *screen,
+                            &mut overlay,
+                            &mut status_bar,
+                            &mut sbtex,
+                            &bar_stats,
+                            take_screenshot,
+                            if borrow { Some(&**fb_rgb) } else { None },
+                            if borrow { Some(&**fb_aux) } else { None },
+                        );
                         self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                    }
+
+                    if !screen.status_bar_only {
+                        full_presents = full_presents.saturating_add(1);
                     }
 
                     if take_screenshot {
@@ -3781,19 +4158,24 @@ impl Rex3 {
     }
 
     pub fn save_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.save_framebuffers_named(dir, "rex3")
+    }
+
+    /// Save RGB/aux planes with a custom filename prefix (e.g. `rex3_head1`).
+    pub fn save_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
         let rgb = unsafe { &*self.fb_rgb.get() };
         let mut bytes = Vec::with_capacity(rgb.len() * 4);
         for &word in rgb.iter() {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
-        std::fs::write(dir.join("rex3_rgb.bin"), &bytes)?;
+        std::fs::write(dir.join(format!("{prefix}_rgb.bin")), &bytes)?;
 
         let aux = unsafe { &*self.fb_aux.get() };
         bytes.clear();
         for &word in aux.iter() {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
-        std::fs::write(dir.join("rex3_aux.bin"), &bytes)?;
+        std::fs::write(dir.join(format!("{prefix}_aux.bin")), &bytes)?;
         Ok(())
     }
 
@@ -3820,7 +4202,11 @@ impl Rex3 {
     }
 
     pub fn load_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        let path_rgb = dir.join("rex3_rgb.bin");
+        self.load_framebuffers_named(dir, "rex3")
+    }
+
+    pub fn load_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
+        let path_rgb = dir.join(format!("{prefix}_rgb.bin"));
         if path_rgb.exists() {
             let bytes = std::fs::read(path_rgb)?;
             let rgb = unsafe { &mut *self.fb_rgb.get() };
@@ -3832,7 +4218,7 @@ impl Rex3 {
             }
         }
 
-        let path_aux = dir.join("rex3_aux.bin");
+        let path_aux = dir.join(format!("{prefix}_aux.bin"));
         if path_aux.exists() {
             let bytes = std::fs::read(path_aux)?;
             let aux = unsafe { &mut *self.fb_aux.get() };
@@ -3909,10 +4295,12 @@ impl Device for Rex3 {
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
 
         *self.processor_thread.lock() = Some(thread::Builder::new().name("REX3-Processor".to_string()).spawn(move || {
+            crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
             rex3.register_processor()
         }).unwrap());
 
         *self.refresh_thread.lock() = Some(thread::Builder::new().name("REX3-Refresh".to_string()).spawn(move || {
+            crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Refresh);
             rex3.refresh_loop();
         }).unwrap());
     }
@@ -4359,6 +4747,11 @@ impl BusDevice for Rex3 {
                     let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
                     if had_vrint {
                         let cb = self.vblank_cb.lock().clone();
+                        if let Some(cb) = cb { cb(false); }
+                    }
+                    let had_gfifo = self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed) & STATUS_GFIFO_INT != 0;
+                    if had_gfifo {
+                        let cb = self.fifo_full_cb.lock().clone();
                         if let Some(cb) = cb { cb(false); }
                     }
                     let dcb = self.dcb.lock();

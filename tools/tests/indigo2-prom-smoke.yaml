@@ -1,0 +1,15 @@
+name: indigo2-prom-smoke
+# Cold-boot Indigo2 IP22 into PROM (requires irix-install media).
+# Start: iris --config irix-install/iris-indigo2-smoke-ci.toml
+# Run:   tools/iris-test tools/tests/indigo2-prom-smoke.yaml --no-restore
+#
+# After boot, monitor `mc status` should show SYSID 00000010 and `ioc status`
+# sys_id=11 — see docs/indigo2-ip22.md for the full checklist.
+
+steps:
+  - type: sleep
+    seconds: 1
+
+  - type: serial
+    expect: "SGI"
+    timeout: 90

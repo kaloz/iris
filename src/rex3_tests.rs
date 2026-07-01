@@ -1807,6 +1807,73 @@ fn test_iline_skipfirst_skiplast() {
     assert_eq!(pts, expected, "skip_first+skip_last should omit both endpoints");
 }
 
+#[test]
+fn test_iline_lspattern_stipple() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    // DRAW I_LINE with ENLSPATTERN; pattern has only MSB set.
+    let dm0 = DM0_DRAW_ILINE | (1 << 13); // enlspattern
+    let bx = 8i32;
+    let ex = 14i32;
+    let y = 40i32;
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI, xy(ex, y));
+    reg(&rex, REX3_XYSTARTI, xy(bx, y));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_LSPATTERN, 0x8000_0000);
+    reg(&rex, REX3_LSMODE, 0); // length=17, repeat=1
+    reg(&rex, REX3_COLORI, 0xEE);
+    reg(&rex, REX3_XYENDI, xy(ex, y));
+    reg(&rex, REX3_XYSTARTI, xy(bx, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0);
+
+    let mut drawn = Vec::new();
+    for x in bx..=ex {
+        if read_pixel(&rex, x, y) & 0xFF == 0xEE {
+            drawn.push(x);
+        }
+    }
+    // MSB-only pattern: first pixel on, then off for the rest.
+    assert_eq!(drawn, vec![bx], "stippled I_LINE should draw only pattern-on pixels");
+}
+
+#[test]
+fn test_iline_lsadvlast_advances_on_last_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let y = 50i32;
+    let dm0 = DM0_DRAW_ILINE | (1 << 13) | (1 << 14); // enlspattern + lsadvlast
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI, xy(20, y));
+    reg(&rex, REX3_XYSTARTI, xy(8, y));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_LSPATTERN, 0x8000_0000);
+    reg(&rex, REX3_LSMODE, 0);
+    // First segment: single pixel at x=8
+    reg(&rex, REX3_COLORI, 0xAA);
+    reg(&rex, REX3_XYENDI, xy(8, y));
+    reg(&rex, REX3_XYSTARTI, xy(8, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0);
+
+    // Second segment without DOSETUP: continue from x=8 (persisted xstart), pat_bit advanced.
+    let dm0_cont = dm0 & !(1 << 5); // clear dosetup
+    reg(&rex, REX3_COLORI, 0xBB);
+    reg(&rex, REX3_XYENDI, xy(10, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0_cont);
+
+    assert_eq!(read_pixel(&rex, 8, y) & 0xFF, 0xAA);
+    assert_eq!(read_pixel(&rex, 9, y) & 0xFF, 0, "stipple advanced past MSB — pixel 9 should be off");
+    assert_eq!(read_pixel(&rex, 10, y) & 0xFF, 0, "pixel 10 should be off");
+}
+
 // --- All octants, r=32 circle, full draw ---
 
 #[test]

@@ -1,6 +1,8 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{MachineConfig, ScsiDeviceConfig, VALID_BANK_SIZES};
 
+use crate::ram::RAM_PRESETS;
+
 /// "New machine" startup dialog.
 /// Pops up at first run (or on `File → New machine…`) to bootstrap a config.
 pub struct NewMachineDialog {
@@ -44,8 +46,6 @@ impl Default for NewMachineDialog {
         }
     }
 }
-
-const RAM_PRESETS: &[u32] = &[32, 64, 96, 128, 192, 256];
 
 pub fn distribute_ram(total: u32) -> [u32; 4] {
     // Greedy fill banks 0..3 with the largest valid bank size that fits.

@@ -4824,6 +4824,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         self.idle_profile_on.store(false, Ordering::SeqCst);
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn cycles_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.cycles)
+    }
+
+    pub fn running_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.running)
+    }
+
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
         self.stop(); // Ensure stopped before running
 
@@ -5175,6 +5187,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         let running = self.running.clone();
 
         *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).spawn(move || {
+            crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             let mut guard = executor.lock();
 
             #[cfg(feature = "jit")]
@@ -5201,19 +5214,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             // iteration, so its state never repeats — we must NOT park it or
             // boot stalls. The state-repeat test distinguishes the two.
             #[cfg(feature = "idle-pause")]
-            let idle_enabled = std::env::var_os("IRIS_NO_IDLE").is_none();
-            // Ring of recent architectural-state hashes (PC folded with all GPRs),
-            // one per idle-suspected batch. A polling/idle loop cycles through a
-            // small set of states, so a hash repeats within ~the loop period; a
-            // delay loop's counter makes every state unique, so it never repeats.
-            #[cfg(feature = "idle-pause")]
-            const IDLE_RING: usize = 32;
-            #[cfg(feature = "idle-pause")]
-            let mut idle_ring = [0u64; IDLE_RING];
-            #[cfg(feature = "idle-pause")]
-            let mut idle_ring_len = 0usize;
-            #[cfg(feature = "idle-pause")]
-            let mut idle_ring_pos = 0usize;
+            let mut idle_state = crate::idle_park::IdleParkState::default();
 
             #[allow(unreachable_code)]
             while running.load(Ordering::Relaxed) {
@@ -5243,107 +5244,15 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 // Flush local cycle counter to shared atomic once per batch
                 guard.flush_cycles();
 
-                // --- idle detection + in-place park (stop spinning host CPU) ---
-                // The kernel idle loop is a tight loop with interrupts enabled and
-                // nothing pending; it exits only on an interrupt. When we detect it,
-                // park the CPU thread until the next CP0 Compare tick or a device
-                // interrupt, advancing cp0_count + local_cycles by the REAL elapsed
-                // time so the wallclock timer and its Compare-write calibration stay
-                // consistent (advancing only count would spike count_step — see
-                // docs/idle-pause-work.md §4). We never stop/restart the thread or
-                // peripherals; we just sleep in place, so the kernel is undisturbed.
                 #[cfg(feature = "idle-pause")]
-                if idle_enabled {
-                    let ie = guard.core.interrupts_enabled();
-                    let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
-                    let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
-                    let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
-                    let interrupt_ready = (ip & im) != 0; // would be delivered next step
-
-                    // `state_repeated` is true only if the current PC+GPR hash
-                    // matches one seen recently — i.e. the loop revisited a state
-                    // (polling), as opposed to a delay loop whose counter makes
-                    // every state unique.
-                    let mut state_repeated = false;
-                    if ie && !interrupt_ready {
-                        // Hash PC + GPRs, but SKIP k0/k1 ($26/$27): those are the
-                        // kernel's exception-handler scratch registers and hold
-                        // leftover junk that differs whenever a timer tick fired
-                        // between iterations — they are not part of the loop's
-                        // real state. (Confirmed: across idle-loop iterations only
-                        // k0/k1 change; a delay loop changes a real reg like v1.)
-                        let mut h = guard.core.pc;
-                        for (i, &g) in guard.core.gpr.iter().enumerate() {
-                            if i == 26 || i == 27 { continue; }
-                            h = h.rotate_left(7) ^ g;
-                        }
-                        if idle_ring[..idle_ring_len].contains(&h) {
-                            // State repeated → still idle. Keep the ring so that
-                            // after a timer tick wakes us the very next batch hash
-                            // matches again and we re-park immediately (otherwise
-                            // we'd re-accumulate the ring every tick, ~5% wasted).
-                            state_repeated = true;
-                        } else {
-                            idle_ring[idle_ring_pos] = h;
-                            idle_ring_pos = (idle_ring_pos + 1) % IDLE_RING;
-                            if idle_ring_len < IDLE_RING {
-                                idle_ring_len += 1;
-                            }
-                        }
-                    } else {
-                        idle_ring_len = 0;
-                        idle_ring_pos = 0;
+                if crate::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
+                    guard.flush_cycles();
+                    drop(guard);
+                    {
+                        let mut guard = executor.lock();
+                        idle_state.park(&mut guard.core, &running);
                     }
-
-                    if state_repeated {
-                        // counts/10ms tick: the CP0 Count hardware rate (independent of
-                        // whether the current tick is the 100 Hz or 1 kHz interval).
-                        let slow_hw = guard.core.compare_delta_slow >> 32;
-                        let cs = guard.core.count_step; // 32.32 counts/instruction
-                        if slow_hw != 0 && cs != 0 {
-                            const SLICE_NS: u64 = 1_000_000;  // 1 ms slices → ≤1 ms IRQ latency
-                            const MIN_SLICE_NS: u64 = 50_000; // <50 µs to tick: just fire it
-                            loop {
-                                if !running.load(Ordering::Relaxed) { break; }
-                                let cnt = guard.core.cp0_count;
-                                let cmp = guard.core.cp0_compare;
-                                let diff = cmp.wrapping_sub(cnt);
-                                // high bit set => count already past compare => tick due now
-                                if (diff >> 63) != 0 || (diff >> 32) == 0 {
-                                    guard.core.cp0_count = cmp;
-                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                                    break;
-                                }
-                                // a device interrupt became ready while we were idle
-                                let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
-                                let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
-                                let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
-                                if (ip & im) != 0 { break; }
-
-                                let rem_hw = diff >> 32;
-                                let ns_to_tick = (rem_hw as u128 * 10_000_000u128 / slow_hw as u128) as u64;
-                                let slice_ns = ns_to_tick.min(SLICE_NS);
-                                if slice_ns < MIN_SLICE_NS {
-                                    guard.core.cp0_count = cmp;
-                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                                    break;
-                                }
-                                // Drop the executor lock so the monitor stays responsive
-                                // while we sleep; re-acquire after.
-                                guard.flush_cycles();
-                                drop(guard);
-                                let t0 = std::time::Instant::now();
-                                std::thread::sleep(std::time::Duration::from_nanos(slice_ns));
-                                let elapsed_ns = t0.elapsed().as_nanos() as u64;
-                                guard = executor.lock();
-                                // Advance guest time by the real elapsed time.
-                                let adv_hw = (elapsed_ns as u128 * slow_hw as u128 / 10_000_000u128) as u64;
-                                guard.core.cp0_count = guard.core.cp0_count.wrapping_add(adv_hw << 32);
-                                let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
-                                guard.core.local_cycles = guard.core.local_cycles.wrapping_add(adv_instrs);
-                            }
-                        }
-                    }
+                    guard = executor.lock();
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---

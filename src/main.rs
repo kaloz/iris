@@ -32,11 +32,8 @@ fn main() {
     let ci_display = cfg.ci_display;
     let ci_socket_path = cfg.ci_socket.clone();
 
-    // CI control socket will be started after Machine::new below (it needs a
-    // pointer into the constructed Machine).
-
-    // NFS is now served in-process by the NAT (src/nfsudp.rs) — no external
-    // unfsd to spawn. The directory is created on demand by the server.
+    // Apply [jit] from TOML (env vars still override if set externally).
+    cfg.jit.apply_env();
 
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
@@ -50,7 +47,6 @@ fn main() {
 
     // CI control socket: started after Machine::new so it can hand out the
     // machine pointer + CiSerialBackend to command handlers.
-    #[cfg(unix)]
     let _ci_server = if ci_enabled {
         let mptr: *mut iris::machine::Machine = &mut *machine;
         match iris::ci::start_server(mptr, &ci_socket_path) {

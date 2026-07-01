@@ -76,7 +76,7 @@ camera = ["dep:nokhwa", "dep:v4l"]
 # Off by default — enable with `cargo build --features pcap`. Select at runtime
 # with `[network] mode = "pcap"` in iris.toml.
 pcap = ["dep:pcap"]
-# N64 development board IPC bridge: shared-memory RAMROM + cross-process semaphores.
+# N64 development board (Ultra64) — GIO slot 0 + shm IPC.
 ultra64 = ["dep:shared_memory", "dep:raw_sync"]
 
 [dependencies]
@@ -114,6 +114,7 @@ libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = tru
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
+windows-sys = { version = "0.52", features = ["Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }

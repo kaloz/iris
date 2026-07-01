@@ -1,0 +1,38 @@
+# Headless Indigo2 IP22 smoke config — disk/NVRAM under irix-install/.
+# Disk: irix-install/scsi1.raw (20 GB IRIX root + overlay)
+# Use: iris.exe --config irix-install/iris-indigo2-smoke-ci.toml
+# Verify: monitor mc status → SYSID 00000010; ioc status → sys_id=11
+
+headless = true
+ci = true
+ci_socket = "127.0.0.1:19851"
+no_audio = false
+banks = [128, 128, 0, 0]
+nvram = "irix-install/nvram-irix65.bin"
+scale = 1
+
+[machine]
+profile = "indigo2_ip22"
+
+[graphics]
+heads = 1
+
+[jit]
+enabled = true
+probe = 500
+probe_min = 100
+max_tier = 2
+compile_stores = false
+
+[perf]
+thread_affinity = false
+
+[audio]
+prebuf_ms = 20
+
+[scsi.1]
+path = "irix-install/scsi1.raw"
+cdrom = false
+
+[nfs]
+shared_dir = "shared"

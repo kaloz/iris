@@ -1529,8 +1529,7 @@ fn emit_draw_iline(
     let xmajor_bit = b.ins().band_imm(octant_v, OCTANT_XMAJOR as i64);
     let y_major_v  = b.ins().icmp_imm(IntCC::Equal, xmajor_bit, 0);
 
-    // major = y_major ? |y2-y| : |x2-x|
-    // pixel_count = major + 1; capped at 32 if length32
+    // major = max(|dx|,|dy|); pixel_count = major + 1 (mirrors draw_line_bresenham).
     let dx_abs = {
         let d = b.ins().isub(x2_v, x_init_v);
         let neg = b.ins().ineg(d);
@@ -1543,7 +1542,8 @@ fn emit_draw_iline(
         let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, d, 0);
         b.ins().select(is_neg, neg, d)
     };
-    let major_v = b.ins().select(y_major_v, dy_abs, dx_abs);
+    let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
+    let major_v = b.ins().select(dx_gt_dy, dx_abs, dy_abs);
     let pixel_count_v = b.ins().iadd_imm(major_v, 1);
 
     // iterate_one = !stoponx && !stopony (step-mode: always draw exactly 1 pixel)

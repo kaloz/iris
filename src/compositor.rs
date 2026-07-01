@@ -33,6 +33,14 @@ pub struct CompositorSource<'a> {
     /// Visible display dimensions decoded from VC2 video timings
     pub width:            usize,
     pub height:           usize,
+    /// Partial upload region (display rows, inclusive y0, exclusive y1).
+    pub dirty_y0:         usize,
+    pub dirty_y1:         usize,
+    /// Partial upload region (display columns, inclusive x0, exclusive x1).
+    pub dirty_x0:         usize,
+    pub dirty_x1:         usize,
+    /// Heartbeat: only status-bar rows changed — skip full DID upload.
+    pub status_bar_only:  bool,
 }
 
 /// Compositor: maps hardware source state to a composited GL texture.

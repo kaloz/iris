@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::config::NetworkConfig;
+use crate::config::{AudioConfig, NetworkConfig};
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
@@ -1008,19 +1008,22 @@ pub struct Hpc3 {
     scsi_dev: Arc<Wd33c93a>,
     hal2: Option<Arc<Hal2>>,
     pdma_dump: Arc<AtomicU32>,
+    /// Indy (Guinness) vs Indigo2 (fullhouse). No HPC3 register divergence from
+    /// Indy today — retained for future fullhouse paths (EISA pbus, dual INT2).
+    #[allow(dead_code)]
     guinness: bool,
 }
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string(), cpu_cycles, true)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), cpu_cycles, true)
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
     /// `--headless`, which can't run audio in CI).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String, cpu_cycles: Arc<AtomicU64>, scsi_deferred_int: bool) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, cpu_cycles: Arc<AtomicU64>, scsi_deferred_int: bool) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
@@ -1114,7 +1117,7 @@ impl Hpc3 {
         let scsi_dev = Arc::new(Wd33c93a::new_with_config(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), cpu_cycles, scsi_deferred_int));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
 
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec(), audio))) };
 
         Self {
             state,

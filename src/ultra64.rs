@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use shared_memory::ShmemConf;
 use raw_sync::{events::{Event, EventImpl, EventInit, EventState}, Timeout};
+#[cfg(unix)]
 use libc;
 
 /// Wraps a `Box<dyn EventImpl>` and asserts Send + Sync.

@@ -218,9 +218,10 @@ impl MemoryController {
         // Initialize REF_CTR: Current Refresh Count
         regs[(REG_REF_CTR / 4) as usize] = 0x00000C30;
 
-        // Initialize GIO64_ARB: ONE_GIO=1 (0x400)
+        // Initialize GIO64_ARB: ONE_GIO=1 (0x400) on Indy (single GIO64 bus).
+        // Indigo2 fullhouse clears ONE_GIO for dual GIO64 buses.
         // Bit 0 (HPC_SIZE) is typically loaded from EEROM. Defaulting to 0 (32-bit) for now.
-        regs[(REG_GIO64_ARB / 4) as usize] = 0x00000400;
+        regs[(REG_GIO64_ARB / 4) as usize] = if guinness { 0x00000400 } else { 0x00000000 };
 
         // Initialize CPU_TIME: 0x100
         regs[(REG_CPU_TIME / 4) as usize] = 0x00000100;
@@ -286,6 +287,29 @@ impl MemoryController {
     /// Rank inference from size_mb (matching the PROM's set_bank_size 0x2a check):
     ///   inst_units = size_mb / 4MB.  inst_rank=1 (dual) if inst_units & 0x2a != 0.
     ///   inst_size_per_rank = size_mb_bytes >> inst_rank.
+    /// Encode a MEMCFG half-word for a bank at `base` with `size_mb` installed.
+    /// Inverse of [`memcfg_bank_info`] for the sizes IRIS supports.
+    pub fn encode_memcfg_half(base: u32, size_mb: u32) -> Option<u16> {
+        if size_mb == 0 {
+            return None;
+        }
+        let (simm_size_field, simm_rank): (u32, u32) = match size_mb {
+            8   => (0,  1),
+            16  => (3,  0),
+            32  => (3,  1),
+            64  => (15, 0),
+            128 => (15, 1),
+            _   => return None,
+        };
+        let base_byte = (base >> 22) & 0xFF;
+        Some(
+            (base_byte as u16)
+                | (1 << 13) // VLD
+                | ((simm_rank as u16) << 14)
+                | ((simm_size_field as u16) << 8),
+        )
+    }
+
     pub fn memcfg_bank_info(half: u16, size_mb: u32) -> Option<(u32, u32, u32)> {
         if size_mb == 0 { return None; }
         if (half >> 13) & 1 == 0 { return None; }
@@ -327,7 +351,58 @@ impl MemoryController {
         std::array::from_fn(|i| Self::memcfg_bank_info(halves[i], self.ram_sizes[i]))
     }
 
-    fn fire_memcfg_callback(&self, state: &MemoryControllerState) {
+    /// If the embedded PROM POSTed lomem (banks 0–1) but skipped himem, synthesize
+    /// MEMCFG1 entries for configured banks 2–3 so IRIX sees extended RAM.
+    fn synthesize_himem_banks(&self, state: &mut MemoryControllerState) -> bool {
+        use crate::physical::{BANK_SIZE, HIMEM_BASE};
+
+        let memcfg0 = state.regs[(REG_MEMCFG0 / 4) as usize];
+        let memcfg1 = state.regs[(REG_MEMCFG1 / 4) as usize];
+        let h0 = (memcfg0 >> 16) as u16;
+        let h1 = (memcfg0 & 0xFFFF) as u16;
+        // Wait until PROM has mapped lomem before touching himem.
+        if (h0 >> 13) & 1 == 0 || (h1 >> 13) & 1 == 0 {
+            return false;
+        }
+
+        let mut h2 = (memcfg1 >> 16) as u16;
+        let mut h3 = (memcfg1 & 0xFFFF) as u16;
+        let mut changed = false;
+
+        if self.ram_sizes[2] > 0 && (h2 >> 13) & 1 == 0 {
+            if let Some(enc) = Self::encode_memcfg_half(HIMEM_BASE, self.ram_sizes[2]) {
+                h2 = enc;
+                changed = true;
+            }
+        }
+        if self.ram_sizes[3] > 0 && (h3 >> 13) & 1 == 0 {
+            if let Some(enc) =
+                Self::encode_memcfg_half(HIMEM_BASE + BANK_SIZE, self.ram_sizes[3])
+            {
+                h3 = enc;
+                changed = true;
+            }
+        }
+
+        if changed {
+            let new_memcfg1 = ((h2 as u32) << 16) | (h3 as u32);
+            state.regs[(REG_MEMCFG1 / 4) as usize] = new_memcfg1;
+            dlog_dev!(
+                LogModule::Mc,
+                "MC: synthesized MEMCFG1 for extended RAM = {:08x} (banks {:?})",
+                new_memcfg1,
+                self.ram_sizes
+            );
+            eprintln!(
+                "MC: synthesized MEMCFG1 for extended RAM (banks {:?})",
+                self.ram_sizes
+            );
+        }
+        changed
+    }
+
+    fn on_memcfg_updated(&self, state: &mut MemoryControllerState) {
+        self.synthesize_himem_banks(state);
         if let Some(cb) = self.memcfg_callback.get() {
             let memcfg0 = state.regs[(REG_MEMCFG0 / 4) as usize];
             let memcfg1 = state.regs[(REG_MEMCFG1 / 4) as usize];
@@ -899,13 +974,13 @@ impl BusDevice for MemoryController {
             REG_MEMCFG0 => {
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG0 = {:08x}", val);
                 state.regs[(REG_MEMCFG0 / 4) as usize] = val;
-                self.fire_memcfg_callback(&state);
+                self.on_memcfg_updated(&mut state);
                 BUS_OK
             }
             REG_MEMCFG1 => {
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG1 = {:08x}", val);
                 state.regs[(REG_MEMCFG1 / 4) as usize] = val;
-                self.fire_memcfg_callback(&state);
+                self.on_memcfg_updated(&mut state);
                 BUS_OK
             }
             REG_CPU_MEMACC => {
@@ -1329,6 +1404,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sysid_matches_guinness_profile() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let indy = MemoryController::new(eeprom.clone(), true, [0u32; 4]);
+        let sysid = indy.read32(MC_BASE + REG_SYSID).data;
+        assert_eq!(sysid, 0x0000_0013, "Indy IP24 (guinness) SYSID");
+        let gio_arb = indy.read32(MC_BASE + REG_GIO64_ARB).data;
+        assert_eq!(gio_arb & 0x400, 0x400, "Indy ONE_GIO set");
+
+        let fullhouse = MemoryController::new(eeprom, false, [0u32; 4]);
+        let sysid = fullhouse.read32(MC_BASE + REG_SYSID).data;
+        assert_eq!(sysid, 0x0000_0010, "Indigo2-class (fullhouse) SYSID");
+        let gio_arb = fullhouse.read32(MC_BASE + REG_GIO64_ARB).data;
+        assert_eq!(gio_arb & 0x400, 0, "fullhouse dual GIO — ONE_GIO clear");
+    }
+
+    #[test]
     fn test_mc_internal_access() {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let mc = MemoryController::new(eeprom, true, [0u32; 4]);
@@ -1383,5 +1474,40 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "MemoryController save_state mismatch after load_state round-trip");
+    }
+
+    #[test]
+    fn memcfg_encode_decode_roundtrip() {
+        use crate::physical::{BANK_SIZE, HIMEM_BASE, LOMEM_BASE};
+        for (base, size) in [
+            (LOMEM_BASE, 128u32),
+            (LOMEM_BASE + BANK_SIZE, 128),
+            (HIMEM_BASE, 64),
+            (HIMEM_BASE + BANK_SIZE, 64),
+        ] {
+            let half = MemoryController::encode_memcfg_half(base, size).unwrap();
+            let info = MemoryController::memcfg_bank_info(half, size);
+            assert!(info.is_some(), "base={base:#x} size={size}");
+            assert_eq!(info.unwrap().0, base);
+        }
+    }
+
+    #[test]
+    fn himem_synthesis_after_lomem_post() {
+        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let mc = MemoryController::new(eeprom, true, [128, 128, 64, 64]);
+        let h0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
+        let h1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
+        let memcfg0 = ((h0 as u32) << 16) | (h1 as u32);
+        assert_eq!(mc.write32(MC_BASE + REG_MEMCFG0, memcfg0), BUS_OK);
+
+        let (m0, m1) = mc.get_memcfg();
+        let addrs = mc.parse_memcfg(m0, m1);
+        assert!(addrs[0].is_some() && addrs[1].is_some());
+        assert!(addrs[2].is_some(), "bank 2 should be synthesized");
+        assert!(addrs[3].is_some(), "bank 3 should be synthesized");
+        assert_eq!(addrs[2].unwrap().0, crate::physical::HIMEM_BASE);
     }
 }

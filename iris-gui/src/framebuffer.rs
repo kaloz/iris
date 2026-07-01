@@ -1,13 +1,15 @@
 //! Headless renderer that captures the composited REX3 framebuffer into a
 //! shared buffer for egui to upload as a texture each frame.
 //!
-//! This renderer has no GL context.  It runs `SwCompositor::compose_pixels()`
-//! directly (CPU-only, no GL upload) and reads from the resulting pixel buffer.
+//! Default path: `CaptureRenderer` (CPU `SwCompositor`).
+//! Set `IRIS_GUI_GL=1` for GPU `GlCompositor` + readback (faster for GL demos).
 
-use iris::rex3::Renderer;
-use iris::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats};
+use iris::compositor::{Compositor, SwCompositor};
 use iris::debug_overlay::DebugOverlay;
-use iris::compositor::SwCompositor;
+use iris::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, STATUS_BAR_HEIGHT};
+use iris::gl_compositor::GlCompositor;
+use iris::headless_gl::HeadlessGl;
+use iris::rex3::Renderer;
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,12 +24,13 @@ pub struct Frame {
     /// Bumped every time a new frame is captured; egui uses this to skip the
     /// texture upload when nothing has changed.
     pub seq: u64,
+    /// First scanline included in `rgba` update (0 = full frame).
+    pub dirty_y: u32,
+    /// Number of scanlines updated (`0` or `height` = full frame).
+    pub dirty_h: u32,
 }
 
 /// Shared latest-frame slot. The renderer writes; the GUI reads.
-///
-/// `seq` is mirrored into a lock-free atomic so the GUI can check for new
-/// frames without taking the mutex or cloning the multi-MB buffer.
 #[derive(Default, Clone)]
 pub struct FrameSink {
     frame: Arc<Mutex<Frame>>,
@@ -37,16 +40,10 @@ pub struct FrameSink {
 impl FrameSink {
     pub fn new() -> Self { Self::default() }
 
-    /// Lock-free latest sequence number (0 = no frame produced yet).
     pub fn seq(&self) -> u64 { self.seq.load(Ordering::Acquire) }
 
-    /// Clone the latest frame. Gate this on `seq()` having changed to avoid
-    /// copying the whole buffer on every repaint when nothing is new.
     pub fn snapshot(&self) -> Frame { self.frame.lock().clone() }
 
-    /// Reset to the "no frame yet" state (seq 0, blank frame). Call before a
-    /// fresh run starts rendering so a restart shows the "waiting for first
-    /// frame" placeholder instead of the previous run's last frame.
     pub fn reset(&self) {
         *self.frame.lock() = Frame::default();
         self.seq.store(0, Ordering::Release);
@@ -56,19 +53,27 @@ impl FrameSink {
 }
 
 /// Headless `Renderer` that captures the composited frame into a `FrameSink`.
-///
-/// Runs `SwCompositor::compose_pixels()` (CPU-only, no GL context needed) and
-/// packs the result into egui-friendly RGBA bytes.
 pub struct CaptureRenderer {
-    sink:       FrameSink,
-    seq:        u64,
-    compositor: SwCompositor,
+    sink:        FrameSink,
+    seq:         u64,
+    compositor:  SwCompositor,
+    last_pixels: Vec<u32>,
 }
 
 impl CaptureRenderer {
     pub fn new(sink: FrameSink) -> Self {
-        Self { sink, seq: 0, compositor: SwCompositor::new() }
+        Self {
+            sink,
+            seq: 0,
+            compositor: SwCompositor::new(),
+            last_pixels: Vec::new(),
+        }
     }
+}
+
+/// IRIX status strip is the bottom `STATUS_BAR_HEIGHT` rows of the visible frame.
+fn status_bar_y(height: usize) -> usize {
+    height.saturating_sub(STATUS_BAR_HEIGHT)
 }
 
 impl Renderer for CaptureRenderer {
@@ -76,44 +81,205 @@ impl Renderer for CaptureRenderer {
         &mut self,
         screen:        &mut Rex3Screen,
         _overlay:       &mut DebugOverlay,
-        _status:        &mut StatusBar,
+        status:        &mut StatusBar,
         _sbtex:         &mut StatusBarTexture,
-        _stats:         &BarStats,
+        stats:         &BarStats,
         _need_readback: bool,
+        live_fb_rgb:   Option<&[u32]>,
+        live_fb_aux:   Option<&[u32]>,
     ) {
+        let _ = (live_fb_rgb, live_fb_aux);
         let width  = screen.width;
         let height = screen.height;
         if width == 0 || height == 0 { return; }
 
-        // Run SW compositor pixel loop (no GL).
-        let src = screen.compositor_source();
+        let needed = 2048 * 1024;
+        if self.last_pixels.len() < needed {
+            self.last_pixels.resize(needed, 0);
+        }
+
+        if screen.status_bar_only && self.sink.seq() > 0 {
+            status.update(stats.hb);
+            let bar_y = status_bar_y(height);
+            status.render(&mut self.last_pixels, width, bar_y, stats);
+            pack_rows(
+                &self.sink,
+                &self.last_pixels,
+                width,
+                height,
+                bar_y,
+                STATUS_BAR_HEIGHT,
+                &mut self.seq,
+            );
+            return;
+        }
+
+        let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
         self.compositor.compose_pixels(&src);
         drop(src);
+        self.last_pixels.copy_from_slice(self.compositor.pixels());
 
-        let needed = width * height * 4;
-        let mut frame = self.sink.lock();
-        if frame.rgba.len() != needed {
-            frame.rgba = vec![0u8; needed];
-        }
-        frame.width  = width;
-        frame.height = height;
+        status.update(stats.hb);
+        status.render(&mut self.last_pixels, width, status_bar_y(height), stats);
 
-        // compositor buf is stride-2048, 0xFFBBGGRR.
-        // egui wants tightly-packed [R, G, B, A] — same byte order on LE.
-        let buf = self.compositor.pixels();
-        for y in 0..height {
-            let src_row = &buf[y * 2048..y * 2048 + width];
-            let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
-            for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
-                dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
-            }
-        }
-
-        self.seq = self.seq.wrapping_add(1);
-        frame.seq = self.seq;
-        drop(frame);
-        self.sink.seq.store(self.seq, Ordering::Release);
+        pack_sw_frame(&self.sink, &self.last_pixels, width, height, &mut self.seq);
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {}
+}
+
+/// GPU compositor path: `GlCompositor` on a hidden GL context (REX3-Refresh thread).
+pub struct GlCaptureRenderer {
+    sink:       FrameSink,
+    seq:        u64,
+    headless:   HeadlessGl,
+    compositor: GlCompositor,
+    rgba:       Vec<u32>,
+    last_pixels: Vec<u32>,
+}
+
+impl GlCaptureRenderer {
+    pub fn new(sink: FrameSink) -> Option<Self> {
+        let headless = HeadlessGl::new()?;
+        eprintln!("iris-gui: OpenGL capture renderer enabled (IRIS_GUI_GL=1)");
+        Some(Self {
+            sink,
+            seq: 0,
+            headless,
+            compositor: GlCompositor::new(),
+            rgba: Vec::new(),
+            last_pixels: Vec::new(),
+        })
+    }
+}
+
+impl Renderer for GlCaptureRenderer {
+    fn present(
+        &mut self,
+        screen:        &mut Rex3Screen,
+        _overlay:       &mut DebugOverlay,
+        status:        &mut StatusBar,
+        _sbtex:         &mut StatusBarTexture,
+        stats:         &BarStats,
+        _need_readback: bool,
+        live_fb_rgb:   Option<&[u32]>,
+        live_fb_aux:   Option<&[u32]>,
+    ) {
+        let _ = (live_fb_rgb, live_fb_aux);
+        let width  = screen.width;
+        let height = screen.height;
+        if width == 0 || height == 0 { return; }
+
+        let needed = 2048 * 1024;
+        if self.last_pixels.len() < needed {
+            self.last_pixels.resize(needed, 0);
+        }
+
+        if screen.status_bar_only && self.sink.seq() > 0 {
+            status.update(stats.hb);
+            let bar_y = status_bar_y(height);
+            status.render(&mut self.last_pixels, width, bar_y, stats);
+            pack_rows(
+                &self.sink,
+                &self.last_pixels,
+                width,
+                height,
+                bar_y,
+                STATUS_BAR_HEIGHT,
+                &mut self.seq,
+            );
+            return;
+        }
+
+        if self.rgba.len() < needed {
+            self.rgba.resize(needed, 0);
+        }
+        let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
+        let gl = &self.headless.gl;
+        let _tex = self.compositor.compose(&src, gl);
+        drop(src);
+        self.compositor.readback_to_screen(&mut self.rgba, width, height, gl);
+        self.last_pixels.copy_from_slice(&self.rgba[..needed]);
+
+        status.update(stats.hb);
+        status.render(&mut self.last_pixels, width, status_bar_y(height), stats);
+
+        pack_sw_frame(&self.sink, &self.last_pixels, width, height, &mut self.seq);
+    }
+
+    fn resize(&mut self, _width: usize, _height: usize) {}
+}
+
+impl Drop for GlCaptureRenderer {
+    fn drop(&mut self) {
+        self.compositor.destroy(&self.headless.gl);
+    }
+}
+
+fn pack_sw_frame(sink: &FrameSink, pixels: &[u32], width: usize, height: usize, seq: &mut u64) {
+    let needed = width * height * 4;
+    let mut frame = sink.lock();
+    if frame.rgba.len() != needed {
+        frame.rgba = vec![0u8; needed];
+    }
+    frame.width  = width;
+    frame.height = height;
+    frame.dirty_y = 0;
+    frame.dirty_h = height as u32;
+
+    for y in 0..height {
+        let src_row = &pixels[y * 2048..y * 2048 + width];
+        let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
+        for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
+            dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
+        }
+    }
+
+    *seq = seq.wrapping_add(1);
+    frame.seq = *seq;
+    drop(frame);
+    sink.seq.store(*seq, Ordering::Release);
+}
+
+fn pack_rows(
+    sink: &FrameSink,
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    start_y: usize,
+    row_count: usize,
+    seq: &mut u64,
+) {
+    let mut frame = sink.lock();
+    if frame.width != width || frame.height != height || frame.rgba.is_empty() {
+        pack_sw_frame(sink, pixels, width, height, seq);
+        return;
+    }
+
+    frame.dirty_y = start_y as u32;
+    frame.dirty_h = row_count as u32;
+
+    for y in start_y..start_y + row_count.min(height.saturating_sub(start_y)) {
+        let src_row = &pixels[y * 2048..y * 2048 + width];
+        let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
+        for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
+            dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
+        }
+    }
+
+    *seq = seq.wrapping_add(1);
+    frame.seq = *seq;
+    drop(frame);
+    sink.seq.store(*seq, Ordering::Release);
+}
+
+/// Pick CPU or GL capture renderer based on `IRIS_GUI_GL=1`.
+pub fn new_capture_renderer(sink: FrameSink) -> Box<dyn Renderer> {
+    if std::env::var("IRIS_GUI_GL").map(|v| v == "1").unwrap_or(false) {
+        if let Some(r) = GlCaptureRenderer::new(sink.clone()) {
+            return Box::new(r);
+        }
+        eprintln!("iris-gui: IRIS_GUI_GL=1 but headless GL init failed — using CPU compositor");
+    }
+    Box::new(CaptureRenderer::new(sink))
 }
