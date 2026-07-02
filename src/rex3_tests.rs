@@ -137,6 +137,48 @@ fn xy(x: i32, y: i32) -> u32 {
     (xi << 16) | yi
 }
 
+// ---------------------------------------------------------------------------
+// Fractional (sub-pixel) coordinate helpers for F_LINE/A_LINE.
+//
+// Use the plain XSTART/YSTART/XEND/YEND registers (16.4(7) format, written
+// via from16_4_7 which sign-extends through Rex3RegisterOps::rexset — see
+// rex3.rs) rather than the GL-fast-path XSTARTF/YSTARTF/XENDF/YENDF
+// aliases. Per the REX3 spec (rex3_pdf.md table 7): "XSTARTF ... GL version
+// of XSTART, (zeros 4 msbs)" — XSTARTF is a *narrower* register that zeros
+// the top bits and cannot represent REX3_COORD_BIAS-shifted (4096-biased)
+// screen coordinates at all (confirmed experimentally: writing a biased
+// value through XSTARTF truncates the bias away, then calculate_fb_address
+// subtracts COORD_BIAS *again* on top of the now-unbiased value, sending
+// every pixel address far out of bounds — nothing gets drawn). Plain
+// XSTART/YSTART/XEND/YEND round-trip biased values correctly (confirmed:
+// from16_4_7(biased_val) recovers the exact screen coordinate on readback),
+// matching how XYSTARTI/XYENDI already bias internally in xy().
+//
+// `frac4` is a 0-15 nibble in 1/16-pixel units — the only fractional
+// precision the interpreter's fline_apply_fract/draw_aline ever consult
+// (bits [10:7] of the 21.11 value). `screen_x`/`screen_y` are plain screen
+// pixel coordinates (same convention as xy()'s x/y params); REX3_COORD_BIAS
+// is added internally so these stay bias-consistent with any other
+// XYSTARTI/XYENDI-driven endpoint on the same line.
+// ---------------------------------------------------------------------------
+
+fn write_xstartf(rex: &Rex3, screen_x: i32, frac4: i32) {
+    let biased = screen_x + REX3_COORD_BIAS;
+    reg(rex, REX3_XSTART, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_ystartf(rex: &Rex3, screen_y: i32, frac4: i32) {
+    let biased = screen_y + REX3_COORD_BIAS;
+    reg(rex, REX3_YSTART, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_xendf(rex: &Rex3, screen_x: i32, frac4: i32) {
+    let biased = screen_x + REX3_COORD_BIAS;
+    reg(rex, REX3_XEND, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_yendf(rex: &Rex3, screen_y: i32, frac4: i32) {
+    let biased = screen_y + REX3_COORD_BIAS;
+    reg(rex, REX3_YEND, ((biased << 11) | (frac4 << 7)) as u32);
+}
+
 // ============================================================================
 // DRAWMODE constants (matching minigl3.c / SGI headers)
 // ============================================================================
@@ -1619,6 +1661,15 @@ fn test_hostw_rgb24_multiline_64bit_unpacked() {
 const DM0_DRAW_ILINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for I_LINE single-step mode (no stoponx/stopony — one pixel per GO).
 const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP;
+// DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
+const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE | DM0_DOSETUP | DM0_STOPONXY;
+// DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
+// A_LINE tests are out of scope for this pass (see rules/testing/rex3-fline-fractional-bresenham.md) —
+// kept for a future session, not yet exercised by any test.
+#[allow(dead_code)]
+const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE | DM0_DOSETUP | DM0_STOPONXY;
+#[allow(dead_code)]
+const DM0_ENDPTFILTER: u32 = 1 << 22;
 
 /// Draw an I_LINE in CI8 and return the set of (x,y) pixels that were written with `color`.
 /// Clears a 256x256 region starting at `base` before drawing.
@@ -1693,6 +1744,173 @@ fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) ->
         }
     }
     pts
+}
+
+/// Reference F_LINE Bresenham in software — a mechanical transcription of
+/// `setup()` + `fline_apply_fract()` + the `bres_step!` macro from
+/// `draw_line_bresenham` (rex3.rs), NOT the simplified octant-agnostic form
+/// `bres_pixels()` uses. This is deliberately duplicated rather than calling
+/// the real implementation: a hand-transcribed oracle must fail if
+/// `fline_apply_fract`/`setup()` regress, which a shared-code oracle cannot
+/// detect (see `rules/` note on this — a call-through oracle would mask
+/// exactly the kind of regression this test exists to catch).
+///
+/// `x0_frac4`/`y0_frac4` are the *start* endpoint's fractional nibble
+/// (0-15, 1/16-pixel units) — the only fractional input `fline_apply_fract`
+/// consumes; the end endpoint is integer-only here, matching what the
+/// F_LINE hardware path actually uses (draw_aline's AWEIGHT lookup is the
+/// only consumer of the *end* endpoint's fraction, handled separately by
+/// `aline_endpoint_skip` below).
+fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    // BRES table copied verbatim from draw_line_bresenham (rex3.rs):
+    // (incrx1, incrx2, incry1, incry2, y_major), indexed by octant.
+    #[rustfmt::skip]
+    const BRES: [(i32, i32, i32, i32, bool); 8] = [
+        ( 0,  1, -1, -1, true ),  // octant 0
+        ( 0,  1,  1,  1, true ),  // octant 1
+        ( 0, -1, -1, -1, true ),  // octant 2
+        ( 0, -1,  1,  1, true ),  // octant 3
+        ( 1,  1,  0, -1, false),  // octant 4
+        ( 1,  1,  0,  1, false),  // octant 5
+        (-1, -1,  0, -1, false),  // octant 6
+        (-1, -1,  0,  1, false),  // octant 7
+    ];
+
+    // 21.11 fixed-point endpoint values, matching how the register writes
+    // populate ctx.xstart/ystart/xend/yend.
+    let xstart = (x0 << 11) | (x0_frac4 << 7);
+    let ystart = (y0 << 11) | (y0_frac4 << 7);
+    let xend = x1 << 11;
+    let yend = y1 << 11;
+
+    // --- setup(): derive octant + initial incr1/incr2/d (rex3.rs:1390-1419) ---
+    let dx = xend - xstart;
+    let dy = yend - ystart;
+    let adx = dx.abs() >> 11;
+    let ady = dy.abs() >> 11;
+
+    let mut octant = 0u32;
+    if dy < 0 { octant |= 1 << 0; } // OCTANT_YDEC
+    if dx < 0 { octant |= 1 << 1; } // OCTANT_XDEC
+    if adx > ady { octant |= 1 << 2; } // OCTANT_XMAJOR
+
+    let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
+    let incr1 = 2 * minor;
+    let incr2 = 2 * (minor - major);
+    let mut d = incr1 - major;
+
+    let (incrx1, incrx2, incry1, incry2, y_major) = BRES[(octant & 7) as usize];
+
+    let mut x = xstart >> 11;
+    let mut y = ystart >> 11;
+    let x2 = xend >> 11;
+    let y2 = yend >> 11;
+
+    // --- fline_apply_fract() (rex3.rs:1754-1816), transcribed verbatim ---
+    {
+        let x1p = xstart >> 11;
+        let y1p = ystart >> 11;
+        let x2p = xend >> 11;
+        let y2p = yend >> 11;
+        let mut fdx = (x1p - x2p).abs();
+        let mut fdy = (y1p - y2p).abs();
+        let mut xf = (xstart >> 7) & 0xF;
+        let mut yf = (ystart >> 7) & 0xF;
+
+        match octant & 7 {
+            1 => {
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            3 => {
+                xf = 0x10 - xf;
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            7 => { xf = 0x10 - xf; }
+            6 => {
+                xf = 0x10 - xf;
+                yf = 0x10 - yf;
+            }
+            2 => {
+                let t = 0x10 - xf;
+                xf = 0x10 - yf;
+                yf = t;
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            0 => {
+                let t = 0x10 - yf;
+                yf = xf;
+                xf = t;
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            4 => { yf = 0x10 - yf; }
+            _ => {}
+        }
+
+        // Spec-correct base d for F_LINE/A_LINE is 3*minor - 2*major, not
+        // I_LINE's 2*minor - major (see rex3.rs fline_apply_fract for the
+        // full derivation from rex3_pdf.md 3.6.1.2 and MAME's do_fline).
+        // `d` here still holds the I_LINE-formula value; apply the same
+        // (minor - major) correction the real fix applies before adding
+        // the fractional term.
+        d += fdy - fdx;
+        d += 2 * (((fdx * yf) >> 4) - ((fdy * xf) >> 4));
+        let major_delta = if y_major { fdy } else { fdx };
+        let e = d - 2 * major_delta;
+        if e > 0 {
+            d = e;
+            let x_major = !y_major;
+            if x_major {
+                y -= incry2;
+            } else {
+                x += incrx2;
+            }
+        }
+    }
+
+    // --- step exactly like bres_step! / draw_line_bresenham's main loop ---
+    let adx2 = (x2 - x).abs();
+    let ady2 = (y2 - y).abs();
+    let pixel_count = adx2.max(ady2) + 1;
+
+    let mut pts = Vec::new();
+    for i in 0..pixel_count {
+        pts.push((x, y));
+        let is_last = i == pixel_count - 1;
+        if !is_last {
+            if d < 0 {
+                x += incrx1; y -= incry1; d += incr1;
+            } else {
+                x += incrx2; y -= incry2; d += incr2;
+            }
+        }
+    }
+    pts
+}
+
+/// Reference A_LINE endpoint-suppression decision — mirrors `draw_aline`'s
+/// AWEIGHT LUT lookup (rex3.rs:1826-1851). `aweight0`/`aweight1` are the raw
+/// 16-entry/4-bit-packed LUT register values. Returns (skip_first, skip_last).
+/// A_LINE tests are out of scope for this pass — kept for a future session.
+#[allow(dead_code)]
+fn aline_endpoint_skip(
+    x0_frac4: i32, y0_frac4: i32, x1_frac4: i32, y1_frac4: i32,
+    aweight0: u32, aweight1: u32,
+) -> (bool, bool) {
+    let mut skip_first = false;
+    let mut skip_last = false;
+    if x0_frac4 != 0 || y0_frac4 != 0 {
+        let wi = ((x0_frac4 + y0_frac4) as usize).min(15);
+        let w = (aweight0 >> (wi * 4)) & 0xF;
+        if w == 0 { skip_first = true; }
+    }
+    if x1_frac4 != 0 || y1_frac4 != 0 {
+        let wi = ((x1_frac4 + y1_frac4) as usize).min(15);
+        let w = (aweight1 >> (wi * 4)) & 0xF;
+        if w == 0 { skip_last = true; }
+    }
+    (skip_first, skip_last)
 }
 
 /// Reference Bresenham in software — returns the exact pixel sequence for an integer line.
@@ -1985,6 +2203,134 @@ fn test_iline_all_octants_step() {
 }
 
 // ============================================================================
+// F_LINE tests — fractional-endpoint Bresenham correction
+// ============================================================================
+
+/// Same 24-direction, 15°-increment sweep as `test_iline_all_octants_full`,
+/// but the center (start endpoint) is shifted by exactly half a pixel via
+/// REX3_XSTARTF/YSTARTF, and results are checked against `fline_pixels()`
+/// (which applies the same fractional correction as `fline_apply_fract`)
+/// instead of `bres_pixels()`. This is the "multidirectional line with
+/// subpixel precision" test: it would degrade to the plain-integer oracle
+/// (and silently pass even with a broken fractional path) if the offset
+/// were zero — the half-pixel shift is what actually exercises
+/// `fline_apply_fract`'s octant-dependent xf/yf swap-and-mirror logic.
+#[test]
+fn test_fline_all_octants_half_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 100i32;
+    let cy = 100i32;
+    let cx_frac = 8; // 0.5px
+    let cy_frac = 8; // 0.5px
+    let r = 32i32;
+    let pad = 4;
+
+    // Clear entire working area once.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    for (idx, deg) in (0..360usize).step_by(15).enumerate() {
+        let color = (idx + 1) as u8; // 1..24, never 0
+        let rad = (deg as f64).to_radians();
+        let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+        let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+        reg(&rex, REX3_COLORI, color as u32);
+        // End endpoint must go through the unbiased F-registers too — mixing
+        // a biased XYENDI with an unbiased XSTARTF corrupts dx/dy (see the
+        // doc comment on write_xstartf).
+        write_xendf(&rex, x1, 0);
+        write_yendf(&rex, y1, 0);
+        write_xstartf(&rex, cx, cx_frac);
+        write_ystartf(&rex, cy, cy_frac);
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+
+        let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+        let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+        let mut pts: HashSet<(i32,i32)> = HashSet::new();
+        for y in by..=ey {
+            for x in bx..=ex {
+                if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                    pts.insert((x, y));
+                }
+            }
+        }
+        let expected: HashSet<(i32,i32)> =
+            fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1).into_iter().collect();
+
+        assert_eq!(pts, expected,
+            "fline half-pixel octant test deg={deg}: ({cx}.5,{cy}.5)->({x1},{y1}): got {:?} expected {:?}",
+            pts, expected);
+    }
+}
+
+/// Same sweep, but at several distinct fractional offsets (1/4, 1/2, 3/4
+/// pixel) to confirm the fractional nibble is consumed proportionally
+/// (i.e. actually threaded through the xf/yf octant transform and the d
+/// correction term), not just treated as a single boolean "is fractional".
+#[test]
+fn test_fline_quarter_pixel_offsets() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 150i32;
+    let cy = 150i32;
+    let r = 24i32;
+    let pad = 4;
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    let mut color = 1u8;
+    for &frac4 in &[4i32, 8, 12] { // 0.25px, 0.5px, 0.75px
+        for &deg in &[0usize, 45, 90, 135, 180, 225, 270, 315] {
+            let rad = (deg as f64).to_radians();
+            let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+            let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+            reg(&rex, REX3_COLORI, color as u32);
+            write_xendf(&rex, x1, 0);
+            write_yendf(&rex, y1, 0);
+            write_xstartf(&rex, cx, frac4);
+            write_ystartf(&rex, cy, frac4);
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+
+            let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+            let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+            let mut pts: HashSet<(i32,i32)> = HashSet::new();
+            for y in by..=ey {
+                for x in bx..=ex {
+                    if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                        pts.insert((x, y));
+                    }
+                }
+            }
+            let expected: HashSet<(i32,i32)> =
+                fline_pixels(cx, frac4, cy, frac4, x1, y1).into_iter().collect();
+
+            assert_eq!(pts, expected,
+                "fline frac4={frac4} deg={deg}: ({cx}+{frac4}/16,{cy}+{frac4}/16)->({x1},{y1}): \
+                 got {:?} expected {:?}", pts, expected);
+
+            color = color.wrapping_add(1).max(1);
+        }
+    }
+}
+
+// A_LINE tests: out of scope for this pass — see rules/testing/rex3-fline-fractional-bresenham.md.
+// aline_endpoint_skip() (the AWEIGHT-LUT oracle helper) is kept for a future session.
+
+// ============================================================================
 // I_LINE line-loop test (XYSTARTI + repeated XYENDI GOs, SKIPLAST, DOSETUP)
 // ============================================================================
 
@@ -2194,9 +2540,27 @@ mod jit_tests {
         } else { false };
         assert!(compiled, "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
 
-        // Reset fb and re-run via JIT
+        // Reset fb and re-run via JIT.
+        //
+        // The "trigger compile" GO above may have executed via the interpreter
+        // fallback (compilation happens asynchronously) and, for a dm0 without
+        // DOSETUP set, that draw would have advanced ctx.pat_bit/zpat_bit as a
+        // side effect (pattern bit position only resets on DOSETUP — see
+        // execute_go, rex3.rs). rex3init()/setup() only touch MMIO registers,
+        // and pat_bit/zpat_bit have no register mapping (pure internal state),
+        // so without this reset the comparison run below would start from
+        // whatever pattern position the first GO left behind instead of the
+        // fresh state rex_interp's single-GO run used — a test-harness bug
+        // that showed up as spurious JIT/interp pixel mismatches for any
+        // dm0 lacking DOSETUP (confirmed: jit_lspattern_span_rgb24 and
+        // friends all use continuation-style dm0 values with DOSETUP clear).
         clear_region(rex_jit, x0, y0, x1, y1);
         rex3init(rex_jit);
+        unsafe {
+            let ctx = &mut *rex_jit.context.get();
+            ctx.pat_bit = 0;
+            ctx.zpat_bit = 0;
+        }
         setup(rex_jit);
         reg_go(rex_jit, REX3_DRAWMODE0, dm0);
         let fb_jit = dump_region(rex_jit, x0, y0, x1, y1);
@@ -2988,6 +3352,51 @@ mod jit_tests {
         );
     }
 
+    /// F_LINE with a fractional (half-pixel) start endpoint. Exercises the
+    /// same fractional-endpoint Bresenham correction (fline_apply_fract) as
+    /// the interpreter-only test_fline_all_octants_half_pixel, but now
+    /// through the JIT compile path — this is the parity check that would
+    /// have caught the JIT's silent I_LINE-degradation bug for F_LINE before
+    /// emit_draw_iline gained real fractional support.
+    #[test]
+    fn jit_fline_half_pixel_octants() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_FLINE;
+        // One representative direction per octant (8 of the 24-direction sweep
+        // used by the interpreter-only test) — full 24x would mean 24 separate
+        // JIT compiles, expensive for a parity check that just needs octant coverage.
+        // Deliberately ASYMMETRIC fractional offsets (xf != yf) at non-45-degree
+        // angles for most cases: a symmetric xf==yf offset at an exact 45-degree
+        // multiple is a degenerate geometry where the fractional correction term
+        // algebraically cancels against the plain I_LINE d — such cases pass even
+        // when the correction is missing entirely, so they can't catch a JIT
+        // regression on their own (this bit a first draft of this test).
+        let cx = 100i32;
+        let cy = 100i32;
+        let r = 24i32;
+        for (deg, xf, yf) in [
+            (0, 3, 11), (45, 5, 2), (90, 12, 7), (135, 1, 9),
+            (180, 8, 8), (225, 14, 3), (270, 6, 13), (315, 10, 1),
+        ] {
+            let rad = (deg as f64).to_radians();
+            let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+            let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+            compare_jit_interp(
+                cx.min(x1) - 4, cy.min(y1) - 4, cx.max(x1) + 4, cy.max(y1) + 4,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,   0xFF);
+                    reg(rex, REX3_COLORI,   0x99);
+                    write_xendf(rex, x1, 0);
+                    write_yendf(rex, y1, 0);
+                    write_xstartf(rex, cx, xf);
+                    write_ystartf(rex, cy, yf);
+                },
+                dm0, dm1,
+            );
+        }
+    }
+
     /// SCR2SCR block copy (RGB24): copy a colored rectangle.
     #[test]
     fn jit_scr2scr_rgb24_block() {
@@ -3392,3 +3801,4 @@ mod gfifo_tests {
         consumer.join().unwrap();
     }
 }
+

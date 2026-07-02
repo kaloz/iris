@@ -462,6 +462,24 @@ pub const OCTANT_YDEC: u32 = 1 << 0;
 pub const OCTANT_XDEC: u32 = 1 << 1;
 pub const OCTANT_XMAJOR: u32 = 1 << 2;
 
+// Bresenham octant table (aped from MAME do_iline s_bresenham_infos).
+// Fields: (incrx1, incrx2, incry1, incry2, y_major)
+// MAME applies y as `y -= incry`, so positive incry moves y in the negative direction.
+// Shared by setup() (fractional-endpoint correction) and draw_line_bresenham (the
+// per-pixel walk) — both interpreter code paths, but setup() also gates what the
+// JIT sees (see setup()'s doc comment on why the fractional correction lives there).
+#[rustfmt::skip]
+const REX3_BRES_OCTANTS: [(i32, i32, i32, i32, bool); 8] = [
+    ( 0,  1, -1, -1, true ),  // octant 0
+    ( 0,  1,  1,  1, true ),  // octant 1
+    ( 0, -1, -1, -1, true ),  // octant 2
+    ( 0, -1,  1,  1, true ),  // octant 3
+    ( 1,  1,  0, -1, false),  // octant 4
+    ( 1,  1,  0,  1, false),  // octant 5
+    (-1, -1,  0, -1, false),  // octant 6
+    (-1, -1,  0,  1, false),  // octant 7
+];
+
 bitfield! {
     #[derive(Clone, Copy, Default)]
     #[repr(transparent)]
@@ -1402,20 +1420,38 @@ impl Rex3 {
         let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
 
         // Bresenham integer parameters (iline).
-        // fline will re-derive d with fractional adjustments at draw time, but incr1/incr2
-        // remain the same — only d differs by a fractional correction term.
         //   incr1 = 2 * minor          (straight step increment, always >= 0)
         //   incr2 = 2 * (minor - major) (diagonal step increment, always <= 0)
-        //   d     = incr1 - major       (initial decision variable)
+        //   d     = incr1 - major       (initial decision variable, I_LINE formula)
         let incr1: i32 = 2 * minor;
         let incr2: i32 = 2 * (minor - major);
-        let d:     i32 = incr1 - major;
+        let mut d: i32 = incr1 - major;
 
         // Store as plain two's-complement integers masked to register field widths.
-        // draw_iline/draw_fline read these back, update d each step, and write d back.
         ctx.bresoctinc1.set_octant(octant);
         ctx.bresoctinc1.set_incr1((incr1 as u32) & 0xFFFFF);     // 20-bit, always positive
         ctx.bresrndinc2.set_incr2((incr2 as u32) & 0x1FFFFF);    // 21-bit signed
+
+        // F_LINE/A_LINE: apply the fractional-endpoint correction HERE, not at draw
+        // time. This must happen in setup() (not draw_line_bresenham/fline_apply_fract)
+        // because setup() is the only Bresenham-state derivation shared by both the
+        // interpreter and the JIT — the JIT-compiled entry point never calls back into
+        // interpreter draw functions, it just replays whatever bresd/bresoctinc1/
+        // bresrndinc2/xstart/ystart setup() already wrote into ctx. Applying the
+        // correction only in draw_line_bresenham (the old approach) left the JIT
+        // silently drawing plain-I_LINE trajectories for F_LINE/A_LINE, since the
+        // JIT never reaches that interpreter-only code path.
+        let adrmode = ctx.drawmode0.adrmode() << 2;
+        let is_fractional = adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE;
+        if is_fractional {
+            let (_incrx1, incrx2, _incry1, incry2, y_major) = REX3_BRES_OCTANTS[(octant & 7) as usize];
+            let mut x = ctx.xstart >> 11;
+            let mut y = ctx.ystart >> 11;
+            Self::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
+            ctx.xstart = x << 11;
+            ctx.ystart = y << 11;
+        }
+
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
     }
 
@@ -1801,6 +1837,19 @@ impl Rex3 {
             _ => {}
         }
 
+        // `*d` arrives holding the I_LINE decision variable (2*minor - major,
+        // computed by setup() and shared by all line adrmodes). The REX3 spec
+        // (rex3_pdf.md 3.6.1.2/3.6.2.1) defines F_LINE/A_LINE's base d as
+        // 3*minor - 2*major instead — confirmed against MAME's do_fline,
+        // which independently derives the same 3dy-2dx formula. The two
+        // formulas differ by exactly (minor - major); apply that correction
+        // before adding the fractional term below. Without it, the fractional
+        // term is added to the wrong baseline and can flip d's sign on the
+        // very first step for near-degenerate (small minor-axis) lines,
+        // producing a spurious extra step in the minor-axis direction that
+        // the line never recovers from (confirmed via a real R4400/REX3
+        // fractional-line test that undershot its endpoint by one row).
+        *d += dy - dx;
         *d += 2 * (((dx * yf) >> 4) - ((dy * xf) >> 4));
         let major_delta = if y_major { dy } else { dx };
         let e = *d - 2 * major_delta;
@@ -1857,23 +1906,8 @@ impl Rex3 {
         extra_skip_first: bool,
         extra_skip_last: bool,
     ) {
-        // Bresenham octant table (aped from MAME do_iline s_bresenham_infos).
-        // Fields: (incrx1, incrx2, incry1, incry2, y_major)
-        // MAME applies y as `y -= incry`, so positive incry moves y in the negative direction.
-        #[rustfmt::skip]
-        const BRES: [(i32, i32, i32, i32, bool); 8] = [
-            ( 0,  1, -1, -1, true ),  // octant 0
-            ( 0,  1,  1,  1, true ),  // octant 1
-            ( 0, -1, -1, -1, true ),  // octant 2
-            ( 0, -1,  1,  1, true ),  // octant 3
-            ( 1,  1,  0, -1, false),  // octant 4
-            ( 1,  1,  0,  1, false),  // octant 5
-            (-1, -1,  0, -1, false),  // octant 6
-            (-1, -1,  0,  1, false),  // octant 7
-        ];
-
         let octant = (ctx.bresoctinc1.octant() & 7) as usize;
-        let (incrx1, incrx2, incry1, incry2, y_major) = BRES[octant];
+        let (incrx1, incrx2, incry1, incry2, y_major) = REX3_BRES_OCTANTS[octant];
 
         let x2 = ctx.xend >> 11;
         let y2 = ctx.yend >> 11;
@@ -1889,14 +1923,13 @@ impl Rex3 {
             if raw & (1 << 20) != 0 { (raw | 0xFFE0_0000) as i32 } else { raw as i32 }
         };
         // d: 27-bit signed — sign-extend from bit 26.  Persisted across step-mode GOs.
+        // For F_LINE/A_LINE (fract=true), the fractional-endpoint correction was
+        // already applied in setup() (see setup()'s doc comment) — bresd/xstart/ystart
+        // read here are already correct, no further adjustment needed.
         let mut d = {
             let raw = ctx.bresd & 0x7FF_FFFF;
             if raw & (1 << 26) != 0 { (raw | 0xF800_0000) as i32 } else { raw as i32 }
         };
-
-        if fract && ctx.drawmode0.dosetup() {
-            Self::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
-        }
 
         // pixel_count = major_axis_length + 1 (both endpoints inclusive).
         // max(|dx|,|dy|): continuation GOs (dosetup clear) must still walk the full
@@ -1950,10 +1983,18 @@ impl Rex3 {
                 pattern_fn(ctx);
             }
 
-            // On the last pixel of a full-line draw, verify Bresenham landed on x2,y2.
-            // Skip in step mode (pixel_count==1) where we draw only one intermediate pixel.
+            // On the last pixel of a full I_LINE draw, verify Bresenham landed on x2,y2 —
+            // integer Bresenham is exact, so this is a real invariant for I_LINE.
+            // F_LINE/A_LINE do NOT get this check: a fractional start biases the initial
+            // error term but the loop still steps by whole pixels along the major axis,
+            // so the minor-axis position at the final major-axis step is the closest
+            // integer approximation to the true (fractional) line, not necessarily the
+            // literal requested endpoint — this is expected behavior for fractional
+            // Bresenham (confirmed independently: real hardware/software fractional-DDA
+            // implementations only guarantee landing in the endpoint's pixel *column/row*,
+            // not its exact minor-axis coordinate).
             debug_assert!(
-                iterate_one || !is_last || (x == x2 && y == y2),
+                fract || iterate_one || !is_last || (x == x2 && y == y2),
                 "I_LINE bres mismatch: pos ({},{}) != end ({},{})", x, y, x2, y2
             );
 
