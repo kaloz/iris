@@ -30,7 +30,6 @@ pub fn try_fastclear_block(rex: &Rex3, ctx: &Rex3Context) -> bool {
     let mut rows = 0u64;
 
     for y in y_lo..=y_hi {
-        rex.note_fb_y(y);
         for x in x_lo..=x_hi {
             if let Some(addr) = rex.calculate_fb_address(x, y, ctx, true) {
                 wr_fn(rex, addr, color);
@@ -69,7 +68,6 @@ pub fn try_src_span_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
 
     let color = ctx.get_colori();
     let wr_fn = unsafe { *rex.px_wr.get() };
-    rex.note_fb_y(y);
     for x in x_lo..=x_hi {
         if let Some(addr) = rex.calculate_fb_address(x, y, ctx, true) {
             wr_fn(rex, addr, color);
@@ -110,7 +108,6 @@ pub fn try_src_block_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
     let mut rows = 0u64;
 
     for y in y_lo..=y_hi {
-        rex.note_fb_y(y);
         for x in x_lo..=x_hi {
             if let Some(addr) = rex.calculate_fb_address(x, y, ctx, true) {
                 wr_fn(rex, addr, color);

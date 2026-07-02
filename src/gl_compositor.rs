@@ -335,69 +335,6 @@ impl GlCompositor {
         true
     }
 
-    fn upload_fb_u32_rows(
-        gl: &glow::Context,
-        tex: glow::Texture,
-        data: &[u32],
-        w: i32,
-        x0: usize,
-        x1: usize,
-        y0: usize,
-        y1: usize,
-    ) {
-        let row_h = (y1 - y0) as i32;
-        let col_w = (x1 - x0) as i32;
-        if row_h <= 0 || col_w <= 0 {
-            return;
-        }
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
-            let start = y0 * FB_W as usize + x0;
-            let byte_len = if row_h <= 1 {
-                col_w as usize * 4
-            } else {
-                (row_h as usize - 1) * FB_W as usize * 4 + col_w as usize * 4
-            };
-            let bytes = std::slice::from_raw_parts(
-                data[start..].as_ptr() as *const u8,
-                byte_len,
-            );
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D, 0, x0 as i32, y0 as i32, col_w, row_h,
-                glow::RED_INTEGER, glow::UNSIGNED_INT,
-                glow::PixelUnpackData::Slice(bytes),
-            );
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
-        }
-    }
-
-    fn upload_fb_u8_rows(
-        gl: &glow::Context,
-        tex: glow::Texture,
-        data: &[u8],
-        w: i32,
-        y0: usize,
-        y1: usize,
-    ) {
-        let row_h = (y1 - y0) as i32;
-        if row_h <= 0 {
-            return;
-        }
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
-            let start = y0 * FB_W as usize;
-            let bytes = &data[start..start + (y1 - y0) * FB_W as usize];
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D, 0, 0, y0 as i32, w, row_h,
-                glow::RED_INTEGER, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(bytes),
-            );
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
-        }
-    }
-
     fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], w: i32, h: i32) {
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -506,31 +443,11 @@ impl Compositor for GlCompositor {
         let fbo        = self.fbo.unwrap();
         let vao        = self.vao.unwrap();
 
-        // ── Upload per-frame buffers (partial when dirty region is a strict subset) ─
-        let partial_y = src.dirty_y1 > src.dirty_y0
-            && (src.dirty_y0 > 0 || src.dirty_y1 < src.height);
-        let partial_x = src.dirty_x1 > src.dirty_x0
-            && (src.dirty_x0 > 0 || src.dirty_x1 < src.width);
-        let partial = partial_y || partial_x;
-        if partial {
-            Self::upload_fb_u32_rows(
-                gl, tex_rgb, src.fb_rgb, w,
-                src.dirty_x0, src.dirty_x1, src.dirty_y0, src.dirty_y1,
-            );
-            Self::upload_fb_u32_rows(
-                gl, tex_aux, src.fb_aux, w,
-                src.dirty_x0, src.dirty_x1, src.dirty_y0, src.dirty_y1,
-            );
-        } else {
-            Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, w, h);
-            Self::upload_fb_u32(gl, tex_aux, src.fb_aux, w, h);
-        }
+        // ── Upload per-frame buffers (always full-frame) ────────────────────────
+        Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, w, h);
+        Self::upload_fb_u32(gl, tex_aux, src.fb_aux, w, h);
         if !src.status_bar_only {
-            if partial_y {
-                Self::upload_fb_u8_rows(gl, tex_did, src.did, w, src.dirty_y0, src.dirty_y1);
-            } else {
-                Self::upload_fb_u8(gl, tex_did, src.did, w, h);
-            }
+            Self::upload_fb_u8(gl, tex_did, src.did, w, h);
         }
 
         // ── Upload lookup tables (skip if unchanged) ───────────────────────────

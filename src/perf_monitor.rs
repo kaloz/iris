@@ -71,7 +71,6 @@ impl PerfMonitor {
             let total = jit + interp;
             let pct = if total > 0 { jit * 100 / total } else { 0 };
             let diag = rex.diag.load(Ordering::Relaxed);
-            let (y0, y1) = rex.dirty_y_range();
             writeln!(
                 writer,
                 "REX3 GO: {} total  JIT {}%  gfifo {}/{}  simd_fills {}",
@@ -80,10 +79,8 @@ impl PerfMonitor {
             ).map_err(|e| e.to_string())?;
             writeln!(
                 writer,
-                "REX3 diag: {:#018x}  dirty_y: {}..{}  gfxbusy: {}",
+                "REX3 diag: {:#018x}  gfxbusy: {}",
                 diag,
-                if y0 == u32::MAX { "—".to_string() } else { y0.to_string() },
-                y1,
                 rex.gfxbusy.load(Ordering::Relaxed),
             ).map_err(|e| e.to_string())?;
             #[cfg(feature = "rex-jit")]

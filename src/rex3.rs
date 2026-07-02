@@ -1070,11 +1070,6 @@ pub struct Rex3 {
     /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
     /// true so the first frame always renders.
     fb_dirty: AtomicBool,
-    /// Tile dirty tracking: min/max X/Y touched since last refresh (Phase 3).
-    dirty_x_min: AtomicU32,
-    dirty_x_max: AtomicU32,
-    dirty_y_min: AtomicU32,
-    dirty_y_max: AtomicU32,
     /// Rows filled via rex3_simd fastclear path (monitor `perf snapshot`).
     pub simd_fill_rows: AtomicU64,
     pub screen: Arc<Mutex<Rex3Screen>>,
@@ -1211,10 +1206,6 @@ impl Rex3 {
             #[cfg(feature = "idle-pause")]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
-            dirty_x_min: AtomicU32::new(u32::MAX),
-            dirty_x_max: AtomicU32::new(0),
-            dirty_y_min: AtomicU32::new(u32::MAX),
-            dirty_y_max: AtomicU32::new(0),
             simd_fill_rows: AtomicU64::new(0),
             screen,
             vblank_cb: Mutex::new(None),
@@ -3163,67 +3154,7 @@ impl Rex3 {
         }
     }
 
-    pub fn dirty_y_range(&self) -> (u32, u32) {
-        (
-            self.dirty_y_min.load(Ordering::Relaxed),
-            self.dirty_y_max.load(Ordering::Relaxed),
-        )
-    }
-
-    pub fn dirty_x_range(&self) -> (u32, u32) {
-        (
-            self.dirty_x_min.load(Ordering::Relaxed),
-            self.dirty_x_max.load(Ordering::Relaxed),
-        )
-    }
-
-    pub(crate) fn note_fb_x(&self, x: i32) {
-        if x < 0 || x >= REX3_SCREEN_WIDTH as i32 {
-            return;
-        }
-        let x = x as u32;
-        let mut min = self.dirty_x_min.load(Ordering::Relaxed);
-        while x < min {
-            match self.dirty_x_min.compare_exchange_weak(min, x, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(v) => min = v,
-            }
-        }
-        let mut max = self.dirty_x_max.load(Ordering::Relaxed);
-        while x > max {
-            match self.dirty_x_max.compare_exchange_weak(max, x, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(v) => max = v,
-            }
-        }
-    }
-
-    pub(crate) fn note_fb_y(&self, y: i32) {
-        if y < 0 || y >= REX3_SCREEN_HEIGHT as i32 {
-            return;
-        }
-        let y = y as u32;
-        let mut min = self.dirty_y_min.load(Ordering::Relaxed);
-        while y < min {
-            match self.dirty_y_min.compare_exchange_weak(min, y, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(v) => min = v,
-            }
-        }
-        let mut max = self.dirty_y_max.load(Ordering::Relaxed);
-        while y > max {
-            match self.dirty_y_max.compare_exchange_weak(max, y, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(v) => max = v,
-            }
-        }
-    }
-
     pub fn calculate_fb_address(&self, x: i32, y: i32, ctx: &Rex3Context, is_write: bool) -> Option<u32> {
-        if is_write {
-            self.note_fb_x(x);
-            self.note_fb_y(y);
-        }
         // 1. XYOFFSET (Draw only, not SCR2SCR source)
         let opcode = ctx.drawmode0.opcode();
         let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
@@ -3837,33 +3768,6 @@ impl Rex3 {
                     && !palette_dirty
                     && !dbg_overlay
                     && !self.screenshot_pending.load(Ordering::Relaxed);
-                if screen.status_bar_only {
-                    let h = screen.height.max(1);
-                    let w = screen.width.max(1);
-                    screen.dirty_y0 = h.saturating_sub(crate::disp::STATUS_BAR_HEIGHT);
-                    screen.dirty_y1 = h;
-                    screen.dirty_x0 = 0;
-                    screen.dirty_x1 = w;
-                } else {
-                    let y0 = self.dirty_y_min.swap(u32::MAX, Ordering::Relaxed);
-                    let y1 = self.dirty_y_max.swap(0, Ordering::Relaxed);
-                    if y0 != u32::MAX && y1 >= y0 {
-                        screen.dirty_y0 = y0 as usize;
-                        screen.dirty_y1 = (y1 as usize + 1).min(screen.height.max(1));
-                    } else {
-                        screen.dirty_y0 = 0;
-                        screen.dirty_y1 = screen.height.max(1);
-                    }
-                    let x0 = self.dirty_x_min.swap(u32::MAX, Ordering::Relaxed);
-                    let x1 = self.dirty_x_max.swap(0, Ordering::Relaxed);
-                    if x0 != u32::MAX && x1 >= x0 {
-                        screen.dirty_x0 = x0 as usize;
-                        screen.dirty_x1 = (x1 as usize + 1).min(screen.width.max(1));
-                    } else {
-                        screen.dirty_x0 = 0;
-                        screen.dirty_x1 = screen.width.max(1);
-                    }
-                }
 
                 // Push debug state into overlay
                 overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
@@ -3880,17 +3784,10 @@ impl Rex3 {
                 self.diag.fetch_or(Self::DIAG_LOCK_RENDERER, Ordering::Relaxed);
                 let mut renderer = self.renderer.lock();
 
-                let h = screen.height.max(1);
-                let w = screen.width.max(1);
-                let partial_fb = fb_was_dirty
-                    && (screen.dirty_y1.saturating_sub(screen.dirty_y0) < h
-                        || screen.dirty_x1.saturating_sub(screen.dirty_x0) < w);
-                let copy_full_fb = fb_was_dirty && !partial_fb;
-
                 let resized = screen.refresh(
                     &**fb_rgb,
                     &**fb_aux,
-                    copy_full_fb,
+                    fb_was_dirty,
                     &self.vc2,
                     &self.xmap0,
                     &self.cmap0,

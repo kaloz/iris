@@ -60,10 +60,6 @@ pub struct Rex3Screen {
     pub status_bar_only: bool,
     /// When true, `fb_rgb`/`fb_aux` snapshots were not copied — use live slices from refresh().
     pub fb_borrowed: bool,
-    pub dirty_y0: usize,
-    pub dirty_y1: usize,
-    pub dirty_x0: usize,
-    pub dirty_x1: usize,
 }
 
 impl Rex3Screen {
@@ -88,10 +84,6 @@ impl Rex3Screen {
             fb_x_offset:      2,
             status_bar_only:  false,
             fb_borrowed:      false,
-            dirty_y0:         0,
-            dirty_y1:         0,
-            dirty_x0:         0,
-            dirty_x1:         0,
         }
     }
 
@@ -263,12 +255,6 @@ impl Rex3Screen {
         live_rgb: Option<&'a [u32]>,
         live_aux: Option<&'a [u32]>,
     ) -> CompositorSource<'a> {
-        let h = self.height.max(1);
-        let w = self.width.max(1);
-        let y0 = self.dirty_y0.min(h);
-        let y1 = self.dirty_y1.max(y0 + 1).min(h);
-        let x0 = self.dirty_x0.min(w);
-        let x1 = self.dirty_x1.max(x0 + 1).min(w);
         CompositorSource {
             fb_rgb:           if self.fb_borrowed { live_rgb.unwrap_or(&self.fb_rgb) } else { &self.fb_rgb },
             fb_aux:           if self.fb_borrowed { live_aux.unwrap_or(&self.fb_aux) } else { &self.fb_aux },
@@ -286,10 +272,6 @@ impl Rex3Screen {
             fb_x_offset:      self.fb_x_offset,
             width:            self.width,
             height:           self.height,
-            dirty_y0:         y0,
-            dirty_y1:         y1,
-            dirty_x0:         x0,
-            dirty_x1:         x1,
             status_bar_only:  self.status_bar_only,
         }
     }
