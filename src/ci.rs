@@ -129,7 +129,7 @@ pub fn start_server(
         start_tcp_server(server.clone(), &path)?;
     } else {
         #[cfg(unix)]
-        start_unix_server(server, &path)?;
+        start_unix_server(server.clone(), &path)?;
         #[cfg(not(unix))]
         return Err(format!(
             "CI socket path {} requires a Unix domain socket; use host:port on this platform",

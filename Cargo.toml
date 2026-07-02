@@ -110,7 +110,7 @@ cranelift-jit        = { version = "0.116", optional = true }
 cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
-libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.288.9", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }

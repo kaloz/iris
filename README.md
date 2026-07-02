@@ -130,6 +130,10 @@ Without this feature, attempting to mount a `.chd` path returns an
 `Unsupported` error; raw images and COW overlays continue to work as
 before.
 
+The CHD backend (`libchdman-rs` >= 0.288.8) and the MAME CHD core it vendors
+are BSD-3-Clause licensed, so enabling this feature keeps IRIS fully
+BSD-3-Clause (see `LICENSE-libchdman-rs.txt`).
+
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
 
@@ -427,7 +431,12 @@ first. It'll save you a few days.
 
 ## License
 
-BSD 3-Clause
+BSD 3-Clause (`LICENSE`).
+
+The optional `--features chd` build links `libchdman-rs` (>= 0.288.8), which —
+along with the MAME CHD core it vendors — is also BSD 3-Clause, so CHD builds
+stay fully BSD 3-Clause. See `LICENSE-libchdman-rs.txt` for that third-party
+notice.
 
 ## Whodunnit?
 
