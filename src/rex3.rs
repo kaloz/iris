@@ -1051,8 +1051,6 @@ pub struct Rex3 {
     pub cmap1: Mutex<Cmap>,
     pub bt445: Mutex<Bt445>,
     clock: AtomicU64,
-    /// REX3 refresh thread iterations (~display vsync cadence).
-    refresh_frames: AtomicU64,
     running: AtomicBool,
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -1204,7 +1202,6 @@ impl Rex3 {
             cmap1: Mutex::new(Cmap::new(1)),
             bt445: Mutex::new(Bt445::new()),
             clock: AtomicU64::new(0),
-            refresh_frames: AtomicU64::new(0),
             running: AtomicBool::new(false),
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
@@ -3738,7 +3735,6 @@ impl Rex3 {
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
-            self.refresh_frames.fetch_add(1, Ordering::Relaxed);
 
             // Poll and clear activity bits; preserve persistent LED bits.
             let bar_stats = crate::disp::BarStats {
@@ -3746,7 +3742,6 @@ impl Rex3 {
                 hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
                 cycles:       self.cycles.load(Ordering::Relaxed),
                 fasttick:     self.fasttick_count.load(Ordering::Relaxed),
-                refresh_frames: self.refresh_frames.load(Ordering::Relaxed),
                 #[cfg(feature = "developer")]
                 decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
                 #[cfg(not(feature = "developer"))]

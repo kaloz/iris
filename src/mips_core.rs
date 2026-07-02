@@ -101,6 +101,15 @@ pub struct MipsCore {
     /// Used for calibration: dt_ns/dc measure the old interval, so count_step must be
     /// computed against the old delta, not the new one.  Zero = no previous write yet.
     pub compare_delta_prev: u64,
+    /// Calibrated hardware-count units per real nanosecond (32.32 fixed-point),
+    /// measured directly from `prev_delta / dt_ns` on each Compare write — i.e.
+    /// the same real-world measurement `count_step` is derived from, but expressed
+    /// as a wall-clock rate instead of a per-instruction step. Used by
+    /// `idle_park::park()` to advance `cp0_count` at the true calibrated rate
+    /// during a sleep, instead of assuming `compare_delta_slow` is exactly 10ms
+    /// (which is only a bucket label, not a measured rate — see rules/perf/idle-pause-work.md).
+    /// Zero = not yet calibrated.
+    pub hw_per_ns: u64,
     pub cp0_status: u32,      // 12: Status Register
     pub cp0_cause: u32,       // 13: Cause Register
     pub cp0_epc: u64,         // 14: Exception Program Counter
@@ -251,6 +260,7 @@ impl MipsCore {
             compare_delta_slow: 0,
             compare_delta_fast: 0,
             compare_delta_prev: 0,
+            hw_per_ns: 0,
             cp0_status: 0,
             cp0_cause: 0,
             cp0_epc: 0,
@@ -596,6 +606,11 @@ impl MipsCore {
                     // so a tick-rate switch doesn't mix old timing with the new delta.
                     // If there was no previous delta (first write after reset), skip.
                     let prev_delta = self.compare_delta_prev;
+                    if prev_delta != 0 && dt_ns > 0 {
+                        // Directly measured hw-count units per real ns — no bucket-snapping
+                        // or "assume 100 Hz" involved, unlike compare_delta_slow/fast.
+                        self.hw_per_ns = ((prev_delta as u128) / (dt_ns as u128)) as u64;
+                    }
                     if prev_delta != 0 {
                         if let Some(snapped_ns) = self.bin_compare_delta(prev_delta) {
                             if dc > 0 {

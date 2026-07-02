@@ -500,8 +500,6 @@ pub struct BarStats {
     pub now:            std::time::Instant,
     pub cycles:         u64,
     pub fasttick:       u64,
-    /// REX3 refresh loop iteration count (use for status-bar Hz).
-    pub refresh_frames: u64,
     pub decoded_delta:  u64,
     pub l1i_hits:       u64,
     pub l1i_fetches:    u64,
@@ -530,10 +528,10 @@ pub struct StatusBar {
     led_red: bool,
     led_green: bool,
     prev_cycles: u64,
-    prev_refresh_frames: u64,
+    prev_fasttick: u64,
     prev_time: std::time::Instant,
     mips: f64,
-    refresh_hz: f64,
+    fasthz: f64,
     decode_pct: f64,
     l1i_hit_pct: f64,
     uncached_pct: f64,
@@ -549,10 +547,10 @@ impl StatusBar {
             led_red: false,
             led_green: false,
             prev_cycles: 0,
-            prev_refresh_frames: 0,
+            prev_fasttick: 0,
             prev_time: std::time::Instant::now(),
             mips: 0.0,
-            refresh_hz: 0.0,
+            fasthz: 0.0,
             decode_pct: 0.0,
             l1i_hit_pct: 0.0,
             uncached_pct: 0.0,
@@ -579,7 +577,7 @@ impl StatusBar {
         let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
             let dc = stats.cycles.wrapping_sub(self.prev_cycles);
-            let dr = stats.refresh_frames.wrapping_sub(self.prev_refresh_frames);
+            let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
             self.mips   = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
             #[cfg(feature = "developer")] {
                 let total_fetches = stats.l1i_fetches + stats.uncached;
@@ -587,9 +585,9 @@ impl StatusBar {
                 self.l1i_hit_pct  = if stats.l1i_fetches > 0 { stats.l1i_hits as f64 / stats.l1i_fetches as f64 * 100.0 } else { 0.0 };
                 self.uncached_pct = if dc > 0 { stats.uncached as f64 / dc as f64 * 100.0 } else { 0.0 };
             }
-            self.refresh_hz = (dr as f64 / dt).round();
+            self.fasthz = (df as f64 / dt).round();
             self.prev_cycles   = stats.cycles;
-            self.prev_refresh_frames = stats.refresh_frames;
+            self.prev_fasttick = stats.fasttick;
             self.prev_time     = stats.now;
         }
 
@@ -597,9 +595,9 @@ impl StatusBar {
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:08x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.refresh_hz, stats.count_step as u32, stats.gfifo_pending);
+        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:08x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_step as u32, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
-        let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.refresh_hz);
+        let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.fasthz);
 
         let row_stride = 2048;
         for row in 0..STATUS_BAR_HEIGHT {

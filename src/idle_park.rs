@@ -62,9 +62,15 @@ impl IdleParkState {
 
     /// Park in ≤1 ms slices until an interrupt is due or pending.
     pub fn park(&self, core: &mut MipsCore, running: &AtomicBool) {
-        let slow_hw = core.compare_delta_slow >> 32;
+        // hw_per_ns is measured directly from the last Compare interval's real
+        // elapsed time (see mips_core.rs write_cp0), unlike compare_delta_slow
+        // which is only a fuzzy-matched bucket label that *assumes* 100 Hz on
+        // its first sample. Using the bucket instead of the measured rate here
+        // silently mis-paces cp0_count advancement whenever the guest's actual
+        // first Compare interval isn't really 10ms (rules/perf/idle-pause-work.md).
+        let hw_per_ns = core.hw_per_ns;
         let cs = core.count_step;
-        if slow_hw == 0 || cs == 0 {
+        if hw_per_ns == 0 || cs == 0 {
             return;
         }
 
@@ -88,8 +94,8 @@ impl IdleParkState {
             }
 
             let rem_hw = diff >> 32;
-            let ns_to_tick = (rem_hw as u128 * 10_000_000u128 / slow_hw as u128) as u64;
-            let slice_ns = ns_to_tick.min(SLICE_NS);
+            let ns_to_tick = ((rem_hw as u128) << 32) / hw_per_ns as u128;
+            let slice_ns = (ns_to_tick.min(SLICE_NS as u128)) as u64;
             if slice_ns < MIN_SLICE_NS {
                 core.cp0_count = cmp;
                 core.cp0_cause |= CAUSE_IP7;
@@ -99,7 +105,7 @@ impl IdleParkState {
             let t0 = Instant::now();
             std::thread::sleep(Duration::from_nanos(slice_ns));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            let adv_hw = (elapsed_ns as u128 * slow_hw as u128 / 10_000_000u128) as u64;
+            let adv_hw = ((elapsed_ns as u128 * hw_per_ns as u128) >> 32) as u64;
             core.cp0_count = core.cp0_count.wrapping_add(adv_hw << 32);
             let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
             core.local_cycles = core.local_cycles.wrapping_add(adv_instrs);
