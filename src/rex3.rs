@@ -3141,7 +3141,7 @@ impl Rex3 {
             });
         }
         self.gfifo.push(addr, val);
-        self.update_gfifo_irqs();
+        //self.update_gfifo_irqs();
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
@@ -3365,7 +3365,7 @@ impl Rex3 {
                 // (context registers + FB) only after both process_register and execute_go
                 // have completed.
                 self.gfifo.consume();
-                self.update_gfifo_irqs();
+                //self.update_gfifo_irqs();
 
                 if exit {
                     self.gfxbusy.store(false, Ordering::Release);
@@ -3376,7 +3376,7 @@ impl Rex3 {
                 if is_busy {
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
-                    self.update_gfifo_irqs();
+                    //self.update_gfifo_irqs();
                 }
                 self.gfifo.flush_head();
                 // Nothing in the ring — back off. Spin-hint/yield while a burst
