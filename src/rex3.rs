@@ -2093,15 +2093,22 @@ impl Rex3 {
     //   LSRCOUNT  (down counter, 0..LSREPEAT-1): decremented each pixel.
     //   When LSRCOUNT == 0 after decrement → advance pat_bit, reload LSRCOUNT = LSREPEAT-1.
     //   LSLENGTH  (4 bits): pattern length = lslength + 17 (range 17..32).
-    //   At pattern end the hardware recirculates by rotating LSPATTERN left (ROL).
+    //   pat_bit wraps: when it would go below (32 - length), reset to 31.
     //   LSREPEAT==0 is treated as 1 (no-repeat is the degenerate case).
+    //
+    // Cursors start at 31 (MSB) on DOSETUP/row start (see execute_go) and walk
+    // DOWN toward the wrap point — a contiguous MSB-to-LSB sweep. f2d0bff
+    // briefly flipped this to increment-from-31 (+ an lspattern rotate-on-wrap
+    // in place of the reset), but incrementing from 31 immediately wraps to 0
+    // after a single step (`(31+1)&31 == 0`), producing a discontinuous,
+    // backwards bit walk — confirmed as the cause of garbled/mirrored PROM
+    // text. Reverted back to decrement/reset-to-31.
 
     fn iterate_pattern_noop(_ctx: &mut Rex3Context) {}
 
     #[inline(always)]
     fn advance_zpat(ctx: &mut Rex3Context) {
-        // Hardware recirculates MSB-first: rotate left through the 32-bit pattern.
-        ctx.zpat_bit = ctx.zpat_bit.wrapping_add(1) & 31;
+        ctx.zpat_bit = ctx.zpat_bit.wrapping_sub(1) & 31;
     }
 
     #[inline(always)]
@@ -2114,10 +2121,9 @@ impl Rex3 {
             let length = ctx.lsmode.lslength() as u8 + 17; // 17..=32
             let wrap_point = 32u8.saturating_sub(length);  // bit index of pattern end
             if ctx.pat_bit == wrap_point {
-                // Recirculate: rotate pattern left, keep cursor at wrap_point.
-                ctx.lspattern = ctx.lspattern.rotate_left(1);
+                ctx.pat_bit = 31; // recirculate
             } else {
-                ctx.pat_bit = ctx.pat_bit.wrapping_add(1) & 31;
+                ctx.pat_bit = ctx.pat_bit.wrapping_sub(1) & 31;
             }
         } else {
             ctx.lsmode.set_lsrcount(ctx.lsmode.lsrcount() - 1);
@@ -3385,6 +3391,11 @@ impl Rex3 {
 
         // Pattern bit positions reset only on DOSETUP (new primitive).  Connected
         // stippled line segments keep pat_bit across GO via LSSAVE/LSRESTORE.
+        // (This gating is a real, separate fix from f2d0bff, validated by
+        // test_iline_lsadvlast_advances_on_last_pixel — do not confuse it with
+        // f2d0bff's LSPATTERN/ZPATTERN direction+rotation change, which broke
+        // PROM text rendering and was reverted separately in advance_zpat/
+        // advance_lspat above.)
         if ctx.drawmode0.dosetup() {
             ctx.pat_bit  = 31;
             ctx.zpat_bit = 31;

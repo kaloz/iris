@@ -1,6 +1,23 @@
 //! SIMD-friendly fast paths for common REX3 interpreter draws (pre rex-jit).
 
-use crate::rex3::{Rex3, Rex3Context, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH};
+use crate::rex3::{Rex3, Rex3Context, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH};
+
+// ctx.xstart/ystart/xend/yend (>>11) are screen coordinates biased by
+// REX3_COORD_BIAS (4096) — the same convention calculate_fb_address expects
+// and subtracts internally. The bounding-box clamps below exist only to cap
+// a degenerate/garbage coordinate range before looping, not to reject
+// off-screen pixels (calculate_fb_address already does that per-pixel via
+// its own bias-aware bounds check, including XYWIN/xymove offsets these
+// clamps don't know about) — so the clamp bounds must be shifted by the
+// same bias, not the raw [0, SCREEN_WIDTH-1] screen range. Using unbiased
+// bounds here previously collapsed every on-screen coordinate (always
+// >= REX3_COORD_BIAS) down to REX3_SCREEN_WIDTH-1/REX3_SCREEN_HEIGHT-1,
+// making these fast paths silently draw a single degenerate off-screen
+// pixel instead of the requested region — confirmed via jit_fastclear_rgb24.
+const REX3_BIASED_X_MIN: i32 = REX3_COORD_BIAS;
+const REX3_BIASED_X_MAX: i32 = REX3_COORD_BIAS + REX3_SCREEN_WIDTH - 1;
+const REX3_BIASED_Y_MIN: i32 = REX3_COORD_BIAS;
+const REX3_BIASED_Y_MAX: i32 = REX3_COORD_BIAS + REX3_SCREEN_HEIGHT - 1;
 
 /// Try to fast-fill a fastclear BLOCK without per-pixel interpreter overhead.
 /// Returns true when the entire primitive was handled.
@@ -18,10 +35,10 @@ pub fn try_fastclear_block(rex: &Rex3, ctx: &Rex3Context) -> bool {
         return false; // BLOCK only
     }
 
-    let x0 = (ctx.xstart >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let x1 = (ctx.xend >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let y0 = (ctx.ystart >> 11).clamp(0, REX3_SCREEN_HEIGHT as i32 - 1);
-    let y1 = (ctx.yend >> 11).clamp(0, REX3_SCREEN_HEIGHT as i32 - 1);
+    let x0 = (ctx.xstart >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let x1 = (ctx.xend >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let y0 = (ctx.ystart >> 11).clamp(REX3_BIASED_Y_MIN, REX3_BIASED_Y_MAX);
+    let y1 = (ctx.yend >> 11).clamp(REX3_BIASED_Y_MIN, REX3_BIASED_Y_MAX);
     let (x_lo, x_hi) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
     let (y_lo, y_hi) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
 
@@ -61,9 +78,9 @@ pub fn try_src_span_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
         return false; // RGB/RGBA planes only
     }
 
-    let x0 = (ctx.xstart >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let x1 = (ctx.xend >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let y = (ctx.ystart >> 11).clamp(0, REX3_SCREEN_HEIGHT as i32 - 1);
+    let x0 = (ctx.xstart >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let x1 = (ctx.xend >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let y = (ctx.ystart >> 11).clamp(REX3_BIASED_Y_MIN, REX3_BIASED_Y_MAX);
     let (x_lo, x_hi) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
 
     let color = ctx.get_colori();
@@ -96,10 +113,10 @@ pub fn try_src_block_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
         return false;
     }
 
-    let x0 = (ctx.xstart >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let x1 = (ctx.xend >> 11).clamp(0, REX3_SCREEN_WIDTH as i32 - 1);
-    let y0 = (ctx.ystart >> 11).clamp(0, REX3_SCREEN_HEIGHT as i32 - 1);
-    let y1 = (ctx.yend >> 11).clamp(0, REX3_SCREEN_HEIGHT as i32 - 1);
+    let x0 = (ctx.xstart >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let x1 = (ctx.xend >> 11).clamp(REX3_BIASED_X_MIN, REX3_BIASED_X_MAX);
+    let y0 = (ctx.ystart >> 11).clamp(REX3_BIASED_Y_MIN, REX3_BIASED_Y_MAX);
+    let y1 = (ctx.yend >> 11).clamp(REX3_BIASED_Y_MIN, REX3_BIASED_Y_MAX);
     let (x_lo, x_hi) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
     let (y_lo, y_hi) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
 

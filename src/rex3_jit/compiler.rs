@@ -1219,9 +1219,11 @@ fn emit_shader(
         (colorred_v, colorgrn_v, colorblue_v, coloralpha_v)
     };
 
-    // Pattern advance
+    // Pattern advance — mirrors advance_zpat/advance_lspat (rex3.rs): decrement,
+    // reset to 31 on wrap (pre-f2d0bff behavior; f2d0bff's increment+lspattern-
+    // rotate scheme broke PROM text rendering and was reverted in rex3.rs, so
+    // the JIT is reverted to match here too — do not reintroduce the rotation).
     let new_zpat_bit = if dm0.enzpattern() {
-        // zpat_bit = (zpat_bit - 1) & 31
         let c1_i8 = b.ins().iconst(types::I8, 1);
         let dec = b.ins().isub(zpat_bit_v, c1_i8);
         b.ins().band_imm(dec, 31)
@@ -1815,7 +1817,8 @@ fn emit_draw_iline(
         (colorred_v, colorgrn_v, colorblue_v, coloralpha_v)
     };
 
-    // Pattern advance (mirrors pattern_fn in draw_iline)
+    // Pattern advance (mirrors pattern_fn in draw_iline) — decrement, reset to
+    // 31 on wrap (see emit_shader's identical block for the full rationale).
     let new_zpat_bit = if dm0.enzpattern() {
         let c1_i8 = b.ins().iconst(types::I8, 1);
         let dec = b.ins().isub(zpat_bit_v, c1_i8);
