@@ -11,6 +11,8 @@ use crate::prom::PromPort;
 use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
 use crate::rex3::Rex3;
+use crate::xz::Xz;
+use crate::mgras::Mgras;
 use crate::vino::Vino;
 #[cfg(feature = "ultra64")]
 use crate::ultra64::Ultra64;
@@ -194,6 +196,12 @@ pub struct Physical {
     banks: [Memory; 4],
 
     pub rex3: Option<Arc<Rex3>>,
+    /// Second Newport head (dual-head Indigo2 / `graphics.heads = 2`).
+    pub rex3_head1: Option<Arc<Rex3>>,
+    /// Indy XZ/Elan preview stub (`graphics.board = xz`).
+    pub xz: Option<Arc<Xz>>,
+    /// Indigo2 IMPACT/MGRAS preview stub (`[impact]` section).
+    pub mgras: Option<Arc<Mgras>>,
     #[cfg(feature = "ultra64")]
     pub ultra64: Option<Arc<Ultra64>>,
     pub vino: Vino,
@@ -259,6 +267,9 @@ impl Physical {
     pub fn new(
         banks: [Memory; 4],
         rex3: Option<Arc<Rex3>>,
+        rex3_head1: Option<Arc<Rex3>>,
+        xz: Option<Arc<Xz>>,
+        mgras: Option<Arc<Mgras>>,
         #[cfg(feature = "ultra64")]
         ultra64: Option<Arc<Ultra64>>,
         vino: Vino,
@@ -294,6 +305,9 @@ impl Physical {
         Self {
             banks,
             rex3,
+            rex3_head1,
+            xz,
+            mgras,
             #[cfg(feature = "ultra64")]
             ultra64,
             vino,
@@ -324,6 +338,10 @@ impl Physical {
         let cpu_err_ptr: *const dyn BusDevice = &self.cpu_bus_error;
         let gio_err_ptr: *const dyn BusDevice = &self.gio_bus_error;
         let rex3_ptr: Option<*const dyn BusDevice> = self.rex3.as_deref().map(|r| r as *const dyn BusDevice);
+        let rex3_head1_ptr: Option<*const dyn BusDevice> =
+            self.rex3_head1.as_deref().map(|r| r as *const dyn BusDevice);
+        let xz_ptr: Option<*const dyn BusDevice> = self.xz.as_deref().map(|x| x as *const dyn BusDevice);
+        let mgras_ptr: Option<*const dyn BusDevice> = self.mgras.as_deref().map(|m| m as *const dyn BusDevice);
         #[cfg(feature = "ultra64")]
         let ultra64_ptr: Option<*const dyn BusDevice> = self.ultra64.as_deref().map(|u| u as *const dyn BusDevice);
         let vino_ptr: *const dyn BusDevice = &self.vino;
@@ -382,8 +400,31 @@ impl Physical {
             for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
                 self.device_map[i as usize] = rex3_ptr;
             }
+        } else if let Some(xz_ptr) = xz_ptr {
+            // Indy XZ/Elan preview: same gfx slot, HQ2 register stub in `src/xz.rs`.
+            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = xz_ptr;
+            }
+        } else if let Some(mgras_ptr) = mgras_ptr {
+            // Indigo2 IMPACT preview: MGRAS stub spans gfx + populated expansion slots.
+            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = mgras_ptr;
+            }
+            for i in (GIO_SLOT0_BASE >> 16)..((GIO_SLOT0_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = mgras_ptr;
+            }
+            for i in (GIO_SLOT1_BASE >> 16)..((GIO_SLOT1_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = mgras_ptr;
+            }
         }
         // else: GIO timeout from layer 2 already covers the Newport slot
+
+        // Second Newport head at GIO expansion slot 1 (dual-head).
+        if let Some(h1_ptr) = rex3_head1_ptr {
+            for i in (GIO_SLOT1_BASE >> 16)..((GIO_SLOT1_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = h1_ptr;
+            }
+        }
 
         // GIO expansion slot 0 (0x1F400000–0x1F5FFFFF): N64 dev board if enabled
         #[cfg(feature = "ultra64")]
@@ -398,7 +439,7 @@ impl Physical {
                 self.device_map[i as usize] = u64_ptr;
             }
         }
-        // GIO expansion slot 1 (0x1F600000–0x1F9FFFFF) — no device, GIO timeout remains
+        // GIO expansion slot 1 — second Newport when rex3_head1 absent: GIO timeout remains
 
         // Map MC registers (128KB at 0x1FA00000)
         for i in (MC_BASE >> 16)..((MC_END - 1) >> 16) + 1 {

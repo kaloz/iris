@@ -73,6 +73,16 @@ use super::trace::{TraceWriter, TraceRecord};
 
 const MAX_BLOCK_LEN: usize = 64;
 
+/// Whether a stable block may leave speculative mode (snapshot/rollback path).
+/// x86_64 Keeps Loads speculative — multi-load blocks miscompile when trusted.
+fn speculative_may_graduate(tier: BlockTier) -> bool {
+    match tier {
+        BlockTier::Alu => true,
+        BlockTier::Loads => cfg!(target_arch = "aarch64"),
+        BlockTier::Full => false,
+    }
+}
+
 /// How many interpreter steps in one outer batch (controls flush_cycles frequency).
 const BATCH_SIZE: u32 = 10000;
 
@@ -233,6 +243,9 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut profile_replay_active = false;
     let mut profile_replayed: u64 = 0;
     let mut profile_stale: u64 = 0;
+
+    #[cfg(feature = "idle-pause")]
+    let mut idle_state = crate::idle_park::IdleParkState::default();
 
     while running.load(Ordering::Relaxed) {
         let mut steps_in_batch: u32 = 0;
@@ -673,21 +686,32 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         block.stable_hits += 1;
                         block.exception_count = 0;
 
-                        if block.speculative && block.stable_hits >= tier_cfg.stable {
+                        // Alu may graduate on all hosts; Loads only on aarch64 (x86_64
+                        // regalloc2 miscompiles multi-load blocks — keep Loads speculative).
+                        // Full-tier load-only blocks never graduate (premiere TLBMISS).
+                        if block.speculative
+                            && block.stable_hits >= tier_cfg.stable
+                            && speculative_may_graduate(block.tier)
+                        {
                             block.speculative = false;
                         }
 
                         if !block.speculative && block.stable_hits >= tier_cfg.promote {
                             if let Some(next) = block.tier.promote().filter(|t| *t <= max_tier) {
-                                promotions += 1;
-                                eprintln!("JIT: promote {:016x} {:?}→{:?} ({}hits)",
-                                    pc, block.tier, next, block.hit_count);
-                                let instrs = trace_block(exec, pc, next);
-                                if !instrs.is_empty() {
-                                    async_comp.submit(CompileRequest {
-                                        instrs, block_pc: pc, phys_pc,
-                                        tier: next, kind: CompileKind::Recompile,
-                                    });
+                                if !async_comp.pending.contains(&(phys_pc, pc)) {
+                                    promotions += 1;
+                                    eprintln!("JIT: promote {:016x} {:?}→{:?} ({}hits)",
+                                        pc, block.tier, next, block.hit_count);
+                                    let instrs = trace_block(exec, pc, next);
+                                    if !instrs.is_empty() {
+                                        async_comp.submit(CompileRequest {
+                                            instrs, block_pc: pc, phys_pc,
+                                            tier: next, kind: CompileKind::Recompile,
+                                        });
+                                    }
+                                    if let Some(block) = cache.lookup_mut(phys_pc, pc) {
+                                        block.stable_hits = 0;
+                                    }
                                 }
                             }
                         }
@@ -885,7 +909,10 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         if !cache.contains(phys_pc, entry.virt_pc)
                             && !async_comp.pending.contains(&(phys_pc, entry.virt_pc))
                         {
-                            let instrs = trace_block(exec, entry.virt_pc, entry.tier);
+                            // Profile hints are Loads-tier at most; Full blocks are
+                            // promoted in-session with speculative rollback intact.
+                            let replay_tier = entry.tier.min(max_tier).min(BlockTier::Loads);
+                            let instrs = trace_block(exec, entry.virt_pc, replay_tier);
                             if !instrs.is_empty() {
                                 let content_hash = super::compiler::hash_block_instrs(&instrs);
                                 if instrs.len() as u32 == entry.len_mips
@@ -893,7 +920,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 {
                                     async_comp.submit(CompileRequest {
                                         instrs, block_pc: entry.virt_pc, phys_pc,
-                                        tier: entry.tier,
+                                        tier: replay_tier,
                                         kind: CompileKind::ProfileReplay { content_hash },
                                     });
                                 } else {
@@ -913,6 +940,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         {
             let exec = unsafe { &mut *exec_ptr };
             exec.flush_cycles();
+        }
+
+        #[cfg(feature = "idle-pause")]
+        if crate::idle_park::idle_park_enabled() {
+            let exec = unsafe { &mut *exec_ptr };
+            if idle_state.update(&exec.core) {
+                idle_state.park(&mut exec.core, running);
+            }
         }
 
         // Write trace record at 100K instruction milestones.
@@ -1000,7 +1035,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         .map(|(&(phys_pc, _virt_pc), block)| ProfileEntry {
             phys_pc,
             virt_pc: block.virt_addr,
-            tier: block.tier,
+            tier: block.tier.min(BlockTier::Loads),
             len_mips: block.len_mips,
             content_hash: block.content_hash,
             hit_count: block.hit_count,
@@ -1086,13 +1121,10 @@ fn trace_block<T: Tlb, C: MipsCache>(
     let mut instrs = Vec::with_capacity(max_len);
     let mut pc = start_pc;
 
-    // Full-tier blocks accumulate up to max_helpers load/store helper calls
-    // before terminating. Each helper emits an ok_block/exc_block CFG diamond.
-    // Too many chained diamonds trip Cranelift's regalloc2 and produce wrong
-    // code (confirmed by IRIS_JIT_VERIFY catching real GPR mismatches). The
-    // safe ceiling was empirically determined: aarch64 tolerates 3, x86_64
-    // only 1. Bumping past this threshold produces silent miscompilations.
-    let max_helpers: u32 = MAX_BLOCK_LEN as u32;
+    // Loads/Full: each load helper emits an ok_block/exc_block CFG diamond.
+    // Too many chained diamonds trip Cranelift regalloc2 on x86_64 (limit 1);
+    // aarch64 tolerates 3. See rules/jit/cranelift-regalloc2-helper-diamond-limit.
+    let max_helpers: u32 = if cfg!(target_arch = "aarch64") { 3 } else { 1 };
     let mut helper_count: u32 = 0;
 
     for _ in 0..max_len {
@@ -1123,7 +1155,8 @@ fn trace_block<T: Tlb, C: MipsCache>(
             break;
         }
 
-        let is_helper_instr = tier == BlockTier::Full && is_compilable_load(&d);
+        let is_helper_instr =
+            tier >= BlockTier::Loads && is_compilable_load(&d);
         instrs.push((raw, d));
 
         if is_helper_instr {

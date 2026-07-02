@@ -1,4 +1,4 @@
-use crate::framebuffer::{CaptureRenderer, FrameSink};
+use crate::framebuffer::{new_capture_renderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use iris::config::{MachineConfig, PortForwardConfig};
 use iris::machine::Machine;
@@ -42,7 +42,11 @@ pub enum Cmd {
     CowReset { base: String, chd: bool },
     /// Load a disc image into a CD-ROM device (live hot-swap).
     /// Valid only while running. The path is loaded as the active disc.
-    LoadDisc { id: u8, path: String },
+    LoadDisc { id: u8, path: String, remount: bool },
+    /// Empty the CD-ROM tray on a running machine (SCSI layer only).
+    EjectCdrom { id: u8 },
+    /// Inject an IRIX shell command to (re)mount /CDROM for SCSI `id`.
+    RemountCdrom { id: u8 },
     Quit,
 }
 
@@ -140,6 +144,8 @@ pub struct EmulatorHandle {
     /// Shared latest-framebuffer slot, written by the CaptureRenderer
     /// inside the worker and read by the GUI each egui frame.
     pub frame_sink: FrameSink,
+    /// Second Newport head (`graphics.heads == 2`); inactive when seq stays 0.
+    pub frame_sink_head1: FrameSink,
     /// Handle to the live machine's PS/2 controller (when running), so
     /// the GUI thread can push keyboard / mouse events at it directly.
     /// `None` when no machine is up.
@@ -156,7 +162,9 @@ impl EmulatorHandle {
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
         let (evt_tx, evt_rx) = unbounded::<Evt>();
         let frame_sink = FrameSink::new();
+        let frame_sink_head1 = FrameSink::new();
         let sink_for_worker = frame_sink.clone();
+        let sink_head1_for_worker = frame_sink_head1.clone();
         let ps2: Arc<Mutex<Option<Arc<Ps2Controller>>>> = Arc::new(Mutex::new(None));
         let ps2_for_worker = ps2.clone();
         let thread = std::thread::Builder::new()
@@ -169,13 +177,14 @@ impl EmulatorHandle {
             // worker generous headroom. This is virtual address space, lazily
             // committed, so the large reservation has no real cost.
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, ps2_for_worker))
+            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, sink_head1_for_worker, ps2_for_worker))
             .expect("spawn iris-gui-emu thread");
         Self {
             cmd_tx,
             evt_rx,
             thread: Some(thread),
             frame_sink,
+            frame_sink_head1,
             ps2,
             status: Status::default(),
             net_seen_frames: 0,
@@ -297,6 +306,7 @@ fn worker_loop(
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<Evt>,
     frame_sink: FrameSink,
+    frame_sink_head1: FrameSink,
     ps2_slot: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
 ) {
     let mut machine: Option<Box<Machine>> = None;
@@ -353,6 +363,7 @@ fn worker_loop(
                 // shows the "waiting for first REX3 frame" placeholder instead
                 // of the stale screen until its first frame is rendered.
                 frame_sink.reset();
+                frame_sink_head1.reset();
                 // Wrap construction in catch_unwind: Machine::new and
                 // friends may panic on missing files, bad images, etc.
                 // We surface those as Evt::Error toasts instead of
@@ -365,6 +376,8 @@ fn worker_loop(
                 // conflict with eframe.
                 let cfg_owned = *cfg;
                 let sink_for_machine = frame_sink.clone();
+                let sink_for_head1 = frame_sink_head1.clone();
+                let heads = cfg_owned.graphics.heads;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut m = Box::new(Machine::new(cfg_owned));
                     m.register_system_controller();
@@ -373,7 +386,13 @@ fn worker_loop(
                     // sink the GUI can read.
                     if let Some(rex3) = m.get_rex3() {
                         *rex3.renderer.lock() =
-                            Some(Box::new(CaptureRenderer::new(sink_for_machine)));
+                            Some(new_capture_renderer(sink_for_machine));
+                    }
+                    if heads >= 2 {
+                        if let Some(rex3) = m.get_rex3_head1() {
+                            *rex3.renderer.lock() =
+                                Some(new_capture_renderer(sink_for_head1));
+                        }
                     }
                     m.start();
                     m
@@ -571,7 +590,7 @@ fn worker_loop(
                     Err(e) => { let _ = evt_tx.send(Evt::Error(format!("screenshot failed: {e}"))); }
                 }
             }
-            Ok(Cmd::LoadDisc { id, path }) => {
+            Ok(Cmd::LoadDisc { id, path, remount }) => {
                 match machine.as_ref() {
                     Some(m) => {
                         match m.hpc3().scsi().load_disc(id as usize, path.clone()) {
@@ -580,7 +599,15 @@ fn worker_loop(
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| loaded_path.clone());
-                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: loaded {filename}")));
+                                let msg = if remount {
+                                    m.remount_cdrom_guest(id);
+                                    format!(
+                                        "SCSI #{id}: loaded {filename} — remount sent to console"
+                                    )
+                                } else {
+                                    format!("SCSI #{id}: loaded {filename}")
+                                };
+                                let _ = evt_tx.send(Evt::Error(msg));
                             }
                             Err(e) => {
                                 let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: {e}")));
@@ -588,6 +615,32 @@ fn worker_loop(
                         }
                     }
                     None => { let _ = evt_tx.send(Evt::Error("load disc: not running".into())); }
+                }
+            }
+            Ok(Cmd::EjectCdrom { id }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        match m.hpc3().scsi().eject_to_empty(id as usize) {
+                            Ok(()) => {
+                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: tray empty")));
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: {e}")));
+                            }
+                        }
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error("eject: not running".into())); }
+                }
+            }
+            Ok(Cmd::RemountCdrom { id }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        m.remount_cdrom_guest(id);
+                        let _ = evt_tx.send(Evt::Error(format!(
+                            "SCSI #{id}: /CDROM remount sent to console"
+                        )));
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error("remount: not running".into())); }
                 }
             }
             Ok(Cmd::Quit) | Err(_) => {

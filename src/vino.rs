@@ -359,7 +359,10 @@ pub struct Vino {
     state:   Arc<Mutex<VinoState>>,
     irq:     Arc<Mutex<Option<Arc<dyn VinoIrq>>>>,
     sys_mem: Arc<Mutex<Option<Arc<dyn BusDevice>>>>,
-    source:  Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
+    /// D0 / composite (SAA7191 path) — defaults to black field generator.
+    source_d0: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
+    /// D1 / IndyCam (CDMC path) — set via set_source() from machine config.
+    source_d1: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
     wake:    Arc<DmaWake>,
     running: Arc<AtomicBool>,
     thread:  Arc<Mutex<Option<thread::JoinHandle<()>>>>,
@@ -371,7 +374,10 @@ impl Vino {
             state:   Arc::new(Mutex::new(VinoState::default())),
             irq:     Arc::new(Mutex::new(None)),
             sys_mem: Arc::new(Mutex::new(None)),
-            source:  Arc::new(Mutex::new(None)),
+            source_d0: Arc::new(Mutex::new(Some(Arc::new(
+                crate::video_source::BlackSource::new(crate::video_source::VideoStandard::Ntsc),
+            ) as Arc<dyn VideoSource>))),
+            source_d1: Arc::new(Mutex::new(None)),
             wake:    DmaWake::new(),
             running: Arc::new(AtomicBool::new(false)),
             thread:  Arc::new(Mutex::new(None)),
@@ -388,11 +394,21 @@ impl Vino {
         *self.sys_mem.lock() = Some(mem);
     }
 
-    /// Install the video input source.  Shared by both channels (per-port
-    /// routing via the SELECT_D1 control bit is a later-phase concern).
+    /// Install the D1 (IndyCam / CDMC) video input source.
     pub fn set_source(&self, src: Arc<dyn VideoSource>) {
-        *self.source.lock() = Some(src);
+        *self.source_d1.lock() = Some(src);
         self.wake.notify();
+    }
+
+    /// Install the D0 (composite / SAA7191) video input source.
+    pub fn set_source_d0(&self, src: Arc<dyn VideoSource>) {
+        *self.source_d0.lock() = Some(src);
+        self.wake.notify();
+    }
+
+    /// Read CDMC register file for pixel pipeline adjustments.
+    pub fn cdmc_regs(&self) -> [u8; crate::cdmc::reg::COUNT] {
+        self.state.lock().cdmc.regs_copy()
     }
 
     // ── Power-on reset ────────────────────────────────────────────────────
@@ -919,21 +935,38 @@ impl Vino {
                 Some(m) => m,
                 None    => { thread::sleep(Duration::from_millis(10)); continue; }
             };
-            let src = match self.source.lock().clone() {
-                Some(s) => s,
-                None    => { thread::sleep(Duration::from_millis(10)); continue; }
-            };
 
-            // Blocks one field period; the source paces itself.
-            let field = src.next_field();
-
-            let (a_en, b_en) = {
+            let (control, a_en, b_en) = {
                 let st = self.state.lock();
-                (st.control & ctrl::CHA_DMA_EN != 0,
-                 st.control & ctrl::CHB_DMA_EN != 0)
+                (
+                    st.control,
+                    st.control & ctrl::CHA_DMA_EN != 0,
+                    st.control & ctrl::CHB_DMA_EN != 0,
+                )
             };
-            if a_en { self.pump_field(0, &field, &mem); }
-            if b_en { self.pump_field(1, &field, &mem); }
+
+            let field_for = |ch: usize| -> Option<Field> {
+                let select_d1 = if ch == 0 { ctrl::CHA_SELECT_D1 } else { ctrl::CHB_SELECT_D1 };
+                let src = if control & select_d1 != 0 {
+                    self.source_d1.lock().clone()?
+                } else {
+                    self.source_d0.lock().clone()?
+                };
+                Some(src.next_field())
+            };
+
+            if a_en {
+                match field_for(0) {
+                    Some(field) => self.pump_field(0, &field, &mem),
+                    None => { thread::sleep(Duration::from_millis(10)); continue; }
+                }
+            }
+            if b_en {
+                match field_for(1) {
+                    Some(field) => self.pump_field(1, &field, &mem),
+                    None => { thread::sleep(Duration::from_millis(10)); continue; }
+                }
+            }
         }
     }
 
@@ -1145,7 +1178,7 @@ impl Vino {
             reg::CH_CLIP_END       => chan.clip_end   = val & clip::REG_MASK,
             reg::CH_FRAME_RATE     => {
                 chan.frame_rate = val & frame_rate::REG_MASK;
-                // TODO: recompute frame-mask shifter
+                chan.field_counter = 0;
             }
             reg::CH_FIELD_COUNTER  => { /* read-only, ignore */ }
             reg::CH_LINE_SIZE      => chan.line_size    = val & 0x0FF8,
@@ -1397,11 +1430,16 @@ impl Device for Vino {
                 writeln!(writer, "VINO Status  (debug {})", if log { "on" } else { "off" })
                     .map_err(|e| e.to_string())?;
 
-                let src_status = self.source.lock()
+                let d0_status = self.source_d0.lock()
                     .as_ref()
                     .map(|s| s.status())
-                    .unwrap_or_else(|| "no source installed".to_string());
-                writeln!(writer, "  source: {}", src_status).map_err(|e| e.to_string())?;
+                    .unwrap_or_else(|| "none".to_string());
+                let d1_status = self.source_d1.lock()
+                    .as_ref()
+                    .map(|s| s.status())
+                    .unwrap_or_else(|| "none".to_string());
+                writeln!(writer, "  source D0 (composite): {}", d0_status).map_err(|e| e.to_string())?;
+                writeln!(writer, "  source D1 (IndyCam):   {}", d1_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  REV_ID      = {:#010x}  (chip_id={:#x} rev={})",
                     st.rev_id, (st.rev_id >> 4) & 0xF, st.rev_id & 0xF)
                     .map_err(|e| e.to_string())?;

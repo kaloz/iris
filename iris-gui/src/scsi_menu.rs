@@ -8,8 +8,10 @@ pub enum ScsiAction {
     None,
     AttachHdd { id: u8, path: String },
     AttachEmptyCdrom { id: u8 },
+    AttachCdromWithDisc { id: u8, path: String },
     InsertDisc { id: u8, path: String },
     Eject { id: u8 },
+    RemountInIrix { id: u8 },
     Detach { id: u8 },
     CreateBlank { id: u8 },
     ToggleOverlay { id: u8 },
@@ -39,6 +41,12 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         action = ScsiAction::AttachEmptyCdrom { id };
                         ui.close_menu();
                     }
+                    if ui.button("Attach CD-ROM with disc…").clicked() {
+                        if let Some(p) = pick_iso("Attach CD-ROM with disc") {
+                            action = ScsiAction::AttachCdromWithDisc { id, path: p };
+                        }
+                        ui.close_menu();
+                    }
                     if ui.button("Create blank HDD image…").clicked() {
                         action = ScsiAction::CreateBlank { id };
                         ui.close_menu();
@@ -58,6 +66,12 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                             action = ScsiAction::InsertDisc { id, path: p };
                         }
                         ui.close_menu();
+                    }
+                    if has_media {
+                        if ui.button("Mount /CDROM in IRIX…").clicked() {
+                            action = ScsiAction::RemountInIrix { id };
+                            ui.close_menu();
+                        }
                     }
                     ui.separator();
                     if ui.button("Detach CD-ROM drive").clicked() {
@@ -93,7 +107,8 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
     }
     ui.separator();
     ui.label(RichText::new(
-        "Reset the machine after attaching or detaching drives."
+        "CD-ROM: prefer SCSI #4. Insert/Swap hot-loads media + remounts /CDROM \
+         (console shell must be active). New drives need Stop→Start."
     ).weak().small());
     action
 }
@@ -162,7 +177,14 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
                 path: String::new(), discs: vec![], cdrom: true,
                 overlay: false, scratch: false, size_mb: None,
             });
-            Some(format!("scsi{id}: empty CD-ROM drive attached"))
+            Some(format!("scsi{id}: empty CD-ROM drive attached (Stop→Start if VM is running)"))
+        }
+        ScsiAction::AttachCdromWithDisc { id, path } => {
+            cfg.scsi.insert(id, ScsiDeviceConfig {
+                path: path.clone(), discs: vec![], cdrom: true,
+                overlay: false, scratch: false, size_mb: None,
+            });
+            Some(format!("scsi{id}: CD-ROM attached with disc"))
         }
         ScsiAction::InsertDisc { id, path } => {
             if let Some(d) = cfg.scsi.get_mut(&id) { d.path = path; }
@@ -184,5 +206,6 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
             if let Some(d) = cfg.scsi.get_mut(&id) { d.overlay = !d.overlay; }
             Some(format!("scsi{id}: overlay toggled"))
         }
+        ScsiAction::RemountInIrix { .. } => None,
     }
 }

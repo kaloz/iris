@@ -62,6 +62,44 @@ pub trait VideoSource: Send + Sync {
     fn status(&self) -> String { "no status available".to_string() }
 }
 
+// ─── CDMC register → pixel pipeline (Phase 3) ────────────────────────────────
+
+/// Applies IndyCam CDMC gain/balance/saturation to UYVY fields after capture.
+pub struct CdmcAdjustedSource {
+    inner: Arc<dyn VideoSource>,
+    vino:  crate::vino::Vino,
+}
+
+impl CdmcAdjustedSource {
+    pub fn new(inner: Arc<dyn VideoSource>, vino: crate::vino::Vino) -> Self {
+        Self { inner, vino }
+    }
+}
+
+impl VideoSource for CdmcAdjustedSource {
+    fn standard(&self) -> VideoStandard { self.inner.standard() }
+
+    fn next_field(&self) -> Field {
+        let mut field = self.inner.next_field();
+        let regs = self.vino.cdmc_regs();
+        let mut pixels = field.pixels.to_vec();
+        crate::cdmc::Cdmc::apply_uyvy_field(&mut pixels, &regs);
+        field.pixels = Arc::from(pixels);
+        field
+    }
+
+    fn status(&self) -> String {
+        let regs = self.vino.cdmc_regs();
+        format!(
+            "{}  cdmc gain={:#04x} red_bal={:#04x} blue_bal={:#04x}",
+            self.inner.status(),
+            regs[crate::cdmc::reg::GAIN as usize],
+            regs[crate::cdmc::reg::RED_BAL as usize],
+            regs[crate::cdmc::reg::BLUE_BAL as usize],
+        )
+    }
+}
+
 // ─── Black source: emits solid black fields at the standard's field rate ─────
 
 pub struct BlackSource {

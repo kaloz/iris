@@ -205,6 +205,296 @@ pub struct Ultra64Config {
     pub enabled: bool,
 }
 
+/// Emulated SGI machine profile (hardware layout scaffold).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineProfile {
+    /// SGI Indy IP24 (Guinness) — single Newport GIO64. Default and fully supported.
+    #[default]
+    IndyIp24,
+    /// SGI Indigo2 IP22 — fullhouse MC/IOC, Newport XL on GIO gfx slot.
+    Indigo2Ip22,
+}
+
+impl MachineProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IndyIp24 => "SGI Indy (IP24)",
+            Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
+        }
+    }
+
+    pub fn supported(self) -> bool {
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22)
+    }
+
+    /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
+    pub fn guinness(self) -> bool {
+        matches!(self, Self::IndyIp24)
+    }
+}
+
+/// Indy / Indigo2 graphics board family (preview stubs for non-Newport options).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsBoard {
+    /// Newport (REX3) — fully emulated. Default.
+    #[default]
+    Newport,
+    /// Indy GR3-XZ / Elan (HQ2 command engine) — register stub only (`src/xz.rs`).
+    Xz,
+}
+
+/// IMPACT board occupying one GIO64 slot (Indigo2 preview scaffold).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactSlot {
+    #[default]
+    None,
+    Solid,
+    High,
+    Max,
+}
+
+/// `[impact]` section — IMPACT/MGRAS slot population (Indigo2 IP22 preview).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ImpactSection {
+    /// GIO gfx slot (`0x1F000000`). Solid IMPACT anchors here.
+    #[serde(default)]
+    pub gfx: ImpactSlot,
+    /// GIO expansion slot 0 (`0x1F400000`). Second board for High / Max configs.
+    #[serde(default)]
+    pub exp0: ImpactSlot,
+    /// GIO expansion slot 1 (`0x1F600000`). Third board for Maximum IMPACT.
+    #[serde(default)]
+    pub exp1: ImpactSlot,
+}
+
+impl ImpactSection {
+    pub fn any_enabled(&self) -> bool {
+        self.gfx != ImpactSlot::None
+            || self.exp0 != ImpactSlot::None
+            || self.exp1 != ImpactSlot::None
+    }
+
+    /// Hardware-valid slot population (rejects High+High and orphan expansion boards).
+    pub fn validate(&self) -> Result<(), String> {
+        let slots = [self.gfx, self.exp0, self.exp1];
+        let high_count = slots.iter().filter(|&&s| s == ImpactSlot::High).count();
+        if high_count >= 2 {
+            return Err(
+                "[impact] High+High is invalid — at most one High IMPACT board per system".into(),
+            );
+        }
+        if self.exp0 != ImpactSlot::None && self.gfx == ImpactSlot::None {
+            return Err("[impact] exp0 requires gfx slot populated".into());
+        }
+        if self.exp1 != ImpactSlot::None && self.exp0 == ImpactSlot::None {
+            return Err("[impact] exp1 requires exp0 populated (Maximum IMPACT uses all three slots)".into());
+        }
+        if self.exp1 == ImpactSlot::Max && self.exp0 != ImpactSlot::High {
+            return Err("[impact] Maximum IMPACT expects exp0=high when exp1=max".into());
+        }
+        Ok(())
+    }
+}
+
+/// `[graphics]` section — Newport head count and display options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphicsSection {
+    /// Graphics board family. `xz` is Indy-only preview; disables Newport compositor.
+    #[serde(default)]
+    pub board: GraphicsBoard,
+    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
+    #[serde(default = "default_graphics_heads")]
+    pub heads: u8,
+    /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
+    #[serde(default)]
+    pub resolution: crate::vc2_timings::NewportResolution,
+}
+
+impl GraphicsSection {
+    /// Pixel size for host window layout when a preset is selected.
+    pub fn host_display_size(&self) -> (u32, u32) {
+        self.resolution
+            .visible_size()
+            .unwrap_or((1280, 1024))
+    }
+}
+
+fn default_graphics_heads() -> u8 { 1 }
+
+impl Default for GraphicsSection {
+    fn default() -> Self {
+        Self {
+            board: GraphicsBoard::default(),
+            heads: default_graphics_heads(),
+            resolution: crate::vc2_timings::NewportResolution::default(),
+        }
+    }
+}
+
+/// `[machine]` section — platform identity (not performance knobs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineSection {
+    #[serde(default)]
+    pub profile: MachineProfile,
+}
+
+impl Default for MachineSection {
+    fn default() -> Self {
+        Self { profile: MachineProfile::default() }
+    }
+}
+
+/// MIPS / REX3 JIT runtime tuning (`[jit]` section). Applied to process env at Start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jit_probe")]
+    pub probe: u32,
+    #[serde(default = "default_jit_probe_min")]
+    pub probe_min: u32,
+    #[serde(default = "default_jit_max_tier")]
+    pub max_tier: u8,
+    /// iris-gui only: use GlCompositor capture path (IRIS_GUI_GL=1).
+    #[serde(default)]
+    pub gui_gl_capture: bool,
+    /// Allow Full-tier store compilation (uses write-log rollback). Off by default.
+    #[serde(default)]
+    pub compile_stores: bool,
+    #[serde(default)]
+    pub verify: bool,
+    #[serde(default)]
+    pub no_idle: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trace_file: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_file: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub debug_log: String,
+}
+
+fn default_jit_probe() -> u32 { 500 }
+fn default_jit_probe_min() -> u32 { 100 }
+fn default_jit_max_tier() -> u8 { 2 }
+
+impl Default for JitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe: default_jit_probe(),
+            probe_min: default_jit_probe_min(),
+            max_tier: default_jit_max_tier(),
+            gui_gl_capture: false,
+            compile_stores: false,
+            verify: false,
+            no_idle: false,
+            trace_file: String::new(),
+            profile_file: String::new(),
+            debug_log: String::new(),
+        }
+    }
+}
+
+impl JitConfig {
+    pub fn premiere_defaults() -> Self {
+        Self { enabled: true, max_tier: 1, ..Default::default() }
+    }
+
+    /// Apply to current process environment (CLI and iris-gui before Machine::new).
+    pub fn apply_env(&self) {
+        if self.enabled {
+            std::env::set_var("IRIS_JIT", "1");
+        } else {
+            std::env::remove_var("IRIS_JIT");
+        }
+        std::env::set_var("IRIS_JIT_PROBE", self.probe.to_string());
+        std::env::set_var("IRIS_JIT_PROBE_MIN", self.probe_min.to_string());
+        std::env::set_var("IRIS_JIT_MAX_TIER", self.max_tier.to_string());
+        if self.verify {
+            std::env::set_var("IRIS_JIT_VERIFY", "1");
+        } else {
+            std::env::remove_var("IRIS_JIT_VERIFY");
+        }
+        if self.compile_stores {
+            std::env::remove_var("IRIS_JIT_NO_STORES");
+        } else {
+            std::env::set_var("IRIS_JIT_NO_STORES", "1");
+        }
+        if self.no_idle {
+            std::env::set_var("IRIS_NO_IDLE", "1");
+        } else {
+            std::env::remove_var("IRIS_NO_IDLE");
+        }
+        if self.gui_gl_capture {
+            std::env::set_var("IRIS_GUI_GL", "1");
+        } else {
+            std::env::remove_var("IRIS_GUI_GL");
+        }
+        set_or_remove_env("IRIS_JIT_TRACE", &self.trace_file);
+        set_or_remove_env("IRIS_JIT_PROFILE", &self.profile_file);
+        set_or_remove_env("IRIS_DEBUG_LOG", &self.debug_log);
+    }
+}
+
+fn set_or_remove_env(key: &str, val: &str) {
+    if val.is_empty() {
+        std::env::remove_var(key);
+    } else {
+        std::env::set_var(key, val);
+    }
+}
+
+/// Host-side performance tuning (`[perf]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerfConfig {
+    #[serde(default)]
+    pub thread_affinity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_core: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex3_core: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_core: Option<u32>,
+}
+
+impl Default for PerfConfig {
+    fn default() -> Self {
+        Self {
+            thread_affinity: false,
+            cpu_core: None,
+            rex3_core: None,
+            refresh_core: None,
+        }
+    }
+}
+
+/// HAL2 / cpal audio output tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
+    #[serde(default = "default_audio_prebuf_ms")]
+    pub prebuf_ms: u64,
+    /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpal_buffer_frames: Option<u32>,
+}
+
+fn default_audio_prebuf_ms() -> u64 { 20 }
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
+    }
+}
+
 /// VINO video-in configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VinoConfig {
@@ -365,6 +655,30 @@ pub struct MachineConfig {
     #[serde(default = "default_scsi_deferred_int")]
     pub scsi_deferred_int: bool,
 
+    /// HAL2 audio output tuning (`[audio]` section).
+    #[serde(default)]
+    pub audio: AudioConfig,
+
+    /// Machine platform profile (`[machine]` section).
+    #[serde(default)]
+    pub machine: MachineSection,
+
+    /// Graphics options (`[graphics]` section).
+    #[serde(default)]
+    pub graphics: GraphicsSection,
+
+    /// IMPACT/MGRAS slot population (`[impact]` section, Indigo2 preview).
+    #[serde(default)]
+    pub impact: ImpactSection,
+
+    /// JIT runtime tuning (`[jit]` section).
+    #[serde(default)]
+    pub jit: JitConfig,
+
+    /// Host performance tuning (`[perf]` section).
+    #[serde(default)]
+    pub perf: PerfConfig,
+
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
     #[cfg(feature = "ultra64")]
     #[serde(default)]
@@ -373,7 +687,38 @@ pub struct MachineConfig {
 
 fn default_scsi_deferred_int() -> bool { true }
 
+#[cfg(unix)]
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+#[cfg(windows)]
+fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
+#[cfg(not(any(unix, windows)))]
+fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+
+/// True when `ci_socket` is a TCP `host:port` address (Windows CI default).
+pub fn ci_socket_is_tcp(path: &str) -> bool {
+    let path = path.trim();
+    if path.starts_with("tcp:") {
+        return true;
+    }
+    // host:port heuristic (not a filesystem path)
+    if path.contains(':') && !path.starts_with('\\') && !path.starts_with('/') {
+        path.rsplit_once(':')
+            .map(|(_, port)| port.parse::<u16>().is_ok())
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// Normalize CI socket address to `host:port` for TCP clients.
+pub fn ci_socket_tcp_addr(path: &str) -> String {
+    let path = path.trim();
+    if let Some(rest) = path.strip_prefix("tcp:") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
@@ -435,6 +780,12 @@ impl Default for MachineConfig {
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
             scsi_deferred_int: default_scsi_deferred_int(),
+            audio: AudioConfig::default(),
+            machine: MachineSection::default(),
+            graphics: GraphicsSection::default(),
+            impact: ImpactSection::default(),
+            jit: JitConfig::default(),
+            perf: PerfConfig::default(),
             #[cfg(feature = "ultra64")]
             ultra64: Ultra64Config::default(),
         }
@@ -477,6 +828,38 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.machine.profile.supported() {
+            return Err(format!(
+                "machine profile \"{}\" is not implemented; use {}",
+                self.machine.profile.label(),
+                MachineProfile::IndyIp24.label(),
+            ));
+        }
+        if self.graphics.heads != 1 && self.graphics.heads != 2 {
+            return Err(format!(
+                "graphics.heads {} is invalid (valid: 1, 2)",
+                self.graphics.heads
+            ));
+        }
+        if self.graphics.board == GraphicsBoard::Xz {
+            if self.machine.profile != MachineProfile::IndyIp24 {
+                return Err(
+                    "graphics.board \"xz\" is only valid on Indy (machine.profile = indy_ip24)".into(),
+                );
+            }
+            if self.graphics.heads != 1 {
+                return Err("graphics.board \"xz\" does not support dual-head (graphics.heads must be 1)".into());
+            }
+            if !self.graphics.resolution.is_guest() {
+                return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
+            }
+        }
+        if self.impact.any_enabled() && self.machine.profile != MachineProfile::Indigo2Ip22 {
+            return Err(
+                "[impact] slots are preview-only on Indigo2 (machine.profile = indigo2_ip22)".into(),
+            );
+        }
+        self.impact.validate()?;
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
@@ -816,5 +1199,22 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn indy_ip24_profile_validates_and_is_guinness() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        cfg.validate().expect("indy_ip24 should validate");
+        assert!(cfg.machine.profile.guinness());
+    }
+
+    #[test]
+    fn indigo2_profile_validates_and_is_fullhouse() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::Indigo2Ip22;
+        cfg.validate().expect("indigo2_ip22 should validate on default build");
+        assert!(cfg.machine.profile.supported());
+        assert!(!cfg.machine.profile.guinness());
     }
 }

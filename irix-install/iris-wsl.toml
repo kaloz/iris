@@ -1,0 +1,35 @@
+# IRIS daily-use config for WSL (~/iris-wsl-build).
+# Disk + NVRAM live in irix-install/ next to this file.
+# ISO paths use /mnt/c so CDs stay on the Windows Downloads folder.
+
+headless = false
+no_audio = false
+banks    = [128, 128, 0, 0]
+nvram    = "irix-install/nvram-irix65.bin"
+scale    = 2
+
+[scsi.1]
+path   = "irix-install/scsi1.raw"
+cdrom  = false
+
+# Optional CD changer — only needed to install software or swap discs.
+[scsi.4]
+path  = "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso"
+cdrom = true
+discs = [
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso",
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-1_812-0759-002.iso",
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-2_812-0760-002.iso",
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-applications-june-1998_812-0761-002.iso",
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-foundation_812-0757-002.iso",
+  "/mnt/c/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-libraries_812-0766-002.iso",
+]
+
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
+
+[nfs]
+shared_dir = "shared"

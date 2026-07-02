@@ -1,0 +1,70 @@
+# IRIS daily-use config for native Windows.
+# Launch: wsl\run-iris-premiere.bat  or  wsl\run-iris-windows.bat
+# Setup in GUI: wsl\run-iris-gui-windows.bat
+#
+# Authentic Indy max: banks = [128, 128, 0, 0]  (256 MB)
+# IRIX 6.5 extended:  banks = [128, 128, 64, 64]  (384 MB — see iris-windows-384.toml)
+# IRIX 5.3 only:      banks = [128, 128, 128, 128]  (512 MB — NOT for IRIX 6.5)
+# After changing banks: Stop iris completely, then cold-start (not hot reload).
+# Verify in monitor: mc status  |  in IRIX: hinv -t memory
+# R5000SC build: see wsl/README.md (requires --features iris/r5k,iris/r5ksc rebuild)
+
+headless = false
+no_audio = false
+banks    = [128, 128, 0, 0]
+nvram    = "irix-install/nvram-irix65.bin"
+scale    = 1
+
+[machine]
+profile = "indy_ip24"
+
+[jit]
+enabled         = true
+probe           = 500
+probe_min       = 100
+max_tier        = 1
+compile_stores  = false
+gui_gl_capture  = false
+
+[perf]
+thread_affinity = false
+# cpu_core = 0
+# rex3_core = 1
+# refresh_core = 2
+
+# CI automation (same hardware as GUI export):
+# ci = true
+# ci_socket = "127.0.0.1:19851"
+# headless = true
+
+[audio]
+# Match IRIX BRES master (44100 Hz). Bump prebuf if you hear tail scratch on Windows.
+prebuf_ms = 40
+# cpal_buffer_frames = 512
+
+[scsi.1]
+path    = "irix-install/scsi1.raw"
+cdrom   = false
+# Protect root disk from kernel-panic corruption (see rules/testing/disk-image-hygiene.md).
+overlay = true
+
+[scsi.4]
+path  = 'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso'
+cdrom = true
+discs = [
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-installation-tools-june-1998_812-0758-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-1_812-0759-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-foundation-2_812-0760-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-applications-june-1998_812-0761-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-foundation_812-0757-002.iso',
+  'C:/Users/chron/Downloads/sgi-irix-6.5/sgi-irix-6.5-development-libraries_812-0766-002.iso',
+]
+
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
+
+[nfs]
+shared_dir = "shared"

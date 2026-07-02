@@ -73,6 +73,9 @@ pcap = ["iris/pcap"]
 # model differs deeply). Surfaced read-only on the Memory tab via
 # iris::build_features::CPU. Build with: cargo build -p iris-gui --features r5k
 r5k = ["iris/r5k"]
+# YouTube / max in-process perf: lightning (no GDB hot-path) + idle-pause on the
+# embedded iris core. Build with: cargo build -p iris-gui --release --features premiere
+premiere = ["iris/lightning", "iris/idle-pause"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can

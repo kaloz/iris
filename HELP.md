@@ -15,6 +15,40 @@ Serial ports are on ports 8880 and 8881 (connect to 8881 for IRIX serial term)
 
 ---
 
+## Performance vs inventory (MHz vs MIPS)
+
+IRIX **System Manager** and `hinv` report a **CPU MHz** line (e.g. 166 MHz). That
+is **guest inventory** from the PROM and kernel — not how fast your PC is
+emulating the Indy.
+
+The **iris-gui status bar MIPS** figure (or the CLI window title `MIPS` readout)
+is **real throughput**: MIPS instructions executed per wall-clock second on the
+host. Enable the JIT stack (`IRIS_JIT=1`, `--features jit,rex-jit`) for higher
+MIPS; the hinv MHz string stays the same.
+
+The status bar **Hz** value is the CP0 Compare tick rate (kernel scheduler
+cadence), not CPU MHz.
+
+---
+
+## RAM banks (config vs guest)
+
+`banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
+Changing RAM while IRIX is running updates the config but not the live guest —
+**Stop → change banks → Start**.
+
+| Layout | `banks` | Typical guest RAM |
+|--------|---------|-------------------|
+| Authentic Indy max | `[128, 128, 0, 0]` | 256 MB |
+| IRIX 6.5 extended | `[128, 128, 64, 64]` | 384 MB |
+| IRIX 5.3 / emulator max | `[128, 128, 128, 128]` | 512 MB |
+
+If extended himem banks are configured but IRIX still reports 256 MB, check
+monitor `mc status` for MEMCFG on banks 2–3. IRIS synthesizes himem MEMCFG when
+the PROM skips them (see `rules/irix/extended-ram-memcfg.md`).
+
+---
+
 ## First-time setup — Ethernet MAC address
 
 The Indy stores its Ethernet MAC address in NVRAM (the DS1386 RTC chip).  A

@@ -54,6 +54,16 @@ pub struct Rex3Screen {
     pub cursor_x_adjust: i32,
     /// Horizontal read offset into the framebuffer (XYWIN.x − 0x1000; typically 2)
     pub fb_x_offset:     i32,
+
+    /// When true, renderers may skip full compositor work and refresh only the
+    /// status bar (heartbeat frames with no FB/palette change).
+    pub status_bar_only: bool,
+    /// When true, `fb_rgb`/`fb_aux` snapshots were not copied — use live slices from refresh().
+    pub fb_borrowed: bool,
+    pub dirty_y0: usize,
+    pub dirty_y1: usize,
+    pub dirty_x0: usize,
+    pub dirty_x1: usize,
 }
 
 impl Rex3Screen {
@@ -76,6 +86,12 @@ impl Rex3Screen {
             topscan:          0,
             cursor_x_adjust:  0,
             fb_x_offset:      2,
+            status_bar_only:  false,
+            fb_borrowed:      false,
+            dirty_y0:         0,
+            dirty_y1:         0,
+            dirty_x0:         0,
+            dirty_x1:         0,
         }
     }
 
@@ -145,125 +161,19 @@ impl Rex3Screen {
 
     // Returns (width, height, cursor_x_adjust).
     fn decode_video_timings(&self) -> (usize, usize, i32) {
-        let frame_ptr = self.vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
-        let ram = &self.vc2_ram;
-
-        let mut max_visible_width   = 0usize;
-        let mut total_visible_lines = 0usize;
-        let mut hpos_to_visible: Option<usize> = None;
-        let mut curr_frame_ptr = frame_ptr;
-        let mut loop_safety    = 0usize;
-
-        loop {
-            if curr_frame_ptr + 1 >= ram.len() { break; }
-            let line_seq_ptr    = ram[curr_frame_ptr] as usize;
-            let mut line_seq_len = ram[curr_frame_ptr + 1] as usize;
-            if line_seq_len == 0 { break; }
-            let mut curr_line_ptr = line_seq_ptr;
-
-            while line_seq_len > 0 {
-                let mut line_visible_width = 0usize;
-                let mut eol  = false;
-                let mut line_loop_safety = 0usize;
-                let mut state_c = 0u8;
-                let mut pixel_offset = 0usize;
-                let mut hpos_pixel: Option<usize> = None;
-                let mut visible_pixel: Option<usize> = None;
-                let mut hpos_seen_deasserted = false;
-
-                while !eol {
-                    if curr_line_ptr >= ram.len() { break; }
-                    let w1 = ram[curr_line_ptr]; curr_line_ptr += 1;
-                    let duration      = ((w1 >> 8) & 0x7F) as usize;
-                    let state_a       = (w1 & 0x7F) as u8;
-                    let sb_sc_absent  = (w1 & 0x0080) != 0;
-                    let mut eol_bit   = (w1 & 0x8000) != 0;
-
-                    if !sb_sc_absent {
-                        if curr_line_ptr >= ram.len() { break; }
-                        let w2 = ram[curr_line_ptr];
-                        if (w2 & 0x8000) != 0 { eol_bit = true; }
-                        curr_line_ptr += 1;
-                        state_c = (w2 & 0x7F) as u8;
-                    }
-
-                    eol = eol_bit;
-                    let pixels = duration * 2;
-
-                    if hpos_pixel.is_none() {
-                        if (state_a & VT_HPOS_VC_N) != 0 {
-                            hpos_seen_deasserted = true;
-                        } else if hpos_seen_deasserted {
-                            hpos_pixel = Some(pixel_offset);
-                        }
-                    }
-
-                    let visible = (state_c & VT_CBLANK_XMAP_N) != 0
-                        && (state_a & VT_VIS_LN_VC_N)    == 0
-                        && (state_a & VT_DSPLY_EN_RO_N)   == 0;
-
-                    if visible {
-                        if visible_pixel.is_none() { visible_pixel = Some(pixel_offset); }
-                        line_visible_width += pixels;
-                    }
-                    pixel_offset += pixels;
-                    line_loop_safety += 1;
-                    if line_loop_safety > 1000 { break; }
-                }
-
-                if line_visible_width > 0 {
-                    total_visible_lines += 1;
-                    if line_visible_width > max_visible_width {
-                        max_visible_width = line_visible_width;
-                    }
-                    if hpos_to_visible.is_none() {
-                        if let (Some(h), Some(v)) = (hpos_pixel, visible_pixel) {
-                            if v >= h { hpos_to_visible = Some(v - h); }
-                        }
-                    }
-                }
-
-                line_seq_len -= 1;
-                if curr_line_ptr >= ram.len() { break; }
-                curr_line_ptr = ram[curr_line_ptr] as usize;
-            }
-
-            curr_frame_ptr += 2;
-            loop_safety    += 1;
-            if loop_safety > 1000 { break; }
-        }
-
-        if max_visible_width > 0 && total_visible_lines > 0 {
-            let w = max_visible_width.min(2048);
-            let h = total_visible_lines.min(1024);
-            let cursor_x_adjust = match hpos_to_visible {
-                Some(d) => {
-                    let adj = d as i32 - 31;
-                    if adj < 0 || adj > 64 {
-                        println!("Rex3: WARNING: hpos_to_visible={} gives cursor_x_adjust={}, out of range, falling back to 11", d, adj);
-                        11
-                    } else { adj }
-                }
-                None => {
-                    println!("Rex3: WARNING: HPOS leading edge not found in VT, falling back to cursor_x_adjust=11");
-                    11
-                }
-            };
-            (w, h, cursor_x_adjust)
-        } else {
-            (0, 0, 0)
-        }
+        decode_vc2_timings(&self.vc2_regs, &self.vc2_ram)
     }
 
     /// Copy hardware device state into this cache, decode timings and DID.
     /// Returns `true` if the display resolution changed.
     ///
-    /// After this call, the caller should build a `CompositorSource` from the
-    /// fields of this struct and call `compositor.compose()`.
+    /// When `copy_fb` is false, skip the ~16 MB RGB/aux snapshot (palette/cursor
+    /// heartbeat refreshes that don't need new framebuffer pixels).
     pub fn refresh(
         &mut self,
         fb_rgb:   &[u32],
         fb_aux:   &[u32],
+        copy_fb:  bool,
         vc2:      &Mutex<Vc2>,
         xmap:     &Mutex<Xmap9>,
         cmap:     &Mutex<Cmap>,
@@ -273,10 +183,15 @@ impl Rex3Screen {
         let mut resized = false;
 
         // ── 1. Copy device state snapshots ──────────────────────────────────────
-        diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
-        self.fb_rgb.copy_from_slice(fb_rgb);
-        self.fb_aux.copy_from_slice(fb_aux);
-        diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+        if copy_fb {
+            diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+            self.fb_rgb.copy_from_slice(fb_rgb);
+            self.fb_aux.copy_from_slice(fb_aux);
+            self.fb_borrowed = false;
+            diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+        } else {
+            self.fb_borrowed = true;
+        }
 
         diag.fetch_or(Rex3::DIAG_LOCK_VC2 | Rex3::DIAG_LOOP_VC2_COPY, Ordering::Relaxed);
         {
@@ -343,13 +258,20 @@ impl Rex3Screen {
         resized
     }
 
-    /// Build a `CompositorSource` borrowing from this struct's caches.
-    /// Only valid after `refresh()` returns without early-exiting
-    /// (i.e. `width > 0 && height > 0`).
-    pub fn compositor_source(&self) -> CompositorSource<'_> {
+    pub fn compositor_source_from<'a>(
+        &'a self,
+        live_rgb: Option<&'a [u32]>,
+        live_aux: Option<&'a [u32]>,
+    ) -> CompositorSource<'a> {
+        let h = self.height.max(1);
+        let w = self.width.max(1);
+        let y0 = self.dirty_y0.min(h);
+        let y1 = self.dirty_y1.max(y0 + 1).min(h);
+        let x0 = self.dirty_x0.min(w);
+        let x1 = self.dirty_x1.max(x0 + 1).min(w);
         CompositorSource {
-            fb_rgb:           &self.fb_rgb,
-            fb_aux:           &self.fb_aux,
+            fb_rgb:           if self.fb_borrowed { live_rgb.unwrap_or(&self.fb_rgb) } else { &self.fb_rgb },
+            fb_aux:           if self.fb_borrowed { live_aux.unwrap_or(&self.fb_aux) } else { &self.fb_aux },
             did:              &self.did,
             xmap_mode:        &self.xmap_mode,
             xmap_config:      self.xmap_config,
@@ -364,7 +286,16 @@ impl Rex3Screen {
             fb_x_offset:      self.fb_x_offset,
             width:            self.width,
             height:           self.height,
+            dirty_y0:         y0,
+            dirty_y1:         y1,
+            dirty_x0:         x0,
+            dirty_x1:         x1,
+            status_bar_only:  self.status_bar_only,
         }
+    }
+
+    pub fn compositor_source(&self) -> CompositorSource<'_> {
+        self.compositor_source_from(None, None)
     }
 
     /// Build an `OverlaySource` borrowing from this struct's caches.
@@ -384,6 +315,118 @@ impl Rex3Screen {
             fb_aux:           &self.fb_aux,
             did:              &self.did,
         }
+    }
+}
+
+/// Decode visible display size from VC2 state (used by compositor and timing presets).
+pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32) {
+    let frame_ptr = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
+    let ram = vc2_ram;
+
+    let mut max_visible_width   = 0usize;
+    let mut total_visible_lines = 0usize;
+    let mut hpos_to_visible: Option<usize> = None;
+    let mut curr_frame_ptr = frame_ptr;
+    let mut loop_safety    = 0usize;
+
+    loop {
+        if curr_frame_ptr + 1 >= ram.len() { break; }
+        let line_seq_ptr    = ram[curr_frame_ptr] as usize;
+        let mut line_seq_len = ram[curr_frame_ptr + 1] as usize;
+        if line_seq_len == 0 { break; }
+        let mut curr_line_ptr = line_seq_ptr;
+
+        while line_seq_len > 0 {
+            let mut line_visible_width = 0usize;
+            let mut eol  = false;
+            let mut line_loop_safety = 0usize;
+            let mut state_c = 0u8;
+            let mut pixel_offset = 0usize;
+            let mut hpos_pixel: Option<usize> = None;
+            let mut visible_pixel: Option<usize> = None;
+            let mut hpos_seen_deasserted = false;
+
+            while !eol {
+                if curr_line_ptr >= ram.len() { break; }
+                let w1 = ram[curr_line_ptr]; curr_line_ptr += 1;
+                let duration      = ((w1 >> 8) & 0x7F) as usize;
+                let state_a       = (w1 & 0x7F) as u8;
+                let sb_sc_absent  = (w1 & 0x0080) != 0;
+                let mut eol_bit   = (w1 & 0x8000) != 0;
+
+                if !sb_sc_absent {
+                    if curr_line_ptr >= ram.len() { break; }
+                    let w2 = ram[curr_line_ptr];
+                    if (w2 & 0x8000) != 0 { eol_bit = true; }
+                    curr_line_ptr += 1;
+                    state_c = (w2 & 0x7F) as u8;
+                }
+
+                eol = eol_bit;
+                let pixels = duration * 2;
+
+                if hpos_pixel.is_none() {
+                    if (state_a & VT_HPOS_VC_N) != 0 {
+                        hpos_seen_deasserted = true;
+                    } else if hpos_seen_deasserted {
+                        hpos_pixel = Some(pixel_offset);
+                    }
+                }
+
+                let visible = (state_c & VT_CBLANK_XMAP_N) != 0
+                    && (state_a & VT_VIS_LN_VC_N)    == 0
+                    && (state_a & VT_DSPLY_EN_RO_N)   == 0;
+
+                if visible {
+                    if visible_pixel.is_none() { visible_pixel = Some(pixel_offset); }
+                    line_visible_width += pixels;
+                }
+                pixel_offset += pixels;
+                line_loop_safety += 1;
+                if line_loop_safety > 1000 { break; }
+            }
+
+            if line_visible_width > 0 {
+                total_visible_lines += 1;
+                if line_visible_width > max_visible_width {
+                    max_visible_width = line_visible_width;
+                }
+                if hpos_to_visible.is_none() {
+                    if let (Some(h), Some(v)) = (hpos_pixel, visible_pixel) {
+                        if v >= h { hpos_to_visible = Some(v - h); }
+                    }
+                }
+            }
+
+            line_seq_len -= 1;
+            if curr_line_ptr >= ram.len() { break; }
+            curr_line_ptr = ram[curr_line_ptr] as usize;
+        }
+
+        curr_frame_ptr += 2;
+        loop_safety    += 1;
+        if loop_safety > 1000 { break; }
+    }
+
+    if max_visible_width > 0 && total_visible_lines > 0 {
+        let w = max_visible_width.min(2048);
+        let h = total_visible_lines.min(1024);
+        let cursor_x_adjust = match hpos_to_visible {
+            Some(d) => {
+                let adj = d as i32 - 31;
+                if adj < 0 || adj > 64 {
+                    println!("Rex3: WARNING: hpos_to_visible={} gives cursor_x_adjust={}, out of range, falling back to 11", d, adj);
+                    11
+                } else { adj }
+            }
+            None => {
+                println!("Rex3: WARNING: HPOS leading edge not found in VT, falling back to cursor_x_adjust=11");
+                11
+            }
+        };
+        (w, h, cursor_x_adjust)
+    } else {
+        (0, 0, 0)
     }
 }
 
@@ -457,6 +500,8 @@ pub struct BarStats {
     pub now:            std::time::Instant,
     pub cycles:         u64,
     pub fasttick:       u64,
+    /// REX3 refresh loop iteration count (use for status-bar Hz).
+    pub refresh_frames: u64,
     pub decoded_delta:  u64,
     pub l1i_hits:       u64,
     pub l1i_fetches:    u64,
@@ -485,10 +530,10 @@ pub struct StatusBar {
     led_red: bool,
     led_green: bool,
     prev_cycles: u64,
-    prev_fasttick: u64,
+    prev_refresh_frames: u64,
     prev_time: std::time::Instant,
     mips: f64,
-    fasthz: f64,
+    refresh_hz: f64,
     decode_pct: f64,
     l1i_hit_pct: f64,
     uncached_pct: f64,
@@ -504,10 +549,10 @@ impl StatusBar {
             led_red: false,
             led_green: false,
             prev_cycles: 0,
-            prev_fasttick: 0,
+            prev_refresh_frames: 0,
             prev_time: std::time::Instant::now(),
             mips: 0.0,
-            fasthz: 0.0,
+            refresh_hz: 0.0,
             decode_pct: 0.0,
             l1i_hit_pct: 0.0,
             uncached_pct: 0.0,
@@ -534,7 +579,7 @@ impl StatusBar {
         let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
             let dc = stats.cycles.wrapping_sub(self.prev_cycles);
-            let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
+            let dr = stats.refresh_frames.wrapping_sub(self.prev_refresh_frames);
             self.mips   = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
             #[cfg(feature = "developer")] {
                 let total_fetches = stats.l1i_fetches + stats.uncached;
@@ -542,9 +587,9 @@ impl StatusBar {
                 self.l1i_hit_pct  = if stats.l1i_fetches > 0 { stats.l1i_hits as f64 / stats.l1i_fetches as f64 * 100.0 } else { 0.0 };
                 self.uncached_pct = if dc > 0 { stats.uncached as f64 / dc as f64 * 100.0 } else { 0.0 };
             }
-            self.fasthz = (df as f64 / dt).round();
+            self.refresh_hz = (dr as f64 / dt).round();
             self.prev_cycles   = stats.cycles;
-            self.prev_fasttick = stats.fasttick;
+            self.prev_refresh_frames = stats.refresh_frames;
             self.prev_time     = stats.now;
         }
 
@@ -552,9 +597,9 @@ impl StatusBar {
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:08x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_step as u32, stats.gfifo_pending);
+        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:08x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.refresh_hz, stats.count_step as u32, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
-        let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.fasthz);
+        let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.refresh_hz);
 
         let row_stride = 2048;
         for row in 0..STATUS_BAR_HEIGHT {

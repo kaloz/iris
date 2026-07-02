@@ -346,6 +346,8 @@ impl Renderer for GlRenderer {
         sbtex:         &mut StatusBarTexture,
         stats:         &BarStats,
         need_readback: bool,
+        live_fb_rgb:   Option<&[u32]>,
+        live_fb_aux:   Option<&[u32]>,
     ) {
         if self.state.is_none() {
             self.init_gl();
@@ -429,7 +431,7 @@ impl Renderer for GlRenderer {
 
         unsafe {
             // ── Compositor runs first — it sets its own FBO/viewport ─────────
-            let src      = screen.compositor_source();
+            let src      = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
             let main_tex = self.compositor.compose(&src, gl);
 
             // Restore full-window viewport/scissor — compositor FBO left them dirty.

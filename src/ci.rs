@@ -1,16 +1,19 @@
 //! CI control socket.
 //!
-//! Unix domain socket that drives the emulator for automated testing. The
-//! protocol is newline-delimited JSON, strict request/response, single client.
-//! See `ci_mode_plan.md` in the repo root.
+//! Unix domain socket (Linux/macOS) or TCP localhost (Windows) that drives the
+//! emulator for automated testing. The protocol is newline-delimited JSON,
+//! strict request/response, single client. See `ci_mode_plan.md` in the repo root.
 
-#![cfg(unix)]
-
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
+
+use crate::config::{ci_socket_is_tcp, ci_socket_tcp_addr};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -66,12 +69,21 @@ pub struct CiServer {
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
     rex3: Option<Arc<Rex3>>,
+    rex3_head1: Option<Arc<Rex3>>,
 }
 
 impl Drop for CiServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        cleanup_socket_path(&self.socket_path);
     }
+}
+
+fn cleanup_socket_path(path: &str) {
+    if ci_socket_is_tcp(path) {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(path);
 }
 
 impl CiServer {
@@ -100,24 +112,40 @@ pub fn start_server(
     let ci_serial = unsafe { (*machine_ptr).get_ci_serial() }
         .ok_or_else(|| "CI mode: CiSerialBackend not installed on Machine".to_string())?;
     let rex3 = unsafe { (*machine_ptr).get_rex3() };
+    let rex3_head1 = unsafe { (*machine_ptr).get_rex3_head1() };
 
     let path = socket_path.to_string();
-    // Clear stale socket from a previous run.
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)
-        .map_err(|e| format!("failed to bind {}: {}", path, e))?;
-
-    eprintln!("iris: --ci control socket listening at {}", path);
-
-    *SOCKET_PATH.lock() = Some(path.clone());
-
     let server = Arc::new(CiServer {
-        socket_path: path,
+        socket_path: path.clone(),
         machine: Arc::new(Mutex::new(MachinePtr(machine_ptr))),
         ci_serial,
         rex3,
+        rex3_head1,
     });
 
+    *SOCKET_PATH.lock() = Some(path.clone());
+
+    if ci_socket_is_tcp(&path) {
+        start_tcp_server(server.clone(), &path)?;
+    } else {
+        #[cfg(unix)]
+        start_unix_server(server, &path)?;
+        #[cfg(not(unix))]
+        return Err(format!(
+            "CI socket path {} requires a Unix domain socket; use host:port on this platform",
+            path
+        ));
+    }
+
+    Ok(server)
+}
+
+#[cfg(unix)]
+fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
+    cleanup_socket_path(path);
+    let listener = UnixListener::bind(path)
+        .map_err(|e| format!("failed to bind {}: {}", path, e))?;
+    eprintln!("iris: --ci control socket listening at {}", path);
     let server_clone = server.clone();
     thread::Builder::new()
         .name("iris-ci-accept".into())
@@ -136,23 +164,47 @@ pub fn start_server(
             }
         })
         .map_err(|e| format!("failed to spawn CI accept thread: {}", e))?;
-
-    Ok(server)
+    Ok(())
 }
 
-// ----------------------------------------------------------------------------
-// Connection handling
-// ----------------------------------------------------------------------------
+#[cfg(windows)]
+fn start_tcp_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
+    start_tcp_server_impl(server, path)
+}
 
-fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
-    let reader = match stream.try_clone() {
-        Ok(s) => BufReader::new(s),
-        Err(e) => {
-            eprintln!("iris-ci-handler: clone failed: {}", e);
-            return;
-        }
-    };
-    let mut writer = stream;
+#[cfg(not(windows))]
+fn start_tcp_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
+    start_tcp_server_impl(server, path)
+}
+
+fn start_tcp_server_impl(server: Arc<CiServer>, path: &str) -> Result<(), String> {
+    let addr = ci_socket_tcp_addr(path);
+    let listener = TcpListener::bind(&addr)
+        .map_err(|e| format!("failed to bind TCP CI socket {}: {}", addr, e))?;
+    eprintln!("iris: --ci control socket listening at tcp:{}", addr);
+    let server_clone = server.clone();
+    thread::Builder::new()
+        .name("iris-ci-accept".into())
+        .spawn(move || {
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
+                        let s = server_clone.clone();
+                        thread::Builder::new()
+                            .name("iris-ci-handler".into())
+                            .spawn(move || handle_client_tcp(s, stream))
+                            .ok();
+                    }
+                    Err(e) => eprintln!("iris-ci-accept: {}", e),
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn CI accept thread: {}", e))?;
+    Ok(())
+}
+
+fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: impl Write) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -169,6 +221,27 @@ fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
         };
         out.push(b'\n');
         if writer.write_all(&out).is_err() { break; }
+    }
+}
+
+#[cfg(unix)]
+fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
+    match stream.try_clone() {
+        Ok(writer) => {
+            let reader = BufReader::new(stream);
+            handle_client_lines(server, reader, writer);
+        }
+        Err(e) => eprintln!("iris-ci-handler: clone failed: {}", e),
+    }
+}
+
+fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
+    match stream.try_clone() {
+        Ok(writer) => {
+            let reader = BufReader::new(stream);
+            handle_client_lines(server, reader, writer);
+        }
+        Err(e) => eprintln!("iris-ci-handler: clone failed: {}", e),
     }
 }
 
@@ -258,7 +331,7 @@ fn cmd_quit() -> Response {
     thread::spawn(|| {
         thread::sleep(Duration::from_millis(50));
         if let Some(p) = SOCKET_PATH.lock().take() {
-            let _ = std::fs::remove_file(&p);
+            cleanup_socket_path(&p);
         }
         // Same escape hatch as the PowerOff handler: library hosts set
         // IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI socket does
@@ -428,8 +501,17 @@ fn cmd_serial_read(server: &CiServer) -> Response {
 }
 
 fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
-    let Some(rex3) = &server.rex3 else {
-        return Response::err("screenshot: REX3 not present (running with --headless?)");
+    let head = args.get("head").and_then(|v| v.as_u64()).unwrap_or(0);
+    let rex3 = match head {
+        0 => server.rex3.as_ref(),
+        1 => server.rex3_head1.as_ref(),
+        _ => return Response::err("screenshot: head must be 0 or 1"),
+    };
+    let Some(rex3) = rex3 else {
+        return Response::err(format!(
+            "screenshot: REX3 head {} not present (headless or graphics.heads < 2?)",
+            head
+        ));
     };
     let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
         return Response::err("screenshot: missing 'path' arg");
@@ -477,6 +559,7 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
 
     Response::data(serde_json::json!({
         "path": path,
+        "head": head,
         "width": width,
         "height": height,
         "bytes": rgb.len() + 100,  // rough

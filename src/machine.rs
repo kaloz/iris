@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::config::{MachineConfig, NetworkConfig};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::eeprom_93c56::Eeprom93c56;
@@ -48,7 +48,7 @@ pub fn emulator_name() -> &'static str {
         }
 
         let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable"];
-        let thirds = ["IRIX", "Indy", "Iris", "IP22"];
+        let thirds = ["IRIX", "Indy", "Iris"];
         let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
 
         let first = firsts[((now / 4) % firsts.len() as u64) as usize];
@@ -93,6 +93,12 @@ pub struct Machine {
     disks: Vec<DiskRef>,
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
+    /// Host-forced Newport resolution from `[graphics] resolution` at construction.
+    display_resolution: crate::vc2_timings::NewportResolution,
+    /// Whether Newport compositor is active (not headless / not XZ board).
+    newport_active: bool,
+    /// Indigo2 IP22 fullhouse layout (`!guinness`).
+    fullhouse: bool,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -126,6 +132,7 @@ struct RollbackCheckpoint {
     seeq: toml::Value,
     hpc3: toml::Value,
     rex3: Option<toml::Value>,
+    rex3_head1: Option<toml::Value>,
 }
 
 impl Machine {
@@ -133,6 +140,19 @@ impl Machine {
         // Capture config flags that are needed after the local `cfg` binding
         // is shadowed later in this function.
         let ci_enabled = cfg.ci;
+        let perf = cfg.perf.clone();
+        let display_resolution = cfg.graphics.resolution;
+        let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
+
+        if !cfg.machine.profile.supported() {
+            eprintln!(
+                "iris: machine profile \"{}\" is not implemented; use {}",
+                cfg.machine.profile.label(),
+                MachineProfile::IndyIp24.label(),
+            );
+            std::process::exit(1);
+        }
+        let guinness = cfg.machine.profile.guinness();
 
         // 0. Shared EEPROM
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
@@ -148,7 +168,7 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
-        let mc = MemoryController::new(eeprom.clone(), true, cfg.banks);
+        let mc = MemoryController::new(eeprom.clone(), guinness, cfg.banks);
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
@@ -174,7 +194,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
-        let ioc = if ci_enabled { Ioc::new_ci(true) } else { Ioc::new(true) };
+        let ioc = if ci_enabled { Ioc::new_ci(guinness) } else { Ioc::new(guinness) };
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
@@ -214,7 +234,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.nvram.clone(), cycles.clone(), cfg.scsi_deferred_int);
+        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cycles.clone(), cfg.scsi_deferred_int);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Attach SCSI devices from config (IDs 1–7).
@@ -324,17 +344,74 @@ impl Machine {
         disk_provenance.sort_by_key(|d| d.id);
         let nvram_provenance = cfg.nvram.clone();
 
-        // REX3 Graphics — skipped in headless mode
-        let rex3: Option<Arc<Rex3>> = if cfg.headless {
+        // REX3 Graphics — Newport only; skipped in headless mode or when XZ board selected
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
+            None
+        } else {
+            let r = Arc::new(Rex3::new(heartbeat.clone(), cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let ioc_clone = ioc.clone();
+            r.set_vblank_callback(Arc::new(move |active| {
+                // Vertical retrace → L1 VERTICAL_RETRACE on Indy; on fullhouse the IOC
+                // fans extio SG_RETRACE into the same L1 bit (see apply_extio_fanout).
+                // GfxDrain0/1 are MAP FIFO-drain feedback — not vblank.
+                ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
+            }));
+            let ioc_ff = ioc.clone();
+            r.set_fifo_full_callback(Arc::new(move |active| {
+                ioc_ff.set_interrupt(crate::ioc::IocInterrupt::FifoFull, active);
+            }));
+            let ioc_gfx = ioc.clone();
+            r.set_graphics_callback(Arc::new(move |active| {
+                ioc_gfx.set_interrupt(crate::ioc::IocInterrupt::Graphics, active);
+            }));
+            let ioc_drain = ioc.clone();
+            r.set_gfx_drain_callback(Arc::new(move |active| {
+                if guinness {
+                    // Indy integrated Newport: drain feedback unused on MAP (guinness).
+                    let _ = active;
+                } else {
+                    ioc_drain.set_interrupt(crate::ioc::IocInterrupt::GfxDrain0, active);
+                }
+            }));
+            Some(r)
+        };
+
+        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat, cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
-            // Connect VBlank interrupt to IOC
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
-                ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
+                if guinness {
+                    ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp1, active);
+                } else {
+                    // Second Newport @ GIO slot 1: retrace via extio S0 (gc_select=1).
+                    ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp0Retrace, active);
+                }
+            }));
+            let ioc_ff = ioc.clone();
+            r.set_fifo_full_callback(Arc::new(move |active| {
+                ioc_ff.set_interrupt(crate::ioc::IocInterrupt::FifoFull, active);
+            }));
+            let ioc_gfx = ioc.clone();
+            r.set_graphics_callback(Arc::new(move |active| {
+                ioc_gfx.set_interrupt(crate::ioc::IocInterrupt::Graphics, active);
             }));
             Some(r)
+        };
+
+        // Indy XZ/Elan preview stub — same GIO gfx slot as Newport, no compositor.
+        let xz: Option<Arc<crate::xz::Xz>> = if guinness && cfg.graphics.board == crate::config::GraphicsBoard::Xz {
+            Some(Arc::new(crate::xz::Xz::new()))
+        } else {
+            None
+        };
+
+        // Indigo2 IMPACT/MGRAS preview — multi-slot GIO stub.
+        let mgras: Option<Arc<crate::mgras::Mgras>> = if !guinness && cfg.impact.any_enabled() {
+            Some(Arc::new(crate::mgras::Mgras::new(&cfg.impact)))
+        } else {
+            None
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
@@ -366,7 +443,10 @@ impl Machine {
         // 2. Create Physical Bus with devices
         let phys_raw = Physical::new(
             banks,
-            rex3,
+            rex3.clone(),
+            rex3_head1.clone(),
+            xz.clone(),
+            mgras.clone(),
             #[cfg(feature = "ultra64")]
             ultra64,
             vino,
@@ -444,7 +524,9 @@ impl Machine {
             crate::config::VinoSource::Off => None,
         };
         if let Some(source) = source {
-            phys.vino.set_source(source);
+            let adjusted: Arc<dyn crate::video_source::VideoSource> =
+                Arc::new(crate::video_source::CdmcAdjustedSource::new(source, phys.vino.clone()));
+            phys.vino.set_source(adjusted);
             phys.vino.start();
         }
 
@@ -498,9 +580,19 @@ impl Machine {
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
         if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
+        if let Some(rex3) = &phys.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(xz) = &phys.xz { monitor.register_device(xz.clone()); }
+        if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
         #[cfg(feature = "ultra64")]
         if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
+        monitor.register_device(crate::perf_monitor::PerfMonitor::new(
+            cpu.running_flag(),
+            cpu.cycles_counter(),
+            cpu.fasttick_count.clone(),
+            phys.rex3.clone(),
+            hpc3.hal2().cloned(),
+        ));
         let monitor = Arc::new(monitor);
 
         // Register lock monitor device and all component locks
@@ -511,6 +603,7 @@ impl Machine {
             mc.register_locks();
             hpc3.register_locks();
             if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
+            if let Some(rex3) = &phys.rex3_head1 { rex3.register_locks(); }
             cpu.register_locks();
         }
         {
@@ -523,6 +616,8 @@ impl Machine {
         // Give MC and IOC async event senders so they can request hard-reset / power-off.
         mc.set_event_sender(event_tx.clone());
         ioc.set_event_sender(event_tx.clone());
+
+        crate::thread_affinity::init(perf);
 
         Self {
             cpu,
@@ -540,6 +635,33 @@ impl Machine {
             scratch_path,
             disks: disk_provenance,
             nvram_path: nvram_provenance,
+            display_resolution,
+            newport_active,
+            fullhouse: !guinness,
+        }
+    }
+
+    fn apply_host_display_resolution(&self) {
+        if !self.newport_active {
+            return;
+        }
+        let mode = if self.display_resolution.is_guest() {
+            // Fullhouse + guest-selected resolution: IRIX/PROM may never program VC2
+            // (embedded Indy PROM, gfxinit mismatch). Bootstrap 1280×1024 so the GUI
+            // refresh thread has non-zero dimensions; guest can reprogram VC2 later.
+            if self.fullhouse {
+                crate::vc2_timings::NewportResolution::Res1280x1024
+            } else {
+                return;
+            }
+        } else {
+            self.display_resolution
+        };
+        if let Some(rex3) = &self._phys.rex3 {
+            rex3.apply_display_resolution(mode);
+        }
+        if let Some(rex3) = &self._phys.rex3_head1 {
+            rex3.apply_display_resolution(mode);
         }
     }
 
@@ -571,7 +693,10 @@ impl Machine {
         // Start peripherals
         self.mc.start();
         self.hpc3.start();
+        // Program VC2 before the refresh thread runs so the first frame has size.
+        self.apply_host_display_resolution();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
         #[cfg(feature = "ultra64")]
         if let Some(u64) = &self._phys.ultra64 { u64.start(); }
 
@@ -646,6 +771,7 @@ impl Machine {
     pub fn stop(&mut self) {
         self.cpu.stop();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
+        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
         self.hpc3.stop();
         self.mc.stop();
         #[cfg(feature = "ultra64")]
@@ -709,6 +835,10 @@ impl Machine {
         self._phys.rex3.clone()
     }
 
+    pub fn get_rex3_head1(&self) -> Option<Arc<crate::rex3::Rex3>> {
+        self._phys.rex3_head1.clone()
+    }
+
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
         self.timer_manager.clone()
     }
@@ -736,6 +866,26 @@ impl Machine {
     /// request/response probe over the console without a loopback TCP client.
     pub fn read_serial_console(&self) -> Vec<u8> {
         self.hpc3.ioc().scc().drain_console()
+    }
+
+    /// csh one-liner to (re)mount `/CDROM` for SCSI unit `id` (EFS s7, else iso9660 vol).
+    pub fn irix_cdrom_remount_command(scsi_id: u8) -> String {
+        format!(
+            "umount /CDROM >& /dev/null; \
+             mount -t efs -o ro /dev/dsk/dks0d{id}s7 /CDROM || \
+             mount -t iso9660 /dev/rdsk/dks0d{id}vol /CDROM\n",
+            id = scsi_id
+        )
+    }
+
+    /// Best-effort `/CDROM` remount via the IRIX serial console (tty1).
+    /// Works when a login shell or xterm on the console is active.
+    pub fn remount_cdrom_guest(&self, scsi_id: u8) {
+        let script = Self::irix_cdrom_remount_command(scsi_id);
+        eprintln!(
+            "IRIX: remount /CDROM for SCSI #{scsi_id} (console shell must be active)"
+        );
+        self.inject_serial_console(script.as_bytes());
     }
 
     /// CPU thread, started explicitly by the CI `start` command or by
@@ -913,6 +1063,7 @@ impl Machine {
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
         let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
 
         let bank_words: [Vec<u32>; 4] = [
             self._phys.snapshot_bank_inmem(0),
@@ -952,7 +1103,7 @@ impl Machine {
             overlay_sets,
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, seeq, hpc3, rex3,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, seeq, hpc3, rex3, rex3_head1,
         })
     }
 
@@ -974,6 +1125,9 @@ impl Machine {
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
         if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+            rex3.load_state(rex3_toml)?;
+        }
+        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
             rex3.load_state(rex3_toml)?;
         }
 
@@ -1000,6 +1154,7 @@ impl Machine {
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
     }
 
     /// Helper to power-on reset all devices.
@@ -1027,6 +1182,8 @@ impl Machine {
         if let Some(hal2) = self.hpc3.hal2() { hal2.power_on(); }
         self.hpc3.power_on();
         if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
+        if let Some(rex3) = &self._phys.rex3_head1 { rex3.power_on(); }
+        self.apply_host_display_resolution();
     }
 
     /// Stop all threads, power-on reset every device in-place, restart peripherals.
@@ -1083,6 +1240,19 @@ impl Machine {
             if sv < 3 {
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
+        }
+        if let Some(rex3) = &self._phys.rex3_head1 {
+            snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
+            if sv < 3 {
+                let dir = &snap.dir;
+                rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(xz) = &self._phys.xz {
+            snap.write_state("xz", &xz.save_state(), sv).map_err(|e| e.to_string())?;
+        }
+        if let Some(mgras) = &self._phys.mgras {
+            snap.write_state("mgras", &mgras.save_state(), sv).map_err(|e| e.to_string())?;
         }
 
         // Bulk memory: v3+ goes to the content-addressable chunk store
@@ -1156,6 +1326,7 @@ impl Machine {
         self.hpc3.stop();
         self.mc.stop();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
+        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
         Ok(())
     }
 
@@ -1306,9 +1477,26 @@ impl Machine {
         if let Some(rex3) = &self._phys.rex3 {
             let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
-            // v3+ stores framebuffers in the chunk store; v2 used .bin files.
             if schema_version < 3 {
                 rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(rex3) = &self._phys.rex3_head1 {
+            if let Ok(rex3_v) = snap.read_state("rex3_head1", schema_version) {
+                rex3.load_state(&rex3_v)?;
+                if schema_version < 3 {
+                    rex3.load_framebuffers_named(&snap.dir, "rex3_head1").map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if let Some(xz) = &self._phys.xz {
+            if let Ok(xz_v) = snap.read_state("xz", schema_version) {
+                xz.load_state(&xz_v)?;
+            }
+        }
+        if let Some(mgras) = &self._phys.mgras {
+            if let Ok(mgras_v) = snap.read_state("mgras", schema_version) {
+                mgras.load_state(&mgras_v)?;
             }
         }
 
