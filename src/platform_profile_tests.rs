@@ -1,8 +1,8 @@
 //! Headless acceptance tests for IP22/IP24 profile wiring, XZ, and IMPACT stubs.
 //!
-//! These run in `cargo test --lib` without booting the guest. When
-//! `irix-install/scsi1.raw` is present, use `iris-indigo2-smoke-ci.toml` for
-//! live boot checks (monitor on 127.0.0.1:8888; CI serial is channel B / IRIX).
+//! These run in `cargo test --lib` without booting the guest. For live boot
+//! checks, point `iris-indigo2-smoke-ci.toml` at a local IRIX root disk (raw or
+//! CHD; monitor on 127.0.0.1:8888; CI serial is channel B / IRIX).
 
 #[cfg(test)]
 mod tests {
@@ -23,15 +23,6 @@ mod tests {
         let mut cfg = MachineConfig::default();
         cfg.scsi.clear();
         cfg
-    }
-
-    #[test]
-    fn irix_install_scsi_disk_present() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/irix-install/scsi1.raw");
-        assert!(
-            std::path::Path::new(path).exists(),
-            "irix-install/scsi1.raw — IRIX root disk for smoke/CI configs"
-        );
     }
 
     #[test]
