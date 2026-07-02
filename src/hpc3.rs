@@ -1117,7 +1117,8 @@ impl Hpc3 {
         let scsi_dev = Arc::new(Wd33c93a::new_with_config(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), cpu_cycles, scsi_deferred_int));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
 
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec(), audio))) };
+        let _ = audio;
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
             state,
