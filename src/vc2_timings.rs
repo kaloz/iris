@@ -30,6 +30,15 @@ pub enum NewportResolution {
 }
 
 impl NewportResolution {
+    /// All selectable modes, in display order. Single source of truth for the
+    /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
+    pub const ALL: [Self; 4] = [
+        Self::Guest,
+        Self::Res1024x768,
+        Self::Res1280x960,
+        Self::Res1280x1024,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Guest => "Guest (IRIX / setmon)",

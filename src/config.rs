@@ -217,6 +217,10 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
+    /// All selectable profiles, in display order. Single source of truth for the
+    /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
+    pub const ALL: [Self; 2] = [Self::IndyIp24, Self::Indigo2Ip22];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::IndyIp24 => "SGI Indy (IP24)",

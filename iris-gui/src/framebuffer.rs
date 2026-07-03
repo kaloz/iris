@@ -6,7 +6,7 @@
 
 use iris::compositor::{Compositor, SwCompositor};
 use iris::debug_overlay::DebugOverlay;
-use iris::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, STATUS_BAR_HEIGHT};
+use iris::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture};
 use iris::gl_compositor::GlCompositor;
 use iris::headless_gl::HeadlessGl;
 use iris::rex3::Renderer;
@@ -71,19 +71,14 @@ impl CaptureRenderer {
     }
 }
 
-/// IRIX status strip is the bottom `STATUS_BAR_HEIGHT` rows of the visible frame.
-fn status_bar_y(height: usize) -> usize {
-    height.saturating_sub(STATUS_BAR_HEIGHT)
-}
-
 impl Renderer for CaptureRenderer {
     fn present(
         &mut self,
         screen:        &mut Rex3Screen,
         _overlay:       &mut DebugOverlay,
-        status:        &mut StatusBar,
+        _status:        &mut StatusBar,
         _sbtex:         &mut StatusBarTexture,
-        stats:         &BarStats,
+        _stats:         &BarStats,
         _need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -93,34 +88,23 @@ impl Renderer for CaptureRenderer {
         let height = screen.height;
         if width == 0 || height == 0 { return; }
 
+        // Heartbeat-only refresh: the compositor sets `status_bar_only` when
+        // nothing in the guest display changed and only the emulator's own
+        // status bar would. iris-gui shows its own status chrome and never bakes
+        // that bar into the frame, so there's nothing to push here.
+        if screen.status_bar_only && self.sink.seq() > 0 {
+            return;
+        }
+
         let needed = 2048 * 1024;
         if self.last_pixels.len() < needed {
             self.last_pixels.resize(needed, 0);
-        }
-
-        if screen.status_bar_only && self.sink.seq() > 0 {
-            status.update(stats.hb);
-            let bar_y = status_bar_y(height);
-            status.render(&mut self.last_pixels, width, bar_y, stats);
-            pack_rows(
-                &self.sink,
-                &self.last_pixels,
-                width,
-                height,
-                bar_y,
-                STATUS_BAR_HEIGHT,
-                &mut self.seq,
-            );
-            return;
         }
 
         let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
         self.compositor.compose_pixels(&src);
         drop(src);
         self.last_pixels.copy_from_slice(self.compositor.pixels());
-
-        status.update(stats.hb);
-        status.render(&mut self.last_pixels, width, status_bar_y(height), stats);
 
         pack_sw_frame(&self.sink, &self.last_pixels, width, height, &mut self.seq);
     }
@@ -158,9 +142,9 @@ impl Renderer for GlCaptureRenderer {
         &mut self,
         screen:        &mut Rex3Screen,
         _overlay:       &mut DebugOverlay,
-        status:        &mut StatusBar,
+        _status:        &mut StatusBar,
         _sbtex:         &mut StatusBarTexture,
-        stats:         &BarStats,
+        _stats:         &BarStats,
         _need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -170,27 +154,16 @@ impl Renderer for GlCaptureRenderer {
         let height = screen.height;
         if width == 0 || height == 0 { return; }
 
+        // See CaptureRenderer::present — no baked status bar, so a heartbeat-only
+        // refresh has nothing to push.
+        if screen.status_bar_only && self.sink.seq() > 0 {
+            return;
+        }
+
         let needed = 2048 * 1024;
         if self.last_pixels.len() < needed {
             self.last_pixels.resize(needed, 0);
         }
-
-        if screen.status_bar_only && self.sink.seq() > 0 {
-            status.update(stats.hb);
-            let bar_y = status_bar_y(height);
-            status.render(&mut self.last_pixels, width, bar_y, stats);
-            pack_rows(
-                &self.sink,
-                &self.last_pixels,
-                width,
-                height,
-                bar_y,
-                STATUS_BAR_HEIGHT,
-                &mut self.seq,
-            );
-            return;
-        }
-
         if self.rgba.len() < needed {
             self.rgba.resize(needed, 0);
         }
@@ -200,9 +173,6 @@ impl Renderer for GlCaptureRenderer {
         drop(src);
         self.compositor.readback_to_screen(&mut self.rgba, width, height, gl);
         self.last_pixels.copy_from_slice(&self.rgba[..needed]);
-
-        status.update(stats.hb);
-        status.render(&mut self.last_pixels, width, status_bar_y(height), stats);
 
         pack_sw_frame(&self.sink, &self.last_pixels, width, height, &mut self.seq);
     }
@@ -228,38 +198,6 @@ fn pack_sw_frame(sink: &FrameSink, pixels: &[u32], width: usize, height: usize, 
     frame.dirty_h = height as u32;
 
     for y in 0..height {
-        let src_row = &pixels[y * 2048..y * 2048 + width];
-        let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
-        for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
-            dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
-        }
-    }
-
-    *seq = seq.wrapping_add(1);
-    frame.seq = *seq;
-    drop(frame);
-    sink.seq.store(*seq, Ordering::Release);
-}
-
-fn pack_rows(
-    sink: &FrameSink,
-    pixels: &[u32],
-    width: usize,
-    height: usize,
-    start_y: usize,
-    row_count: usize,
-    seq: &mut u64,
-) {
-    let mut frame = sink.lock();
-    if frame.width != width || frame.height != height || frame.rgba.is_empty() {
-        pack_sw_frame(sink, pixels, width, height, seq);
-        return;
-    }
-
-    frame.dirty_y = start_y as u32;
-    frame.dirty_h = row_count as u32;
-
-    for y in start_y..start_y + row_count.min(height.saturating_sub(start_y)) {
         let src_row = &pixels[y * 2048..y * 2048 + width];
         let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
         for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
