@@ -57,6 +57,16 @@ pub const GFIFO_EXIT: u32 = 0xFFFF_0001;
 /// Consumer advances gfifo_fence to the payload value when it processes this entry.
 /// No GO bit set, so process_register receives this value directly as reg_offset.
 pub const GFIFO_DISP_SYNC: u32 = 0xFFFF_0002;
+/// Internal-only offset (not a real REX3 register — top of the 8KB window, well past
+/// any hardware register) used as a "pure GO, no register write" alias for `dma_read64`/
+/// `dma_write64`. Consumed the same way as `GFIFO_PURE_GO`: triggers execute_go() without
+/// touching any context field. Exists so MC's VDMA worker can prime/advance the HOSTRW
+/// read-then-advance pipeline via the normal GFIFO path (correct ordering relative to
+/// concurrent CPU-driven register writes) without needing its own bespoke sentinel.
+/// GO bit (0x0800) is baked in, mirroring GFIFO_PURE_GO's convention.
+pub const REX3_DMA_PURE_GO: u32 = 0x1FF0 | 0x0800;
+/// REX3_DMA_PURE_GO with the GO bit stripped — the reg_offset seen by process_register.
+pub const REX3_DMA_PURE_GO_REG: u32 = REX3_DMA_PURE_GO & !0x0800;
 pub const REX3_COORD_BIAS: i32 = 4096; // Physical coordinate system offset.
 pub const REX3_SCREEN_WIDTH: i32 = 1344; // 1280 displayable + 64 off-screen.
 pub const REX3_SCREEN_HEIGHT: i32 = 1024; // Max displayable height.
@@ -669,6 +679,10 @@ pub struct DrawRecord {
     pub hostrw_writes: u32,
     /// Writes that arrived on the HOSTRW path when colorhost=0 (unexpected).
     pub spurious_writes: u32,
+    /// Actual HOSTRW reads performed (32-bit words; each 64-bit counts as 1).
+    pub hostrw_reads: u32,
+    /// Reads that arrived on the HOSTRW path when colorhost=0 (unexpected).
+    pub spurious_reads: u32,
 }
 
 const DRAW_RING_SIZE: usize = 65536;
@@ -710,6 +724,19 @@ impl DrawRingBuf {
                 r.hostrw_writes += 1;
             } else {
                 r.spurious_writes += 1;
+            }
+        }
+    }
+
+    /// Called on every HOSTRW read (32-bit or 64-bit).
+    /// Increments `hostrw_reads` on the pending draw, or `spurious_reads` if colorhost=0.
+    pub fn on_hostrw_read(&mut self) {
+        if let Some(idx) = self.pending {
+            let r = &mut self.entries[idx];
+            if r.expected_words > 0 {
+                r.hostrw_reads += 1;
+            } else {
+                r.spurious_reads += 1;
             }
         }
     }
@@ -1102,8 +1129,11 @@ pub struct Rex3 {
     /// Display thread spins until gfifo_fence >= sampled xmap_fence (wrapping).
     pub gfifo_fence: AtomicU32,
     pub debug: Arc<AtomicBool>,
+    #[cfg(feature = "developer")]
     pub block_debug: Arc<AtomicBool>,
+    #[cfg(feature = "developer")]
     pub draw_debug: Arc<AtomicBool>,
+    #[cfg(feature = "developer")]
     pub draw_ring: Arc<Mutex<DrawRingBuf>>,
     #[cfg(feature = "developer")]
     pub gfifo_hwm: AtomicUsize,
@@ -1142,8 +1172,10 @@ pub struct Rex3 {
     pub l1i_fetch_count: Arc<AtomicU64>,
     pub uncached_fetch_count: Arc<AtomicU64>,
     /// Optional log file for block/span draws (set when block_debug is enabled).
+    #[cfg(feature = "developer")]
     block_log: Mutex<Option<std::fs::File>>,
     /// GFIFO log (written by painter thread on process_register, one line per entry).
+    #[cfg(feature = "developer")]
     rex3_log: Mutex<Option<std::fs::File>>,
     /// When true, the refresh thread overlays a 16x16 grid of 8x8 CMAP swatches.
     pub show_cmap: AtomicBool,
@@ -1233,8 +1265,11 @@ impl Rex3 {
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
             debug: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "developer")]
             block_debug: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "developer")]
             draw_debug: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "developer")]
             draw_ring: Arc::new(Mutex::new(DrawRingBuf::default())),
             #[cfg(feature = "developer")]
             gfifo_hwm: AtomicUsize::new(0),
@@ -1267,7 +1302,9 @@ impl Rex3 {
             l1i_hit_count,
             l1i_fetch_count,
             uncached_fetch_count,
+            #[cfg(feature = "developer")]
             block_log: Mutex::new(None),
+            #[cfg(feature = "developer")]
             rex3_log: Mutex::new(None),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
@@ -1455,9 +1492,40 @@ impl Rex3 {
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
     }
 
+    /// Whether the draw-debug overlay/ring-buffer tracking is active. Always false
+    /// in non-developer builds (the toggle command to enable it doesn't exist there),
+    /// so callers can use this instead of touching the developer-gated fields directly.
+    #[cfg(feature = "developer")]
+    #[inline(always)]
+    fn draw_debug_active(&self) -> bool { self.draw_debug.load(Ordering::Relaxed) }
+    #[cfg(not(feature = "developer"))]
+    #[inline(always)]
+    fn draw_debug_active(&self) -> bool { false }
+
+    /// Record a HOSTRW write/read against the pending draw-debug entry. No-op in
+    /// non-developer builds.
+    #[cfg(feature = "developer")]
+    #[inline(always)]
+    fn note_hostrw_write(&self) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_write(); } }
+    #[cfg(not(feature = "developer"))]
+    #[inline(always)]
+    fn note_hostrw_write(&self) {}
+
+    #[cfg(feature = "developer")]
+    #[inline(always)]
+    fn note_hostrw_read(&self) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_read(); } }
+    #[cfg(not(feature = "developer"))]
+    #[inline(always)]
+    fn note_hostrw_read(&self) {}
+
+    #[cfg(not(feature = "developer"))]
+    #[inline(always)]
+    fn log_block(&self, _ctx: &Rex3Context, _opcode: u32) {}
+
+    #[cfg(feature = "developer")]
     fn log_block(&self, ctx: &Rex3Context, opcode: u32) {
         let need_block_log = self.block_log.lock().is_some();
-        let need_draw_ring = self.draw_debug.load(Ordering::Relaxed);
+        let need_draw_ring = self.draw_debug_active();
         if ctx.mid_primitive || (!need_block_log && !need_draw_ring) { return; }
 
         let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
@@ -1580,6 +1648,7 @@ impl Rex3 {
                 wrmask: ctx.wrmask, lspat: ctx.lspattern, zpat: ctx.zpattern,
                 expected_words, expected_doubles,
                 hostrw_writes: 0, spurious_writes: 0,
+                hostrw_reads: 0, spurious_reads: 0,
             });
         }
     }
@@ -1658,6 +1727,14 @@ impl Rex3 {
                 // lsrcount continues across rows — iterate_pattern_ls manages it per-pixel.
 
                 if !stopony {
+                    // Without STOPONY, hardware doesn't auto-advance rows — each row is
+                    // its own complete primitive and the next GO starts a fresh one.
+                    // Mirrors the JIT's emit_shader (!stopony branch in end_x_block),
+                    // which already clears mid_primitive here. Leaving this true (as
+                    // before) permanently wedged log_block()'s "primitive start" guard
+                    // after the first non-stopony block ever ran, hiding every
+                    // subsequent block/READ/DRAW header from block.log.
+                    ctx.mid_primitive = false;
                     break;
                 }
 
@@ -3315,6 +3392,7 @@ impl Rex3 {
                 let exit = self.process_register(reg_offset, val);
 
                 // Log to rex3_log after processing.
+                #[cfg(feature = "developer")]
                 if let Some(f) = self.rex3_log.lock().as_mut() {
                     if addr == GFIFO_PURE_GO {
                         let _ = writeln!(f, "------- PURE_GO -------");
@@ -3806,7 +3884,7 @@ impl Rex3 {
                 let x = self.xmap0.lock().dirty;
                 v || c || b || x
             };
-            let dbg_overlay = self.draw_debug.load(Ordering::Relaxed)
+            let dbg_overlay = self.draw_debug_active()
                 || self.show_cmap.load(Ordering::Relaxed)
                 || self.show_disp_debug.load(Ordering::Relaxed);
             let fb_was_dirty = self.fb_dirty.swap(false, Ordering::Acquire);
@@ -3832,8 +3910,9 @@ impl Rex3 {
                 // Push debug state into overlay
                 overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
                 overlay.show_disp_debug = self.show_disp_debug.load(Ordering::Relaxed);
-                let dd = self.draw_debug.load(Ordering::Relaxed);
+                let dd = self.draw_debug_active();
                 overlay.show_draw_debug = dd;
+                #[cfg(feature = "developer")]
                 if dd {
                     let ring = self.draw_ring.lock();
                     overlay.draw_snapshot.clear();
@@ -3982,13 +4061,17 @@ impl Rex3 {
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
             // triggered by the GO bit in the loop.
             GFIFO_PURE_GO_REG => {}
+            // dma_read64/dma_write64's priming alias — same no-op treatment as
+            // GFIFO_PURE_GO_REG (see REX3_DMA_PURE_GO doc comment).
+            REX3_DMA_PURE_GO_REG => {}
             // HOSTRW: store data port value; reset shift so the draw picks up pixels from MSB.
             // The actual draw/read is triggered by execute_go() when entry.go is set.
             // 64-bit write (REX3_HOSTRW0_64 = 0x0231): store full val64 directly.
             REX3_HOSTRW64 => {
                 ctx.hostrw = val64;
                 ctx.hostcnt = 0;
-                if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
+                self.note_hostrw_write();
+                #[cfg(feature = "developer")]
                 if let Some(f) = self.block_log.lock().as_mut() {
                     let _ = writeln!(f, "  HOSTRW64 {:016x}", val64);
                 }
@@ -3998,7 +4081,8 @@ impl Rex3 {
                 let new_val = (ctx.hostrw & 0x0000_0000_FFFF_FFFF) | ((val64 & 0xFFFF_FFFF) << 32);
                 ctx.hostrw = new_val;
                 ctx.hostcnt = 0;
-                if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
+                self.note_hostrw_write();
+                #[cfg(feature = "developer")]
                 if let Some(f) = self.block_log.lock().as_mut() {
                     let _ = writeln!(f, "  HOSTRW0 {:08x} -> {:016x}", val64 as u32, new_val);
                 }
@@ -4008,7 +4092,8 @@ impl Rex3 {
                 let new_val = (ctx.hostrw & 0xFFFF_FFFF_0000_0000) | (val64 & 0xFFFF_FFFF);
                 ctx.hostrw = new_val;
                 ctx.hostcnt = 0;
-                if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
+                self.note_hostrw_write();
+                #[cfg(feature = "developer")]
                 if let Some(f) = self.block_log.lock().as_mut() {
                     let _ = writeln!(f, "  HOSTRW1 {:08x} -> {:016x}", val64 as u32, new_val);
                 }
@@ -4266,17 +4351,22 @@ impl Device for Rex3 {
     }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![
+        #[allow(unused_mut)]
+        let mut cmds = vec![
             ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump | vc2 debug <on|off> [DEV]".to_string()),
-            ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
-            ("draw".to_string(), "Draw debug overlay: draw debug <on|off>".to_string()),
             ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
             ("cmap".to_string(), "CMAP commands: cmap status | cmap debug <on|off> [DEV]".to_string()),
             ("bt445".to_string(), "BT445 RAMDAC: bt445 status | bt445 identity (reset palette to linear ramp) | bt445 debug <on|off> [DEV]".to_string()),
             ("disp".to_string(), "Display debug: disp status | disp debug <on|off> | disp compositor <gl|sw>".to_string()),
-        ]
+        ];
+        #[cfg(feature = "developer")]
+        cmds.extend([
+            ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
+            ("draw".to_string(), "Draw debug overlay: draw debug <on|off> [DEV]".to_string()),
+        ]);
+        cmds
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -4435,6 +4525,7 @@ impl Device for Rex3 {
             return Ok(());
         }
 
+        #[cfg(feature = "developer")]
         if cmd == "rex" && args[0] == "buslog" {
             let val = match args.get(1).map(|s| *s) {
                 Some("on")  => true,
@@ -4452,6 +4543,10 @@ impl Device for Rex3 {
                 writeln!(writer, "REX3 GFIFO logging disabled").unwrap();
             }
             return Ok(());
+        }
+        #[cfg(not(feature = "developer"))]
+        if cmd == "rex" && args[0] == "buslog" {
+            return Err("rex buslog is only available in developer builds".to_string());
         }
 
         #[cfg(feature = "rex-jit")]
@@ -4606,6 +4701,7 @@ impl Device for Rex3 {
                     writeln!(writer, "DCB debug {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
+                #[cfg(feature = "developer")]
                 "block" => {
                     self.block_debug.store(val, Ordering::Relaxed);
                     let mut log = self.block_log.lock();
@@ -4620,6 +4716,7 @@ impl Device for Rex3 {
                     }
                     return Ok(());
                 }
+                #[cfg(feature = "developer")]
                 "draw" => {
                     self.draw_debug.store(val, Ordering::Relaxed);
                     if !val { self.draw_ring.lock().count = 0; }
@@ -4658,10 +4755,6 @@ impl Device for Rex3 {
 
 impl BusDevice for Rex3 {
     fn read32(&self, addr: u32) -> BusRead32 {
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BusRead32::ok(0);
-        }
-
         let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
         let is_go      = offset & 0x0800 != 0;
@@ -4830,16 +4923,33 @@ impl BusDevice for Rex3 {
             }
         }
 
+        if reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1 {
+            self.note_hostrw_read();
+            #[cfg(feature = "developer")]
+            if let Some(f) = self.block_log.lock().as_mut() {
+                if result.is_ok() {
+                    let _ = writeln!(f, "  {} read -> {:08x}{}",
+                        rex3_reg_name(reg_offset), result.data, if is_go { " (GO)" } else { "" });
+                }
+            }
+        } else if is_go {
+            // Any other register read with the GO bit also pushes a PURE_GO (see below),
+            // which is indistinguishable from a HOSTRW GO-read in the generic PURE_GO
+            // sentinel logged by register_processor. Surface it here so a HOSTRW word
+            // count that comes up short of expected_64b/expected_words can be traced to
+            // a non-HOSTRW GO-read stealing one of the PURE_GO slots, instead of looking
+            // like a dropped/missing pixel word.
+            #[cfg(feature = "developer")]
+            if let Some(f) = self.block_log.lock().as_mut() {
+                let _ = writeln!(f, "  {} read (GO, non-HOSTRW)", rex3_reg_name(reg_offset));
+            }
+        }
+
         if is_go { self.gfifo_push(GFIFO_PURE_GO, 0); }
         result
     }
 
     fn read8(&self, addr: u32) -> BusRead8 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BusRead8::ok(0);
-        }
-
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
@@ -4860,11 +4970,6 @@ impl BusDevice for Rex3 {
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BUS_OK;
-        }
-
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         dlog_dev!(LogModule::Rex3, "REX3 Write8: Offset {:04x} Val {:02x}", offset, val);
@@ -4879,11 +4984,6 @@ impl BusDevice for Rex3 {
     }
 
     fn read16(&self, addr: u32) -> BusRead16 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BusRead16::ok(0);
-        }
-
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
@@ -4904,11 +5004,6 @@ impl BusDevice for Rex3 {
     }
 
     fn write16(&self, addr: u32, val: u16) -> u32 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BUS_OK;
-        }
-
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         dlog_dev!(LogModule::Rex3, "REX3 Write16: Offset {:04x} Val {:04x}", offset, val);
@@ -4923,11 +5018,6 @@ impl BusDevice for Rex3 {
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BUS_OK;
-        }
-
         let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
         dlog_dev!(LogModule::Rex3, "REX3 Write32: Offset {:04x} (Reg {:04x} {}) Val {:08x}", offset, reg_offset, rex3_reg_name(reg_offset), val);
@@ -4964,11 +5054,6 @@ impl BusDevice for Rex3 {
     }
 
     fn read64(&self, addr: u32) -> BusRead64 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BusRead64::ok(0);
-        }
-
         let offset = addr & (REX3_SIZE - 1);
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
@@ -4977,6 +5062,11 @@ impl BusDevice for Rex3 {
                 return BusRead64::busy();
             }
             let val = unsafe { (*self.context.get()).hostrw };
+            self.note_hostrw_read();
+            #[cfg(feature = "developer")]
+            if let Some(f) = self.block_log.lock().as_mut() {
+                let _ = writeln!(f, "  HOSTRW0_64 read -> {:016x}{}", val, if is_go64r { " (GO)" } else { "" });
+            }
             if is_go64r {
                 // Enqueue a pure-go entry: no register update, just trigger next pixel batch.
                 self.gfifo_push(GFIFO_PURE_GO, 0);
@@ -4992,12 +5082,42 @@ impl BusDevice for Rex3 {
         BusRead64::ok(((r_high.data as u64) << 32) | r_low.data as u64)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
-        // Check if address is within the 8KB register window
-        if (addr & 0xFFFFE000) != REX3_BASE {
-            return BUS_OK;
+    /// DMA-driven HOSTRW read (see BusDevice::dma_read64 doc comment).
+    ///
+    /// CPU-driven PIO gets REX3's read-then-advance protocol "for free": each
+    /// GO-space read both returns the currently-latched word AND arms the next
+    /// one, so software naturally discards its first (pre-primitive) read and
+    /// trusts the rest — see xf86-video-newport's NewportXAAReadPixmap, which
+    /// issues N-1 GO reads then 1 final non-GO read for N words, with an
+    /// explicit "go has to be issued before we start reading" SETUP-GO primer.
+    ///
+    /// VDMA has no such software-side discard loop — every dma_read64() result
+    /// must already be real data. So here we invert the ordering: push a
+    /// GO-only entry, wait for it to execute (arms/advances the pipeline),
+    /// THEN read the now-current ctx.hostrw — instead of read-then-advance.
+    fn dma_read64(&self, addr: u32) -> BusRead64 {
+        let offset = addr & (REX3_SIZE - 1);
+        let is_go64r = (offset & 0x0800) != 0;
+        let reg_offset64r = offset & !0x0800;
+        if reg_offset64r != REX3_HOSTRW0 || !is_go64r {
+            return self.read64(addr);
         }
 
+        #[cfg(feature = "developer")]
+        let before = unsafe { (*self.context.get()).hostrw };
+        self.gfifo_push(REX3_DMA_PURE_GO, 0);
+        self.wait_idle();
+
+        let val = unsafe { (*self.context.get()).hostrw };
+        self.note_hostrw_read();
+        #[cfg(feature = "developer")]
+        if let Some(f) = self.block_log.lock().as_mut() {
+            let _ = writeln!(f, "  HOSTRW0_64 dma_read: before={:016x} after={:016x} (primed)", before, val);
+        }
+        BusRead64::ok(val)
+    }
+
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go = (offset & 0x0800) != 0;
         let reg_offset64 = offset & !0x0800;

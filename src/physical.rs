@@ -757,4 +757,21 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         unsafe { (*device_ptr).write64_masked(addr, val, mask) }
     }
+
+    // Route to the target device's dma_read64/dma_write64, not its read64/write64.
+    // Without these overrides, BusDevice's default dma_read64/dma_write64 (which
+    // call self.read64/self.write64) resolve against Physical itself — reaching
+    // the target device's plain read64/write64 one layer too early and skipping
+    // any DMA-specific override (e.g. Rex3::dma_read64) entirely.
+    #[inline(always)]
+    fn dma_read64(&self, addr: u32) -> BusRead64 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).dma_read64(addr) }
+    }
+
+    #[inline(always)]
+    fn dma_write64(&self, addr: u32, val: u64) -> u32 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).dma_write64(addr, val) }
+    }
 }

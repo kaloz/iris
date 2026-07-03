@@ -155,6 +155,10 @@ pub struct MemoryController {
     memcfg_callback: Arc<OnceLock<Box<dyn Fn([Option<(u32, u32, u32)>; 4]) + Send + Sync>>>,
     /// Channel to send async machine events (HardReset, PowerOff) to the machine thread.
     event_tx: Arc<OnceLock<mpsc::SyncSender<MachineEvent>>>,
+    /// Set when `mc vdma on` is active; gates the per-transfer logging in dma_worker.
+    vdma_debug: Arc<AtomicBool>,
+    /// Log file for VDMA transactions (set when vdma_debug is enabled).
+    vdma_log: Arc<Mutex<Option<std::fs::File>>>,
 }
 
 impl MemoryController {
@@ -184,6 +188,8 @@ impl MemoryController {
             ram_sizes: Arc::new(ram_sizes),
             memcfg_callback: Arc::new(OnceLock::new()),
             event_tx: Arc::new(OnceLock::new()),
+            vdma_debug: Arc::new(AtomicBool::new(false)),
+            vdma_log: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -565,7 +571,45 @@ impl MemoryController {
                 mem_vaddr, gio_addr, state.size, mode_reg,
                 to_host, fill, dir_up, xlate, word_aligned);
 
+            // Snapshot the µTLB while state is still locked, for the vdma_log page-table
+            // dump below — translate_addr() re-reads this per-page during the transfer,
+            // but the log only needs the entries valid at transfer start.
+            let tlb_snapshot = if self.vdma_debug.load(Ordering::Relaxed) {
+                Some((state.tlb_hi, state.tlb_lo))
+            } else {
+                None
+            };
+
             drop(state);
+
+            if let Some((tlb_hi, tlb_lo)) = tlb_snapshot {
+                if let Some(f) = self.vdma_log.lock().as_mut() {
+                    let page_16k  = (ctl & 0x2) != 0;
+                    let pte_8byte = (ctl & 0x1) != 0;
+                    let _ = writeln!(f,
+                        "VDMA start: dir={} mode={}{} mem={:08x} gio={:08x} xlate={} page={} pte={}B",
+                        if to_host { "gio->mem" } else { "mem->gio" },
+                        if fill { "fill" } else { "copy" },
+                        if dir_up { "" } else { " dir_down" },
+                        mem_vaddr, gio_addr, xlate,
+                        if page_16k { "16K" } else { "4K" },
+                        if pte_8byte { 8 } else { 4 });
+                    let _ = writeln!(f,
+                        "  block: line_count={} line_width={:#x} line_zoom={} zoom_count={} byte_count={:#x} stride={}",
+                        line_count, line_width, line_zoom, zoom_count, byte_count, stride);
+                    if xlate {
+                        let _ = writeln!(f, "  uTLB:");
+                        for i in 0..4 {
+                            let hi = tlb_hi[i];
+                            let lo = tlb_lo[i];
+                            let valid = (lo & 2) != 0;
+                            let pte_base = (lo & 0x03ffffc0) << 6;
+                            let _ = writeln!(f, "    [{i}] vpnhi={:08x} valid={valid} pte_base={pte_base:08x}",
+                                hi & 0xffc00000);
+                        }
+                    }
+                }
+            }
 
             if let Some(phys) = self.phys.get() {
                 // ── Fast path: word-aligned fill to host, no translation ──────────────
@@ -632,7 +676,7 @@ impl MemoryController {
                                         // thread has no EXEC_RETRY mechanism, so we busy-wait here.
                                         let length = byte_count.min(8);
                                         let data = loop {
-                                            let r = phys.read64(gio_addr);
+                                            let r = phys.dma_read64(gio_addr);
                                             if r.is_ok() { break r.data; }
                                             if r.status != crate::traits::BUS_BUSY { break 0u64; }
                                             std::hint::spin_loop();
@@ -671,7 +715,7 @@ impl MemoryController {
                                         else       { mem_vaddr = mem_vaddr.wrapping_sub(1); }
                                         shift = shift.wrapping_sub(8);
                                     }
-                                    phys.write64(gio_addr, data);
+                                    phys.dma_write64(gio_addr, data);
                                     byte_count = byte_count.saturating_sub(length);
                                 }
                             }
@@ -694,6 +738,12 @@ impl MemoryController {
             let freq = crate::platform::get_host_tick_frequency();
             let elapsed_us = (elapsed as f64 / freq as f64) * 1_000_000.0;
             dlog_dev!(LogModule::Mc, "MC: DMA Finished in {:.3} us ({} ticks)", elapsed_us, elapsed);
+
+            if self.vdma_debug.load(Ordering::Relaxed) {
+                if let Some(f) = self.vdma_log.lock().as_mut() {
+                    let _ = writeln!(f, "VDMA end: mem={:08x} fault={} {:.3}us", mem_vaddr, exc, elapsed_us);
+                }
+            }
 
             state = lock.lock();
             state.memadr = mem_vaddr;
@@ -1211,7 +1261,7 @@ impl Device for MemoryController {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("mc".to_string(), "Memory Controller commands: mc dma, mc status".to_string()),
+            ("mc".to_string(), "Memory Controller commands: mc dma, mc regs, mc vdma <on|off>".to_string()),
             ("eeprom".to_string(), "Enable/disable EEPROM debug: eeprom <on|off>".to_string()),
         ]
     }
@@ -1289,10 +1339,28 @@ impl Device for MemoryController {
                     writeln!(writer, "  SYS_SEMA     : {}", s.sys_semaphore as u8).unwrap();
                     writeln!(writer, "  LOCK_MEM     : {:08x}", reg(REG_LOCK_MEMORY)).unwrap();
                     writeln!(writer, "  EISA_LOCK    : {:08x}", reg(REG_EISA_LOCK)).unwrap();
+                } else if !args.is_empty() && args[0] == "vdma" {
+                    let val = match args.get(1).map(|s| *s) {
+                        Some("on") => true,
+                        Some("off") => false,
+                        _ => return Err("Usage: mc vdma <on|off>".to_string()),
+                    };
+                    self.vdma_debug.store(val, Ordering::Relaxed);
+                    let mut log = self.vdma_log.lock();
+                    if val {
+                        match std::fs::File::create("vdma.log") {
+                            Ok(f) => { *log = Some(f); writeln!(writer, "VDMA debug enabled, logging to vdma.log").unwrap(); }
+                            Err(e) => { writeln!(writer, "VDMA debug enabled but failed to open log: {}", e).unwrap(); }
+                        }
+                    } else {
+                        *log = None;
+                        writeln!(writer, "VDMA debug disabled").unwrap();
+                    }
                 } else {
                     writeln!(writer, "MC Status: OK").unwrap();
                     writeln!(writer, "  Usage: mc dma                    — show GIO DMA + µTLB status").unwrap();
                     writeln!(writer, "         mc regs                   — show MC control registers").unwrap();
+                    writeln!(writer, "         mc vdma <on|off>          — log VDMA transactions to vdma.log").unwrap();
                 }
             }
             "eeprom" => {

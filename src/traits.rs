@@ -80,6 +80,16 @@ pub trait BusDevice: Send + Sync {
     fn read64 (&self, _addr: u32) -> BusRead64 { BusRead64::err() }
     fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
 
+    /// 64-bit access issued by a DMA engine (e.g. MC's VDMA), as opposed to
+    /// CPU-driven PIO. Defaults to plain `read64`/`write64` — most devices don't
+    /// distinguish. A device whose PIO protocol has GO-triggered side effects
+    /// (REX3's HOSTRW: a GO-space access both returns/consumes the current word
+    /// AND arms the next one) can override these to implement the DMA-specific
+    /// sequencing real hardware uses instead, without forcing every other
+    /// BusDevice to care about the distinction.
+    fn dma_read64 (&self, addr: u32) -> BusRead64 { self.read64(addr) }
+    fn dma_write64(&self, addr: u32, val: u64) -> u32 { self.write64(addr, val) }
+
     /// Return a pointer directly into the device's backing store at `addr`.
     /// `addr` must be 8-byte aligned. The pointer is valid for the lifetime of `&self`.
     /// Returns `None` for devices that do not support direct pointer access (default).
