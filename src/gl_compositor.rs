@@ -596,9 +596,8 @@ impl Compositor for GlCompositor {
                         height as i32,
                         glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelPackData::Slice(&mut []),
+                        glow::PixelPackData::BufferOffset(0),
                     );
-                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(*pbo));
                     let mapped = gl.map_buffer_range(
                         glow::PIXEL_PACK_BUFFER,
                         0,
