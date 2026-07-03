@@ -269,8 +269,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ComboBox::from_id_salt("machine_profile")
         .selected_text(cfg.machine.profile.label())
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut cfg.machine.profile, MachineProfile::IndyIp24, MachineProfile::IndyIp24.label());
-            ui.selectable_value(&mut cfg.machine.profile, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip22.label());
+            for p in MachineProfile::ALL {
+                ui.selectable_value(&mut cfg.machine.profile, p, p.label());
+            }
         });
     ui.label(
         RichText::new(
@@ -383,12 +384,7 @@ fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         ComboBox::from_id_salt("graphics_resolution")
             .selected_text(cfg.graphics.resolution.label())
             .show_ui(ui, |ui| {
-                for mode in [
-                    NewportResolution::Guest,
-                    NewportResolution::Res1024x768,
-                    NewportResolution::Res1280x960,
-                    NewportResolution::Res1280x1024,
-                ] {
+                for mode in NewportResolution::ALL {
                     ui.selectable_value(&mut cfg.graphics.resolution, mode, mode.label());
                 }
             });

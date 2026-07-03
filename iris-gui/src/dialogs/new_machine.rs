@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
-use iris::config::{MachineConfig, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::config::{MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::vc2_timings::NewportResolution;
 
 use crate::ram::RAM_PRESETS;
 
@@ -8,6 +9,10 @@ use crate::ram::RAM_PRESETS;
 pub struct NewMachineDialog {
     open: bool,
     pub name: String,
+    /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22).
+    pub profile: MachineProfile,
+    /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).
+    pub resolution: NewportResolution,
     pub prom_path: String,
     pub use_embedded_prom: bool,
     pub nvram_path: String,
@@ -32,6 +37,8 @@ impl Default for NewMachineDialog {
         Self {
             open: false,
             name: "indy".into(),
+            profile: MachineProfile::default(),
+            resolution: NewportResolution::default(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
             nvram_path: crate::settings::GuiSettings::default_nvram_path(),
@@ -74,13 +81,34 @@ impl NewMachineDialog {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(440.0);
-                ui.label(RichText::new("Configure a new SGI Indy emulation").strong());
+                ui.label(RichText::new("Configure a new SGI machine").strong());
                 ui.add_space(4.0);
 
                 Grid::new("new_machine_grid").num_columns(2).striped(true).show(ui, |ui| {
                     ui.label("Name");
                     ui.add(TextEdit::singleline(&mut self.name).desired_width(200.0));
                     ui.end_row();
+
+                    ui.label("Machine model");
+                    ComboBox::from_id_salt("nm_profile")
+                        .selected_text(self.profile.label())
+                        .show_ui(ui, |ui| {
+                            for p in MachineProfile::ALL {
+                                ui.selectable_value(&mut self.profile, p, p.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Display resolution");
+                    ComboBox::from_id_salt("nm_resolution")
+                        .selected_text(self.resolution.label())
+                        .show_ui(ui, |ui| {
+                            for mode in NewportResolution::ALL {
+                                ui.selectable_value(&mut self.resolution, mode, mode.label());
+                            }
+                        });
+                    ui.end_row();
+
                     ui.label("PROM image");
                     ui.horizontal(|ui| {
                         ui.add_enabled(!self.use_embedded_prom,
@@ -197,6 +225,8 @@ impl NewMachineDialog {
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         let mut cfg = MachineConfig::default();
+                        cfg.machine.profile = self.profile;
+                        cfg.graphics.resolution = self.resolution;
                         cfg.prom = if self.use_embedded_prom { String::new() } else { self.prom_path.clone() };
                         // Empty prom path makes Machine::new fall back to embedded
                         // (the load path warns + falls back when the file is missing).
