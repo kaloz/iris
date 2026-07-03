@@ -3481,6 +3481,14 @@ impl Rex3 {
                         e
                     };
                     if let Some(entry) = entry {
+                        // Mirror the interpreter's log_block() calls (see bottom of this
+                        // function) so block/span primitives are traced identically whether
+                        // dispatched via JIT or interpreter — block_debug/draw_debug were
+                        // previously silent for JIT-compiled GOs since this path returns
+                        // before ever reaching the interpreter's log_block() calls.
+                        if adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN {
+                            self.log_block(ctx, opcode);
+                        }
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }

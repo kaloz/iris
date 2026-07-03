@@ -737,6 +737,7 @@ fn emit_shader(
     }
     if is_hostw || is_hostr {
         b.append_block_param(loop_header, types::I64); // host_shifter
+        b.append_block_param(loop_header, types::I32); // hostcnt
     }
 
     // Initial values for loop entry
@@ -817,6 +818,19 @@ fn emit_shader(
         b.ins().iconst(types::I64, 0)
     };
 
+    // Mirrors Rex3Context::hostcnt: pixel slots still unfilled in the word
+    // currently being packed/consumed. Loaded fresh from ctx at shader entry
+    // (same persisted per-context state the interpreter reads/writes), so a
+    // primitive whose GOs are split across interpreter and JIT dispatch stays
+    // in sync. Reset to host_count at the start of a new word (loop_header,
+    // when the previous GO fully drained/filled its word), decremented once
+    // per pixel processed, written back to ctx.hostcnt at every exit.
+    let hostcnt_init: Value = if is_hostw || is_hostr {
+        ld32!(ctx_off!(hostcnt))
+    } else {
+        c0
+    };
+
     let mut init_args: Vec<Value> = vec![xstart_init, ystart_init, first_init];
     if dm0.shade() {
         let cr = ld32!(ctx_off!(colorred));
@@ -837,6 +851,7 @@ fn emit_shader(
     }
     if is_hostw || is_hostr {
         init_args.push(host_shifter_init);
+        init_args.push(hostcnt_init);
     }
 
     // Set mid_primitive = 1 before entering loop
@@ -884,10 +899,10 @@ fn emit_shader(
         let lsm = b.ins().iconst(types::I32, 0);
         (pb, lsm)
     };
-    let host_shifter_v: Value = if is_hostw || is_hostr {
-        let v = hp[param_idx]; param_idx += 1; v
+    let (host_shifter_v, hostcnt_v): (Value, Value) = if is_hostw || is_hostr {
+        let s = hp[param_idx]; let c = hp[param_idx+1]; param_idx += 2; (s, c)
     } else {
-        b.ins().iconst(types::I64, 0)
+        (b.ins().iconst(types::I64, 0), c0)
     };
     let _ = param_idx;
 
@@ -936,19 +951,21 @@ fn emit_shader(
         do_pixel
     };
 
-    // skip_block carries the updated host_shifter when in host mode.
+    // skip_block carries the updated host_shifter/hostcnt when in host mode.
     // This is necessary because clipped pixels still consume a host shifter slot
     // (fetch_host_pixel is called before calculate_fb_address in the interpreter).
     let pixel_block = b.create_block();
     let skip_block  = b.create_block();
     if is_hostw || is_hostr {
         b.append_block_param(skip_block, types::I64); // host_shifter (updated)
+        b.append_block_param(skip_block, types::I32); // hostcnt (updated)
     }
 
     // Branch: do_pixel is I1 (from bnot/icmp) or I8 constant 1.
-    // On skip (skipfirst/skiplast): host shifter is NOT advanced (proc_fn is not called).
+    // On skip (skipfirst/skiplast): host shifter/hostcnt are NOT advanced (proc_fn is not called).
+    let skip_init_args_buf: [Value; 2] = [host_shifter_v, hostcnt_v];
     let skip_init_args: &[Value] = if is_hostw || is_hostr {
-        std::slice::from_ref(&host_shifter_v)
+        &skip_init_args_buf[..]
     } else { &[] };
     b.ins().brif(do_pixel, pixel_block, &[], skip_block, skip_init_args);
 
@@ -973,13 +990,28 @@ fn emit_shader(
         (z, host_shifter_v)
     };
 
+    // hostcnt after consuming one slot: mirrors fetch_host_pixel/store_host_pixel
+    // (rex3.rs) — reload to host_count on a fresh word (hostcnt==0), then -1.
+    // Used at every "this pixel consumed a host word slot" jump into skip_block;
+    // sites that skip without consuming (skipfirst/skiplast, pattern-miss-not-
+    // opaque) pass hostcnt_v unchanged instead.
+    let hostcnt_after_consume: Value = if is_hostw || is_hostr {
+        let hc = dm1.host_count() as i64;
+        let host_count_c = b.ins().iconst(types::I32, hc);
+        let is_fresh = b.ins().icmp_imm(IntCC::Equal, hostcnt_v, 0);
+        let reloaded = b.ins().select(is_fresh, host_count_c, hostcnt_v);
+        b.ins().isub(reloaded, c1)
+    } else {
+        c0
+    };
+
     // Clip/pattern-skip: host pixel NOT consumed (pass un-fetched shifter).
-    let no_fetch_skip_args_buf: [Value; 1] = [host_shifter_v];
+    let no_fetch_skip_args_buf: [Value; 2] = [host_shifter_v, hostcnt_v];
     let clip_skip_args: &[Value] = if is_hostw || is_hostr {
         &no_fetch_skip_args_buf[..]
     } else { &[] };
-    // After a successful draw from host: pass the fetched (advanced) shifter.
-    let clip_skip_args_buf: [Value; 1] = [host_shifter_after_fetch];
+    // After a successful draw from host: pass the fetched (advanced) shifter/hostcnt.
+    let clip_skip_args_buf: [Value; 2] = [host_shifter_after_fetch, hostcnt_after_consume];
 
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
         &mut b, x_v, y_v, &pctx, skip_block, clip_skip_args, dm0, dm1, is_scr2scr,
@@ -1021,7 +1053,7 @@ fn emit_shader(
             emit_expand_ir(&mut b, masked, dm1.drawdepth())
         } else { masked };
         let new_s = emit_pack_host_pixel_ir(&mut b, host_shifter_after_fetch, expanded, dm1);
-        b.ins().jump(skip_block, &[new_s]);
+        b.ins().jump(skip_block, &[new_s, hostcnt_after_consume]);
         new_s // unreachable but satisfies type checker
     } else {
         // ── Source color ──────────────────────────────────────────────────────
@@ -1157,13 +1189,15 @@ fn emit_shader(
         };
 
         emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
-        // Advance the host shifter only when we drew from host, not from colorback.
-        let final_shifter: Value = if is_hostw && (dm0.colorhost() || dm0.alphahost()) {
-            b.ins().select(draw_use_bg_bool, no_fetch_skip_args_buf[0], host_shifter_after_fetch)
+        // Advance the host shifter/hostcnt only when we drew from host, not from colorback.
+        let (final_shifter, final_hostcnt): (Value, Value) = if is_hostw && (dm0.colorhost() || dm0.alphahost()) {
+            let s = b.ins().select(draw_use_bg_bool, no_fetch_skip_args_buf[0], host_shifter_after_fetch);
+            let c = b.ins().select(draw_use_bg_bool, hostcnt_v, hostcnt_after_consume);
+            (s, c)
         } else {
-            host_shifter_v
+            (host_shifter_v, hostcnt_v)
         };
-        let final_shifter_buf: [Value; 1] = [final_shifter];
+        let final_shifter_buf: [Value; 2] = [final_shifter, final_hostcnt];
         let skip_args_after_write: &[Value] = if is_hostw { &final_shifter_buf[..] } else { &[] };
         b.ins().jump(skip_block, skip_args_after_write);
         host_shifter_after_fetch
@@ -1174,11 +1208,12 @@ fn emit_shader(
     b.switch_to_block(skip_block);
     b.seal_block(skip_block);
 
-    // Extract updated host_shifter from skip_block param (carries through clip/skip paths).
-    let current_shifter: Value = if is_hostw || is_hostr {
-        b.block_params(skip_block).to_vec()[0]
+    // Extract updated host_shifter/hostcnt from skip_block params (carries through clip/skip paths).
+    let (current_shifter, current_hostcnt): (Value, Value) = if is_hostw || is_hostr {
+        let p = b.block_params(skip_block).to_vec();
+        (p[0], p[1])
     } else {
-        b.ins().iconst(types::I64, 0)
+        (b.ins().iconst(types::I64, 0), c0)
     };
 
     // Shade DDA step
@@ -1286,12 +1321,27 @@ fn emit_shader(
     let pat_bit_reset = b.ins().iconst(types::I8, 31);
     let zpat_bit_reset = b.ins().iconst(types::I8, 31);
 
-    // Host shifter resets at row boundary (host word spans one row, not across rows).
+    // Host shifter/hostcnt reset at row boundary (host word spans one row, not across rows).
     // For HOSTR at row end: emit send_host_word writeback then reset shifter.
-    // Since the loop runs exactly host_count pixels per GO call in host mode,
-    // row boundaries should only occur after a full word — shifter is already written back.
-    // We just reset current_shifter to 0 for the new row.
     let host_shifter_row_reset = b.ins().iconst(types::I64, 0);
+    let hostcnt_row_reset = c0;
+
+    // Row width isn't always a multiple of host_count, so a row can end mid-word
+    // (e.g. a 6px-wide row packed 4px/word needs a second word with only 2 valid
+    // pixels). Mirrors Rex3::flush_host_pixel: pad the accumulated shifter left by
+    // (unfilled slot count * host_shift) so the valid pixels land at the MSB end,
+    // matching how store_host_pixel packs LSB-to-MSB as each slot fills.
+    // current_hostcnt is exactly ctx.hostcnt's counterpart — unfilled slot count —
+    // so this reads the same way flush_host_pixel does, no extra derivation needed.
+    let flushed_shifter = |b: &mut FunctionBuilder, shifter: Value| -> Value {
+        let host_shift = dm1.host_shift();
+        if !is_hostr || host_count <= 1 || host_shift == 0 {
+            return shifter;
+        }
+        let unfilled64 = b.ins().uextend(types::I64, current_hostcnt);
+        let pad_bits = b.ins().imul_imm(unfilled64, host_shift as i64);
+        b.ins().ishl(shifter, pad_bits)
+    };
 
     if !stopony {
         // Span / block without stopony: primitive done after one row
@@ -1299,7 +1349,11 @@ fn emit_shader(
         st_bool!(ctx_off!(mid_primitive), zero8);
         // For HOSTR: flush accumulated shifter to ctx.hostrw before returning.
         if is_hostr {
-            emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            let padded = flushed_shifter(&mut b, current_shifter);
+            emit_store_hostrw(&mut b, ctx_ptr, &mem, padded, dm1);
+        }
+        if is_hostw || is_hostr {
+            b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
@@ -1318,7 +1372,11 @@ fn emit_shader(
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
         if is_hostr {
-            emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            let padded = flushed_shifter(&mut b, current_shifter);
+            emit_store_hostrw(&mut b, ctx_ptr, &mem, padded, dm1);
+        }
+        if is_hostw || is_hostr {
+            b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
@@ -1331,7 +1389,10 @@ fn emit_shader(
         if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
         if dm0.enzpattern() { back_args.push(zpat_bit_reset); }
         if dm0.enlspattern() { back_args.push(pat_bit_reset); back_args.push(new_lsmode); }
-        if is_hostw || is_hostr { back_args.push(host_shifter_row_reset); }
+        if is_hostw || is_hostr {
+            back_args.push(host_shifter_row_reset);
+            back_args.push(hostcnt_row_reset);
+        }
         b.ins().jump(loop_header, &back_args);
     }
 
@@ -1346,7 +1407,7 @@ fn emit_shader(
             if dm0.shade() { args.extend([new_cr, new_cg, new_cb, new_ca]); }
             if dm0.enzpattern() { args.push(new_zpat_bit); }
             if dm0.enlspattern() { args.push(new_pat_bit); args.push(new_lsmode); }
-            if is_hostw || is_hostr { args.push(current_shifter); }
+            if is_hostw || is_hostr { args.push(current_shifter); args.push(current_hostcnt); }
             args
         }};
     }
@@ -1390,7 +1451,12 @@ fn emit_shader(
 
             b.switch_to_block(stop_block); b.seal_block(stop_block);
             if is_hostr {
+                // host_xstop always triggers at a full word (host_count pixels
+                // packed) — current_hostcnt is 0 here, no flush padding needed.
                 emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            }
+            if is_hostw || is_hostr {
+                b.ins().store(mem, current_hostcnt, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
             }
             emit_writeback(&mut b, ctx_ptr, &mem, xstart_next, ystart_v,
                 dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);

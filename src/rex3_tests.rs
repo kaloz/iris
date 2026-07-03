@@ -3698,6 +3698,105 @@ mod jit_tests {
         assert_eq!(words_interp, words_jit,
             "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
     }
+
+    /// Multi-row HOSTR block with STOPONY *not* set — mirrors the real cursor
+    /// save/restore blit (IRIX login-screen text cursor): each row is its own
+    /// one-row primitive (no hardware row auto-advance), width wider than one
+    /// packed host word so each row takes 2 GOs, and — critically — the shader
+    /// compiles (interpreter fallback) partway through the sequence so later
+    /// rows dispatch via the freshly-compiled JIT entry while earlier rows ran
+    /// on the interpreter, exactly like the real async-compile timing.
+    ///
+    /// All existing jit_hostr_*/jit_hostw_* tests use DM0_STOPONXY (single GO,
+    /// full block in one shot) and never exercise this multi-GO, multi-row,
+    /// no-STOPONY shape — the gap that let this bug ship.
+    #[test]
+    fn jit_hostr_ci8_block_multirow_no_stopony() {
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_COLORHOST;
+        let dm1 = DM1_CI8_HOSTRW; // 8bpp packed, 4 pixels/word
+        let width = 6i32;  // 2 words/row (ceil(6/4))
+        let height = 3i32;
+        let words_per_row = 2usize;
+
+        // Fill a width x height region with distinct per-pixel values so any
+        // word/row misalignment shows up as a mismatch rather than coincidentally
+        // matching (e.g. an all-same-value fill would hide an off-by-one).
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = (0x10 + y * width + x) as u32;
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+        };
+
+        // Drive the exact GO sequence a row-at-a-time cursor blit uses: fresh
+        // XYSTARTI/XYENDI per row, DRAWMODE0 GO (no DOSETUP, no STOPONY) starts
+        // the row, then (words_per_row - 1) HOSTRW0 GO-space reads drain the
+        // rest of that row's words. ystart/xsave carry over via ctx state
+        // exactly as on real hardware — only the first row's registers are
+        // (re)written here since that's all the real driver does too (see
+        // rex3.log capture: XYSTARTI/XYENDI written once, then 40 bare GOs).
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut words = Vec::new();
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_XYENDI,   xy(width - 1, 0));
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            words.push(read_hostrw32_last(rex));
+            let total_words = words_per_row * height as usize;
+            for _ in 1..total_words {
+                words.push(read_hostrw32(rex));
+            }
+            words
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+
+        // JIT run: prime compilation with a throwaway pass over the same
+        // primitive shape first (separate region so it doesn't consume any
+        // of the words compared below), wait for it to land, then run the
+        // real comparison pass. Because compilation is requested from
+        // whatever GO first sees this (dm0, dm1, cm) key and happens on a
+        // background thread, the *real* emulator can and does have a
+        // primitive's later rows dispatch via JIT after its earlier rows
+        // already ran on the interpreter — this priming pass reproduces that
+        // "already compiled by the time the real primitive runs" end state
+        // without relying on racy mid-primitive timing.
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j); // throwaway: triggers compile request
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "CI8 HOSTR multirow (no STOPONY) JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
