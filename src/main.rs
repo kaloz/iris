@@ -133,6 +133,7 @@ fn print_build_features() {
         ("lightning", cfg!(feature = "lightning")),
         ("tlbvmap", cfg!(feature = "tlbvmap")),
         ("tlbstats", cfg!(feature = "tlbstats")),
+        ("instr_stats", cfg!(feature = "instr_stats")),
         ("chd", cfg!(feature = "chd")),
         ("camera", cfg!(feature = "camera")),
         ("pcap", cfg!(feature = "pcap")),

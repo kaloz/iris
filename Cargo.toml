@@ -28,6 +28,12 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
+# Per-instruction execution frequency counters (all ~205 MIPS III/IV opcodes),
+# printed at emulator exit with a MIPS III/IV usage rollup. Diagnostic only —
+# classifies every executed instruction via a match mirroring decode_into, so
+# it is intrusive on the hot path. Kept out of default builds. See
+# mips_instr_stats.rs.
+instr_stats = []
 # R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
 # Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
 r5k = []

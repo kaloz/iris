@@ -2484,6 +2484,117 @@ mod tests {
         assert_eq!(exec.core.read_fpr_d(8), 10.0); // 3*4 - 2 = 10
     }
 
+    // Covers the remaining MIPS IV COP1X fused ops not exercised by test_cop1x_madd
+    // (MADD.D, MSUB.S, NMADD.S/D, NMSUB.S/D) — fd = fs*ft +/- fr, negated for NMADD/NMSUB.
+    #[test]
+    fn test_cop1x_madd_remaining_variants() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        // MADD.D fd, fr, fs, ft: fd = fs*ft + fr
+        exec.core.write_fpr_d(1, 2.0); // fr
+        exec.core.write_fpr_d(2, 3.0); // fs
+        exec.core.write_fpr_d(3, 4.0); // ft
+        let madd_d = make_cop1x(1, 3, 2, 4, FUNCT_MADD_D);
+        assert_eq!(exec.exec(madd_d), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(4), 14.0); // 3*4 + 2 = 14
+
+        // MSUB.S fd, fr, fs, ft: fd = fs*ft - fr
+        exec.core.write_fpr_s(5, 2.0); // fr
+        exec.core.write_fpr_s(6, 3.0); // fs
+        exec.core.write_fpr_s(7, 4.0); // ft
+        let msub_s = make_cop1x(5, 7, 6, 8, FUNCT_MSUB_S);
+        assert_eq!(exec.exec(msub_s), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(8), 10.0); // 3*4 - 2 = 10
+
+        // NMADD.S fd, fr, fs, ft: fd = -(fs*ft + fr)
+        exec.core.write_fpr_s(9, 2.0);  // fr
+        exec.core.write_fpr_s(10, 3.0); // fs
+        exec.core.write_fpr_s(11, 4.0); // ft
+        let nmadd_s = make_cop1x(9, 11, 10, 12, FUNCT_NMADD_S);
+        assert_eq!(exec.exec(nmadd_s), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(12), -14.0); // -(3*4 + 2) = -14
+
+        // NMADD.D fd, fr, fs, ft: fd = -(fs*ft + fr)
+        exec.core.write_fpr_d(13, 2.0); // fr
+        exec.core.write_fpr_d(14, 3.0); // fs
+        exec.core.write_fpr_d(15, 4.0); // ft
+        let nmadd_d = make_cop1x(13, 15, 14, 16, FUNCT_NMADD_D);
+        assert_eq!(exec.exec(nmadd_d), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(16), -14.0); // -(3*4 + 2) = -14
+
+        // NMSUB.S fd, fr, fs, ft: fd = -(fs*ft - fr)
+        exec.core.write_fpr_s(17, 2.0); // fr
+        exec.core.write_fpr_s(18, 3.0); // fs
+        exec.core.write_fpr_s(19, 4.0); // ft
+        let nmsub_s = make_cop1x(17, 19, 18, 20, FUNCT_NMSUB_S);
+        assert_eq!(exec.exec(nmsub_s), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(20), -10.0); // -(3*4 - 2) = -10
+
+        // NMSUB.D fd, fr, fs, ft: fd = -(fs*ft - fr)
+        exec.core.write_fpr_d(21, 2.0); // fr
+        exec.core.write_fpr_d(22, 3.0); // fs
+        exec.core.write_fpr_d(23, 4.0); // ft
+        let nmsub_d = make_cop1x(21, 23, 22, 24, FUNCT_NMSUB_D);
+        assert_eq!(exec.exec(nmsub_d), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(24), -10.0); // -(3*4 - 2) = -10
+    }
+
+    // Covers SDXC1 (missing from test_cop1x_load_store, which only checks LWXC1/SWXC1/LDXC1)
+    // and PREFX (COP1X prefetch — architecturally a hint/no-op).
+    #[test]
+    fn test_cop1x_sdxc1_and_prefx() {
+        let (mut exec, mem) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        // SDXC1 fs, index(base): store doubleword FPR to base+index
+        exec.core.write_fpr_d(4, 1.0); // 0x3FF0000000000000
+        exec.core.write_gpr(5, 0x4000); // base
+        exec.core.write_gpr(6, 8);      // index
+
+        // SDXC1 f4, r6(r5) — rs=base(5), rt=index(6), rd=fs(4)
+        let sdxc1 = make_cop1x(5, 6, 4, 0, FUNCT_SDXC1);
+        assert_eq!(exec.exec(sdxc1), EXEC_COMPLETE);
+        assert_eq!(mem.get_double(0x4008), 0x3FF0000000000000);
+
+        // PREFX is a hint; must complete without side effects.
+        let prefx = make_cop1x(5, 6, 0, 0, FUNCT_PREFX);
+        assert_eq!(exec.exec(prefx), EXEC_COMPLETE);
+    }
+
+    // Covers LLD/SCD (64-bit load-linked/store-conditional), the MIPS III siblings
+    // of LL/SC that had no dedicated test.
+    #[test]
+    fn test_lld_scd() {
+        let (mut exec, mem) = create_executor();
+
+        let addr = 0x2000u64;
+        mem.set_double(addr, 0x0123456789ABCDEF);
+        exec.core.write_gpr(1, addr);
+
+        // LLD r2, 0(r1)
+        let instr_lld = make_i(OP_LLD, 1, 2, 0);
+        assert_eq!(exec.exec(instr_lld), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 0x0123456789ABCDEF);
+        assert!(exec.cache.get_llbit());
+
+        // SCD r2, 0(r1) — should succeed
+        exec.core.write_gpr(2, 0xFEDCBA9876543210);
+        let instr_scd = make_i(OP_SCD, 1, 2, 0);
+        assert_eq!(exec.exec(instr_scd), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 1); // Success
+        assert_eq!(mem.get_double(addr), 0xFEDCBA9876543210);
+        assert!(!exec.cache.get_llbit()); // Cleared
+
+        // SCD fail case (LLBit clear from prior successful store)
+        exec.core.write_gpr(2, 0xAAAAAAAAAAAAAAAA);
+        assert_eq!(exec.exec(instr_scd), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 0); // Fail
+        assert_eq!(mem.get_double(addr), 0xFEDCBA9876543210); // Memory unchanged
+    }
+
     #[test]
     fn test_movci() {
         let (mut exec, _) = create_executor();

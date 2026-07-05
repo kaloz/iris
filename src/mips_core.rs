@@ -342,6 +342,12 @@ impl MipsCore {
             self.fpu_fexr = 0;
             self.fpu_fenr = 0;
             self.fpu_fcsr = 0;
+            // Sync host FPU rounding mode to match (RM=0=RN). Without this the
+            // host thread's rounding mode is left at whatever it was before
+            // reset — usually RN by platform default, but not guaranteed, and
+            // it would otherwise silently desync from the software-tracked
+            // fpu_fcsr until the next CTC1 write.
+            crate::platform::set_fpu_mode(0);
         }
 
         self.pc = 0xFFFFFFFF_BFC00000; // Reset vector in KSEG1 (uncached, sign-extended)

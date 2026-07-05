@@ -652,6 +652,9 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub fpr_write_w: fn(&mut MipsCore, u32, u32),
     /// Cached external interrupt word — reloaded every 16 instructions.
     pub(crate) cached_pending: u64,
+    /// Per-instruction execution frequency counters (feature = "instr_stats").
+    #[cfg(feature = "instr_stats")]
+    pub instr_stats: crate::mips_instr_stats::InstrStats,
 }
 
 // ---- translate_fn slow-path wrappers (one per privilege × addressing-mode combination) ------
@@ -826,6 +829,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             fpr_read_w:  crate::mips_core::read_fpr_w_fr0,
             fpr_write_w: crate::mips_core::write_fpr_w_fr0,
             cached_pending: 0,
+            #[cfg(feature = "instr_stats")]
+            instr_stats: crate::mips_instr_stats::InstrStats::default(),
         };
 
         executor.rebind_atomic_ptrs();
@@ -1225,6 +1230,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let symbols = self.symbols.lock();
         let sym_str = format_pc_symbol(self.core.pc, &symbols);
         dlog_dev!(LogModule::Mips, "Reserved instruction at {:016x}{}: {:08x} {}", self.core.pc, sym_str, d.raw, mips_dis::disassemble(d.raw, self.core.pc, Some(&symbols)));
+        #[cfg(feature = "instr_stats")]
+        eprintln!("[instr_stats] Reserved/illegal instruction at {:016x}{}: {:08x} {}",
+            self.core.pc, sym_str, d.raw, mips_dis::disassemble(d.raw, self.core.pc, Some(&symbols)));
         exec_exception(EXC_RI)
     }
 
@@ -4322,6 +4330,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.fpu_fexr = snapshot.fpu_fexr;
         self.core.fpu_fenr = snapshot.fpu_fenr;
         self.core.fpu_fcsr = snapshot.fpu_fcsr;
+        // Sync host FPU rounding mode to the restored FCSR.RM — this bypasses
+        // write_fpu_control (which is what normally keeps the two in sync via
+        // CTC1), so without this the host rounding mode stays whatever it was
+        // before the restore instead of matching the snapshotted guest state.
+        crate::platform::set_fpu_mode((snapshot.fpu_fcsr & 0x3) as u8);
         self.core.running = snapshot.running;
         self.core.halted = snapshot.halted;
         self.in_delay_slot = snapshot.in_delay_slot;
@@ -4357,6 +4370,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// Execute the given decoded instruction.
     #[inline(always)]
     pub fn exec_decoded(&mut self, d: &DecodedInstr) -> ExecStatus {
+        #[cfg(feature = "instr_stats")]
+        self.instr_stats.record(d.op, d.rs, d.rt, d.funct, d.raw);
+
         type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
         let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
         let status = f(self, d);
@@ -4849,6 +4865,13 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
         let task = move || {
             let mut exec = executor.lock();
+
+            // Same reasoning as MipsCpu::start(): this closure runs on its own
+            // fresh OS thread ("MIPS-Debug"), so the host FPU rounding mode
+            // needs to be re-synced from the guest's tracked FCSR.RM rather
+            // than assuming the platform default matches.
+            crate::platform::set_fpu_mode((exec.core.fpu_fcsr & 0x3) as u8);
+
             if !wait {
                 let _ = writeln!(writer, "Running...");
             }
@@ -5162,6 +5185,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         }
         #[cfg(feature = "tlbstats")]
         self.executor.lock().tlb.stats_print();
+        #[cfg(feature = "instr_stats")]
+        self.executor.lock().instr_stats.print();
         #[cfg(feature = "developer_ip7")]
         {
             let map = &self.executor.lock().core.compare_delta_stats;
@@ -5189,6 +5214,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             let mut guard = executor.lock();
+
+            // A freshly spawned OS thread has its own host FPU rounding-mode
+            // state, independent of whatever thread ran the CPU previously —
+            // sync it to the guest's tracked FCSR.RM now rather than relying
+            // on the platform default happening to match (usually RN, but not
+            // guaranteed, and silently wrong if the guest had set a non-RN mode
+            // before the CPU was last stopped).
+            crate::platform::set_fpu_mode((guard.core.fpu_fcsr & 0x3) as u8);
 
             #[cfg(feature = "jit")]
             {
@@ -5341,6 +5374,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
             ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
+            #[cfg(feature = "instr_stats")]
+            ("instrstats".to_string(), "Per-instruction execution frequency counters: instrstats [report|clear] [DEV]".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
@@ -6259,6 +6294,22 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         exec.idle_profile_report(count, &mut writer);
                     }
                     _ => return Err("Usage: idleprof <on | off | report [count]>".to_string()),
+                }
+                Ok(())
+            }
+            #[cfg(feature = "instr_stats")]
+            "instrstats" => {
+                let sub = actual_args.first().copied().unwrap_or("report");
+                let mut exec = self.try_lock_executor()?;
+                match sub {
+                    "report" => {
+                        let _ = exec.instr_stats.write_report(&mut writer);
+                    }
+                    "clear" => {
+                        exec.instr_stats.clear();
+                        writeln!(writer, "instrstats: counters cleared").unwrap();
+                    }
+                    _ => return Err("Usage: instrstats [report | clear]".to_string()),
                 }
                 Ok(())
             }

@@ -46,6 +46,8 @@ pub mod mips_tlb;
 pub mod mips_cache_v2;
 pub mod mips_exec;
 pub mod mips_exec_test;
+#[cfg(feature = "instr_stats")]
+pub mod mips_instr_stats;
 pub mod mem;
 pub mod mc;
 pub mod machine;
