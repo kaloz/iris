@@ -863,12 +863,32 @@ pub fn write_fpr_w_fr1(core: &mut MipsCore, reg: u32, v: u32)  { core.write_fpr_
 
 impl MipsCore {
 
+    /// Pack condition codes cc0..cc7 out of FCSR into an 8-bit FCCR-style value
+    /// (bit i = cc_i): FCSR bit 23 = cc0, bits [31:25] = cc1..cc7.
+    #[inline]
+    fn fccr_from_fcsr(fcsr: u32) -> u32 {
+        let cc0 = (fcsr >> 23) & 1;
+        let cc1_7 = (fcsr >> 25) & 0x7F; // bits 25..31 -> cc1..cc7
+        cc0 | (cc1_7 << 1)
+    }
+
+    /// Scatter an 8-bit FCCR-style value (bit i = cc_i) back into FCSR's
+    /// condition-code bits (bit 23 = cc0, bits [31:25] = cc1..cc7).
+    #[inline]
+    fn fcsr_with_fccr(fcsr: u32, fccr: u32) -> u32 {
+        let cc0 = fccr & 1;
+        let cc1_7 = (fccr >> 1) & 0x7F;
+        (fcsr & !((1 << 23) | (0x7F << 25)))
+            | (cc0 << 23)
+            | (cc1_7 << 25)
+    }
+
     /// Read FPU control register
     #[inline]
     pub fn read_fpu_control(&self, reg: u32) -> u32 {
         match reg {
             0 => self.fpu_fir,
-            25 => self.fpu_fccr,
+            25 => Self::fccr_from_fcsr(self.fpu_fcsr),
             26 => self.fpu_fexr,
             28 => self.fpu_fenr,
             31 => self.fpu_fcsr,
@@ -883,20 +903,13 @@ impl MipsCore {
             0 => { /* FIR is read-only */ }
             25 => {
                 self.fpu_fccr = value & 0xFF;
-                // Sync CC0 to FCSR bit 23
-                if (self.fpu_fccr & 1) != 0 {
-                    self.fpu_fcsr |= 1 << 23;
-                } else {
-                    self.fpu_fcsr &= !(1 << 23);
-                }
+                self.fpu_fcsr = Self::fcsr_with_fccr(self.fpu_fcsr, self.fpu_fccr);
             }
             26 => self.fpu_fexr = value,
             28 => self.fpu_fenr = value,
             31 => {
                 self.fpu_fcsr = value;
-                // Sync FCSR bit 23 to FCCR bit 0
-                let cc0 = (value >> 23) & 1;
-                self.fpu_fccr = (self.fpu_fccr & !1) | cc0;
+                self.fpu_fccr = Self::fccr_from_fcsr(value);
 
                 // Update host FPU rounding mode to match
                 let rm = value & 0x3;
@@ -906,35 +919,24 @@ impl MipsCore {
         }
     }
 
-    /// Get FPU condition code bit (default: CC0, bit 23 of FCSR)
+    /// Get FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
     #[inline]
     pub fn get_fpu_cc(&self, cc: u32) -> bool {
-        if cc < 8 {
-            (self.fpu_fccr >> cc) & 1 != 0
-        } else {
-            false
-        }
+        let bit = if cc == 0 { 23 } else if cc < 8 { 24 + cc } else { return false; };
+        (self.fpu_fcsr >> bit) & 1 != 0
     }
 
-    /// Set FPU condition code bit (default: CC0, bit 23 of FCSR)
+    /// Set FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
     #[inline]
     pub fn set_fpu_cc(&mut self, cc: u32, value: bool) {
-        if cc < 8 {
-            if value {
-                self.fpu_fccr |= 1 << cc;
-            } else {
-                self.fpu_fccr &= !(1 << cc);
-            }
-
-            // Sync CC0 to FCSR bit 23
-            if cc == 0 {
-                if value {
-                    self.fpu_fcsr |= 1 << 23;
-                } else {
-                    self.fpu_fcsr &= !(1 << 23);
-                }
-            }
+        if cc >= 8 { return; }
+        let bit = if cc == 0 { 23 } else { 24 + cc };
+        if value {
+            self.fpu_fcsr |= 1 << bit;
+        } else {
+            self.fpu_fcsr &= !(1 << bit);
         }
+        self.fpu_fccr = Self::fccr_from_fcsr(self.fpu_fcsr);
     }
 }
 

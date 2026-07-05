@@ -2782,6 +2782,61 @@ mod tests {
     }
 
     #[test]
+    fn test_fpu_cc1_7_visible_via_fcsr_readback() {
+        // Regression test: cc1..cc7 (FCSR bits 25..31) must be readable via a plain
+        // `cfc1 $rt, $31` (FCSR), not just via get_fpu_cc()/BC1. Before this was fixed,
+        // c.cond.fmt with a non-zero cc field only updated a side `fpu_fccr` cache and
+        // synced cc0 into FCSR bit 23, silently dropping cc1..cc7 from FCSR itself --
+        // so guest code doing `c.lt.d $fcc2, ...; cfc1 $t0, $31; andi $t0, 1<<27` would
+        // always see 0 for that condition, regardless of the actual compare result.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        for cc in 0u32..8 {
+            exec.core.set_fpu_cc(cc, true);
+            let expected_bit = if cc == 0 { 23 } else { 24 + cc };
+
+            let cfc1_instr = make_cop1_move(RS_CFC1, 10, 31);
+            assert_eq!(exec.exec(cfc1_instr), EXEC_COMPLETE);
+            let fcsr = exec.core.read_gpr(10) as u32;
+            assert_eq!((fcsr >> expected_bit) & 1, 1, "cc{cc} not visible in FCSR readback");
+
+            exec.core.set_fpu_cc(cc, false);
+            assert_eq!(exec.core.read_fpu_control(31) >> expected_bit & 1, 0);
+        }
+
+        // Multiple cc bits set simultaneously must all coexist in one FCSR read.
+        exec.core.set_fpu_cc(0, true);
+        exec.core.set_fpu_cc(2, true);
+        exec.core.set_fpu_cc(7, true);
+        let fcsr = exec.core.read_fpu_control(31);
+        assert_eq!((fcsr >> 23) & 1, 1, "cc0");
+        assert_eq!((fcsr >> 26) & 1, 1, "cc2");
+        assert_eq!((fcsr >> 31) & 1, 1, "cc7");
+        assert_eq!(exec.core.get_fpu_cc(1), false);
+        assert_eq!(exec.core.get_fpu_cc(3), false);
+
+        // Writing FCSR directly (ctc1 $31) must also make cc1..cc7 visible to
+        // get_fpu_cc()/BC1, not just cc0.
+        exec.core.write_gpr(11, (1u64 << 23) | (1u64 << 30)); // cc0 and cc6
+        let ctc1_instr = make_cop1_move(RS_CTC1, 11, 31);
+        assert_eq!(exec.exec(ctc1_instr), EXEC_COMPLETE);
+        assert!(exec.core.get_fpu_cc(0));
+        assert!(exec.core.get_fpu_cc(6));
+        assert!(!exec.core.get_fpu_cc(2));
+
+        // FCCR (control reg 25) must round-trip the same 8 condition bits as FCSR.
+        let fccr = exec.core.read_fpu_control(25);
+        assert_eq!(fccr & 0x1, 1, "FCCR cc0");
+        assert_eq!((fccr >> 6) & 0x1, 1, "FCCR cc6");
+        exec.core.write_fpu_control(25, 0xFF);
+        for cc in 0u32..8 {
+            assert!(exec.core.get_fpu_cc(cc), "cc{cc} should be set after FCCR write");
+        }
+    }
+
+    #[test]
     fn test_r4000cache_step_sequence() {
         // Exercise the full R4000Cache path: kseg0 fetch → L2 fill → L1I fill → exec_decoded.
         // PC 0x80000000 → phys 0x00000000 (kseg0, cacheable).
