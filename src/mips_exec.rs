@@ -396,6 +396,20 @@ pub type ExecStatus = u32;
 /// Actual type: fn(&mut MipsExecutor<T,C>, &DecodedInstr) -> ExecStatus
 pub type RawInstrFn = usize;
 
+/// `DecodedInstr.flags` bit 0: 0 = decoded, 1 = needs (re)decode.
+/// Named so `flags == 0` reads naturally as "decoded, nothing else going on" —
+/// the resting state for the overwhelming majority of instructions.
+pub const FLAG_NOT_DECODED: u8 = 1 << 0;
+/// `DecodedInstr.flags` bit 1: input-only, set by the cache fetch path (never
+/// stored) before calling `decode_into` to mean "imm currently holds the raw
+/// opcode word of the delay-slot instruction from the same L1I line, not the
+/// usual pre-processed immediate". `decode_into` consumes this once — for a
+/// fusable branch/jump opcode it inspects the word to pick a `_nop` handler
+/// variant when it's a literal NOP (0x0), then always overwrites `imm` with
+/// the real immediate and clears this bit before returning. `imm` holds the
+/// normal pre-processed immediate at rest; this bit is never true afterward.
+pub const FLAG_IMM_IS_NEXT: u8 = 1 << 1;
+
 /// Pre-decoded MIPS instruction. All fields extracted from raw word at decode time.
 /// Non-generic, suitable for storage in L1I cache lines.
 pub struct DecodedInstr {
@@ -407,9 +421,15 @@ pub struct DecodedInstr {
     ///   all other imm ops:  imm16 sign-extended as i16 as i32 as u32
     ///   R-type / no-imm:    0
     /// Getters immi64()/imms64() widen to u64/i64 on the fly.
+    /// See FLAG_IMM_IS_NEXT for the transient decode-time exception.
     pub imm:     u32,
     pub raw:     u32,
-    pub decoded: bool,
+    /// See FLAG_NOT_DECODED / FLAG_IMM_IS_NEXT. Kept as a single byte (rather
+    /// than a bool plus a separate Option<u32>) so DecodedInstr stays 24 bytes —
+    /// Option<u32> can't be niche-packed and would grow this struct to 32 bytes,
+    /// which measurably regressed whetstone/dhrystone by bloating the L2
+    /// decoded-instruction array and halving its cache-line packing.
+    pub flags:   u8,
     pub op:      u8,                // bits [31:26]
     pub rs:      u8,                // bits [25:21]  (also: base for loads/stores, fs for FPU)
     pub rt:      u8,                // bits [20:16]  (also: ft for FPU)
@@ -461,7 +481,7 @@ impl Default for DecodedInstr {
     fn default() -> Self {
         Self {
             raw:     0,
-            decoded: false,
+            flags:   FLAG_NOT_DECODED,
             op:      0,
             rs:      0,
             rt:      0,
@@ -479,7 +499,12 @@ pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // normal completio
 pub const EXEC_COMPLETE_NO_INC:    ExecStatus = 0x0000_0080; // completion, PC already set (no increment)
 pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry same instr
 pub const EXEC_BRANCH_DELAY:       ExecStatus = 0x0000_0200; // branch taken; target in delay_slot_target
+// Both "branch likely not taken" and "fused 2-instruction straight-line
+// sequence complete" (e.g. LUI+ORI/ADDIU load32) mean exactly the same thing
+// at dispatch time: PC += 8, nothing else. Kept as one constant with two names
+// so each call site reads clearly for its own context.
 pub const EXEC_BRANCH_LIKELY_SKIP: ExecStatus = 0x0000_0400; // branch likely not taken, skip delay slot
+pub const EXEC_COMPLETE_SKIP8:     ExecStatus = EXEC_BRANCH_LIKELY_SKIP; // completion, PC+=8 (fused straight-line sequence)
 pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
 
 // Exception flags
@@ -950,7 +975,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// Execute a single instruction (decode into scratch, then execute).
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         self.ins.raw = instr;
-        self.ins.decoded = false;
+        self.ins.flags = FLAG_NOT_DECODED;
         decode_into::<T, C>(&mut self.ins);
         let d: *const DecodedInstr = &self.ins;
         self.exec_decoded(unsafe { &*d })
@@ -1057,7 +1082,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             {
                 let slot = fetch.instr as *mut DecodedInstr;
                 let d = unsafe { &mut *slot };
-                if !d.decoded {
+                if d.flags != 0 {
                     decode_into::<T, C>(d);
                 } else {
                     #[cfg(feature = "developer")]
@@ -1119,7 +1144,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         {
             let slot = fetch.instr as *mut DecodedInstr;
             let d = unsafe { &mut *slot };
-            if !d.decoded { decode_into::<T, C>(d); }
+            if d.flags != 0 { decode_into::<T, C>(d); }
         }
         self.exec_decoded(unsafe { &*fetch.instr })
     }
@@ -1686,7 +1711,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.uncached_fetch_count.fetch_add(1, Ordering::Relaxed);
             let r = self.sysad.read32(phys_addr);
             if r.is_ok() {
-                if self.ins.raw != r.data { self.ins.decoded = false; }
+                self.ins.flags = FLAG_NOT_DECODED;
                 self.ins.raw = r.data;
                 FetchInstrResult::hit(&self.ins as *const DecodedInstr)
             } else {
@@ -2007,6 +2032,22 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let target = self.core.read_gpr(d.rs as u32);
         self.branch_delay(target)
     }
+
+    // JR fused with a NOP delay slot — unconditional, so always PC=target directly.
+    // If THIS JR is itself executing from inside another branch's delay slot
+    // (unusual but legal), it can't skip its own delay slot too — a delay slot
+    // is exactly one instruction, so the "fused" NOP would actually be the real
+    // next instruction after this JR's own target. Fall back to plain
+    // (unfused) behavior so that NOP is fetched/executed normally.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_jr_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let target = self.core.read_gpr(d.rs as u32);
+        if self.in_delay_slot {
+            return self.branch_delay(target);
+        }
+        self.core.pc = target;
+        EXEC_COMPLETE_NO_INC
+    }
     fn exec_jalr(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = self.core.read_gpr(d.rs as u32);
         let rd_reg = d.rd as u32;
@@ -2162,6 +2203,105 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.write_gpr(rd_reg, rs_val.wrapping_sub(rt_val) as i32 as i64 as u64);
         EXEC_COMPLETE
     }
+
+    // ADDU fused with an immediately-following load/store that uses ADDU's
+    // destination as its base register (see is_fusable_load_store). `d.imm`
+    // holds the load/store's raw word untouched (decode_into leaves it there
+    // instead of the usual pre-processed immediate). Neither ADDU nor the
+    // fusable load/store opcode set can fault on the arithmetic itself, so the
+    // only hazard is the load/store's OWN fault path (TLB miss, bus error) and
+    // the delay-slot case — both handled by exec_fused_addr_load_store_tail.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_addu_ls(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let rs_val = self.core.read_gpr(d.rs as u32) as u32;
+        let rt_val = self.core.read_gpr(d.rt as u32) as u32;
+        let rd_reg = d.rd as u32;
+        let addr = rs_val.wrapping_add(rt_val) as i32 as i64 as u64;
+        self.core.write_gpr(rd_reg, addr);
+        self.exec_fused_addr_load_store_tail(addr, d.imm)
+    }
+
+    // SUBU fused with an immediately-following load/store — see exec_addu_ls.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_subu_ls(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let rs_val = self.core.read_gpr(d.rs as u32) as u32;
+        let rt_val = self.core.read_gpr(d.rt as u32) as u32;
+        let rd_reg = d.rd as u32;
+        let addr = rs_val.wrapping_sub(rt_val) as i32 as i64 as u64;
+        self.core.write_gpr(rd_reg, addr);
+        self.exec_fused_addr_load_store_tail(addr, d.imm)
+    }
+
+    /// Shared tail for exec_addu_ls/exec_subu_ls/exec_addiu_ls: `addr` is the
+    /// address-calc result (already written to its register by the caller);
+    /// `next_raw` is the fusable load/store's raw word (from `d.imm`).
+    ///
+    /// If this fused pair is itself executing from inside another branch's
+    /// delay slot, it can't also skip straight to the load/store — a delay
+    /// slot is exactly one instruction, so the "fused" load/store is really
+    /// the actual next instruction after the branch target, not part of this
+    /// one. Bail to plain (unfused) completion so the load/store gets
+    /// fetched/decoded/executed normally once PC lands on delay_slot_target
+    /// (mirroring exec_lui_imm32/exec_jr_nop's same fallback).
+    ///
+    /// Otherwise: advance PC by 4 ourselves (for the address-calc instruction)
+    /// BEFORE running the load/store, so that if it faults, handle_exception's
+    /// self.core.pc-based cp0_epc computation blames the load/store's own
+    /// address, not the address-calc instruction's — exactly matching what
+    /// would happen if these were two separate, unfused instructions.
+    #[cfg(feature = "opcodefusion")]
+    #[inline(always)]
+    fn exec_fused_addr_load_store_tail(&mut self, addr: u64, next_raw: u32) -> ExecStatus {
+        if self.in_delay_slot {
+            return EXEC_COMPLETE;
+        }
+        self.core.pc = self.core.pc.wrapping_add(4);
+
+        let next_op = (next_raw >> 26) & 0x3F;
+        let rt_reg = (next_raw >> 16) & 0x1F;
+        let offset = (next_raw & 0xFFFF) as i16 as i64 as u64;
+        let virt_addr = addr.wrapping_add(offset);
+
+        let status = match next_op {
+            OP_LB => match self.read_data::<1>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v as i8 as i64 as u64); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_LBU => match self.read_data::<1>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_LH => match self.read_data::<2>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v as i16 as i64 as u64); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_LHU => match self.read_data::<2>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_LW => match self.read_data::<4>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v as i32 as i64 as u64); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_LD => match self.read_data::<8>(virt_addr) {
+                Ok(v) => { self.core.write_gpr(rt_reg, v); EXEC_COMPLETE }
+                Err(s) => s,
+            },
+            OP_SB => self.write_data::<1>(virt_addr, self.core.read_gpr(rt_reg)),
+            OP_SH => self.write_data::<2>(virt_addr, self.core.read_gpr(rt_reg)),
+            OP_SW => self.write_data::<4>(virt_addr, self.core.read_gpr(rt_reg)),
+            OP_SD => self.write_data::<8>(virt_addr, self.core.read_gpr(rt_reg)),
+            _ => unreachable!("is_fusable_load_store only allows the opcodes matched above"),
+        };
+        // PC was already advanced for the address-calc instruction above (and
+        // we know we're not in a delay slot, or we'd have bailed earlier), so
+        // on success exec_decoded's normal EXEC_COMPLETE fast path correctly
+        // adds the load/store's own PC+4 — no need to touch PC again here.
+        // On fault, `status` already carries the exception; handle_exception
+        // reads self.core.pc (already at the load/store's address) for cp0_epc.
+        status
+    }
+    
     fn exec_and(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
@@ -2362,12 +2502,37 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.branch_delay(target)
     }
 
+    // J fused with a NOP delay slot — unconditional, so always PC=target directly.
+    // See exec_jr_nop for why in_delay_slot must fall back to unfused behavior.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_j_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let target = ((self.core.pc + 4) & 0xFFFFFFFF_F0000000) | d.immi64();
+        if self.in_delay_slot {
+            return self.branch_delay(target);
+        }
+        self.core.pc = target;
+        EXEC_COMPLETE_NO_INC
+    }
+
     // JAL - Jump and Link
     // Unconditional jump, save return address in r31
     fn exec_jal(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = ((self.core.pc + 4) & 0xFFFFFFFF_F0000000) | d.immi64();
         self.core.write_gpr(31, self.core.pc + 8); // Return address (PC of delay slot + 4)
         self.branch_delay(target)
+    }
+
+    // JAL fused with a NOP delay slot — unconditional, so always PC=target directly.
+    // See exec_jr_nop for why in_delay_slot must fall back to unfused behavior.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_jal_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let target = ((self.core.pc + 4) & 0xFFFFFFFF_F0000000) | d.immi64();
+        self.core.write_gpr(31, self.core.pc + 8); // Return address (PC of delay slot + 4)
+        if self.in_delay_slot {
+            return self.branch_delay(target);
+        }
+        self.core.pc = target;
+        EXEC_COMPLETE_NO_INC
     }
 
     // BEQ - Branch on Equal
@@ -2382,6 +2547,30 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
     }
 
+    // BEQ fused with a NOP delay slot (see FLAG_IMM_IS_NEXT): the delay slot is
+    // never fetched/decoded/dispatched. Taken sets PC=target directly
+    // (EXEC_COMPLETE_NO_INC); not taken reuses EXEC_BRANCH_LIKELY_SKIP's PC+=8.
+    // If THIS branch is itself in another branch's delay slot (see
+    // exec_jr_nop), neither shortcut is safe — fall back to plain behavior so
+    // the "fused" NOP is fetched/executed normally as the real delay slot.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_beq_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let rs_val = self.core.read_gpr(d.rs as u32);
+        let rt_val = self.core.read_gpr(d.rt as u32);
+        if rs_val == rt_val {
+            let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
+            if self.in_delay_slot {
+                return self.branch_delay(target);
+            }
+            self.core.pc = target;
+            EXEC_COMPLETE_NO_INC
+        } else if self.in_delay_slot {
+            EXEC_COMPLETE
+        } else {
+            EXEC_BRANCH_LIKELY_SKIP
+        }
+    }
+
     // BNE - Branch on Not Equal
     fn exec_bne(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2391,6 +2580,25 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.branch_delay(target)
         } else {
             EXEC_COMPLETE
+        }
+    }
+
+    // BNE fused with a NOP delay slot — see exec_beq_nop.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_bne_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let rs_val = self.core.read_gpr(d.rs as u32);
+        let rt_val = self.core.read_gpr(d.rt as u32);
+        if rs_val != rt_val {
+            let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
+            if self.in_delay_slot {
+                return self.branch_delay(target);
+            }
+            self.core.pc = target;
+            EXEC_COMPLETE_NO_INC
+        } else if self.in_delay_slot {
+            EXEC_COMPLETE
+        } else {
+            EXEC_BRANCH_LIKELY_SKIP
         }
     }
 
@@ -2564,6 +2772,23 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         EXEC_COMPLETE
     }
 
+    // ADDIU fused with an immediately-following load/store that uses ADDIU's
+    // destination as its base register (see is_fusable_load_store). Unlike the
+    // R-type ADDU/SUBU fusions, `d.imm` here holds the load/store's raw word,
+    // NOT the usual sign-extended immediate (decode_into skips set_imm_se for
+    // this case) — so the ADDIU's own immediate is re-derived from d.raw's
+    // low 16 bits directly, same trick used by exec_lui_imm32's delay-slot
+    // fallback.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_addiu_ls(&mut self, d: &DecodedInstr) -> ExecStatus {
+        let rs_val = self.core.read_gpr(d.rs as u32) as u32;
+        let imm_val = (d.raw & 0xFFFF) as i16 as i32 as u32;
+        let rt_reg = d.rt as u32;
+        let addr = rs_val.wrapping_add(imm_val) as i32 as i64 as u64;
+        self.core.write_gpr(rt_reg, addr);
+        self.exec_fused_addr_load_store_tail(addr, d.imm)
+    }
+
     // DADDI - Doubleword Add Immediate (with overflow exception)
     fn exec_daddi(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
@@ -2629,6 +2854,47 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_lui(&mut self, d: &DecodedInstr) -> ExecStatus {
         self.core.write_gpr(d.rt as u32, d.immu64());
         EXEC_COMPLETE
+    }
+
+    // LUI fused with a same-register ORI the
+    // immediately-following instruction — the
+    // common 32-bit-immediate materialization idiom `lui rX,hi; ori rX,rX,lo`.
+    // decode_into has already verified next is ORI with rs==rt==this rt and
+    // pre-combined the result into `imm` (zero-extend combine: no carry, so
+    // decode-time combination is exact). Skips decoding/dispatching the ORI.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_lui_imm32(&mut self, d: &DecodedInstr) -> ExecStatus {
+        if self.in_delay_slot {
+            // This LUI is itself a delay-slot instruction: the fused ORI is NOT
+            // also in the delay slot (a delay slot is exactly one instruction) —
+            // it's really the instruction at/after the branch target. Treat this
+            // as plain unfused LUI so the ORI gets fetched and executed normally
+            // once PC lands on delay_slot_target; d.raw is still the original LUI
+            // word (only d.imm was repurposed for the fused combine).
+            self.core.write_gpr(d.rt as u32, ((d.raw & 0xFFFF) << 16) as i32 as i64 as u64);
+            return EXEC_COMPLETE;
+        }
+        self.core.write_gpr(d.rt as u32, d.immu64());
+        EXEC_COMPLETE_SKIP8
+    }
+
+    // LUI fused with a same-register ADDIU — `lui rX,hi; addiu rX,rX,lo`.
+    // Unlike ORI, ADDIU's sign-extending add can carry into bit 16 when lo16's
+    // sign bit is set, so decode_into pre-computes the actual wrapping-add
+    // result (matching exec_addiu's semantics exactly) rather than just OR-ing
+    // the halves together.
+    #[cfg(feature = "opcodefusion")]
+    fn exec_lui_simm32(&mut self, d: &DecodedInstr) -> ExecStatus {
+        if self.in_delay_slot {
+            // See exec_lui_imm32: this LUI is a delay-slot instruction, so the
+            // fused ADDIU is really the (unfused) instruction after the branch
+            // target — fall back to plain LUI semantics and let it be fetched
+            // and executed normally once PC lands on delay_slot_target.
+            self.core.write_gpr(d.rt as u32, ((d.raw & 0xFFFF) << 16) as i32 as i64 as u64);
+            return EXEC_COMPLETE;
+        }
+        self.core.write_gpr(d.rt as u32, d.immu64());
+        EXEC_COMPLETE_SKIP8
     }
 
     // Load/Store instructions (converted to use new interface)
@@ -4465,7 +4731,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 }
                 self.core.pc = self.core.pc.wrapping_add(4);
             }
-            EXEC_BRANCH_LIKELY_SKIP => {
+            EXEC_BRANCH_LIKELY_SKIP => { // == EXEC_COMPLETE_SKIP8
                 self.core.pc = self.core.pc.wrapping_add(8);
             }
             EXEC_COMPLETE_NO_INC => {
@@ -4483,7 +4749,37 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
 }
 
-/// Decode `raw` into `ins`. Caller is responsible for checking `ins.decoded` first.
+/// True if `next_raw` is one of the fusable load/store opcodes (LB/LBU/LH/LHU/
+/// LW/LD/SB/SH/SW/SD — see rules/perf/ notes on the addr-calc+load/store
+/// fusion) using `addr_reg` as its base register (`rs` field). Any offset is
+/// fine — the fused handler reads the load/store's own offset field exactly
+/// like the unfused path does; only ADDU/SUBU/ADDIU are fusable producers
+/// (ADD/SUB are excluded because they can themselves fault on overflow,
+/// which would need the same fault-exclusion treatment as the load/store
+/// itself and hasn't been built).
+#[cfg(feature = "opcodefusion")]
+#[inline(always)]
+fn is_fusable_load_store(next_raw: u32, addr_reg: u8) -> bool {
+    let next_op = (next_raw >> 26) & 0x3F;
+    let next_rs = (next_raw >> 21) & 0x1F;
+    if next_rs != addr_reg as u32 {
+        return false;
+    }
+    matches!(next_op,
+        OP_LB | OP_LBU | OP_LH | OP_LHU | OP_LW | OP_LD | OP_SB | OP_SH | OP_SW | OP_SD)
+}
+
+/// Decode `raw` into `ins`. Caller is responsible for checking `ins.flags` first.
+///
+/// If the caller sets FLAG_IMM_IS_NEXT beforehand, `ins.imm` is read here (once,
+/// before being overwritten below) as the raw opcode word of the delay-slot
+/// instruction from the same L1I line — used to fuse a branch/jump with a NOP
+/// delay slot (see FLAG_IMM_IS_NEXT doc comment). The bit and the borrowed
+/// `imm` slot are always consumed by the time this function returns. EXCEPTION:
+/// for a fusable ADDU/SUBU/ADDIU (see is_fusable_load_store), `imm` is instead
+/// left holding the load/store's raw word permanently (not transient) — the
+/// fused handler needs it at execution time to decode the load/store's own
+/// rt/offset fields.
 pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
     let raw = ins.raw;
 
@@ -4505,6 +4801,9 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             FUNCT_SLLV    => MipsExecutor::<T,C>::exec_sllv,
             FUNCT_SRLV    => MipsExecutor::<T,C>::exec_srlv,
             FUNCT_SRAV    => MipsExecutor::<T,C>::exec_srav,
+            #[cfg(feature = "opcodefusion")]
+            FUNCT_JR      => if ins.flags & FLAG_IMM_IS_NEXT != 0 && ins.imm == 0 { MipsExecutor::<T,C>::exec_jr_nop } else { MipsExecutor::<T,C>::exec_jr },
+            #[cfg(not(feature = "opcodefusion"))]
             FUNCT_JR      => MipsExecutor::<T,C>::exec_jr,
             FUNCT_JALR    => MipsExecutor::<T,C>::exec_jalr,
             FUNCT_MOVZ    => MipsExecutor::<T,C>::exec_movz,
@@ -4528,8 +4827,26 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             FUNCT_DDIV    => MipsExecutor::<T,C>::exec_ddiv,
             FUNCT_DDIVU   => MipsExecutor::<T,C>::exec_ddivu,
             FUNCT_ADD     => MipsExecutor::<T,C>::exec_add,
+            #[cfg(feature = "opcodefusion")]
+            FUNCT_ADDU    => {
+                if ins.flags & FLAG_IMM_IS_NEXT != 0 && is_fusable_load_store(ins.imm, rd) {
+                    MipsExecutor::<T,C>::exec_addu_ls
+                } else {
+                    MipsExecutor::<T,C>::exec_addu
+                }
+            }
+            #[cfg(not(feature = "opcodefusion"))]
             FUNCT_ADDU    => MipsExecutor::<T,C>::exec_addu,
             FUNCT_SUB     => MipsExecutor::<T,C>::exec_sub,
+            #[cfg(feature = "opcodefusion")]
+            FUNCT_SUBU    => {
+                if ins.flags & FLAG_IMM_IS_NEXT != 0 && is_fusable_load_store(ins.imm, rd) {
+                    MipsExecutor::<T,C>::exec_subu_ls
+                } else {
+                    MipsExecutor::<T,C>::exec_subu
+                }
+            }
+            #[cfg(not(feature = "opcodefusion"))]
             FUNCT_SUBU    => MipsExecutor::<T,C>::exec_subu,
             FUNCT_AND     => MipsExecutor::<T,C>::exec_and,
             FUNCT_OR      => MipsExecutor::<T,C>::exec_or,
@@ -4572,9 +4889,21 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             RT_BGEZALL => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_bgezall }
             _          => MipsExecutor::<T,C>::exec_reserved,
         },
+        #[cfg(feature = "opcodefusion")]
+        OP_J      => { let fuse = ins.flags & FLAG_IMM_IS_NEXT != 0 && ins.imm == 0; ins.set_imm_j(raw); if fuse { MipsExecutor::<T,C>::exec_j_nop } else { MipsExecutor::<T,C>::exec_j } }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_J      => { ins.set_imm_j(raw); MipsExecutor::<T,C>::exec_j }
+        #[cfg(feature = "opcodefusion")]
+        OP_JAL    => { let fuse = ins.flags & FLAG_IMM_IS_NEXT != 0 && ins.imm == 0; ins.set_imm_j(raw); if fuse { MipsExecutor::<T,C>::exec_jal_nop } else { MipsExecutor::<T,C>::exec_jal } }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_JAL    => { ins.set_imm_j(raw); MipsExecutor::<T,C>::exec_jal }
+        #[cfg(feature = "opcodefusion")]
+        OP_BEQ    => { let fuse = ins.flags & FLAG_IMM_IS_NEXT != 0 && ins.imm == 0; ins.set_imm_se4(raw); if fuse { MipsExecutor::<T,C>::exec_beq_nop } else { MipsExecutor::<T,C>::exec_beq } }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_BEQ    => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_beq }
+        #[cfg(feature = "opcodefusion")]
+        OP_BNE    => { let fuse = ins.flags & FLAG_IMM_IS_NEXT != 0 && ins.imm == 0; ins.set_imm_se4(raw); if fuse { MipsExecutor::<T,C>::exec_bne_nop } else { MipsExecutor::<T,C>::exec_bne } }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_BNE    => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_bne }
         OP_BLEZ   => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_blez }
         OP_BGTZ   => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_bgtz }
@@ -4583,6 +4912,18 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         OP_BLEZL  => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_blezl }
         OP_BGTZL  => { ins.set_imm_se4(raw); MipsExecutor::<T,C>::exec_bgtzl }
         OP_ADDI   => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_addi }
+        #[cfg(feature = "opcodefusion")]
+        OP_ADDIU  => {
+            if ins.flags & FLAG_IMM_IS_NEXT != 0 && is_fusable_load_store(ins.imm, rt) {
+                // imm stays as the load/store's raw word (see decode_into doc
+                // comment) — NOT overwritten with the sign-extended immediate.
+                MipsExecutor::<T,C>::exec_addiu_ls
+            } else {
+                ins.set_imm_se(raw);
+                MipsExecutor::<T,C>::exec_addiu
+            }
+        }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_ADDIU  => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_addiu }
         OP_DADDI  => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_daddi }
         OP_DADDIU => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_daddiu }
@@ -4591,6 +4932,43 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         OP_ANDI   => { ins.set_imm_ze(raw);               MipsExecutor::<T,C>::exec_andi }
         OP_ORI    => { ins.set_imm_ze(raw);               MipsExecutor::<T,C>::exec_ori }
         OP_XORI   => { ins.set_imm_ze(raw);               MipsExecutor::<T,C>::exec_xori }
+        #[cfg(feature = "opcodefusion")]
+        OP_LUI    => {
+            // Fuse the common 32-bit-immediate idiom `lui rX,hi; {ori,addiu} rX,rX,lo`
+            // into one handler call when the following word (from the same L1I
+            // line — see FLAG_IMM_IS_NEXT) is ORI/ADDIU with rs==rt==this rt.
+            // ORI can't carry (pure OR), so the decode-time combine is exact;
+            // ADDIU can carry when lo16's sign bit is set, so its combine must
+            // replicate exec_addiu's wrapping-add semantics exactly, not just OR.
+            let fused = if ins.flags & FLAG_IMM_IS_NEXT != 0 {
+                let next = ins.imm;
+                let next_op = (next >> 26) & 0x3F;
+                let next_rs = (next >> 21) & 0x1F;
+                let next_rt = (next >> 16) & 0x1F;
+                let same_reg = next_rs == rt as u32 && next_rt == rt as u32;
+                if same_reg && next_op == OP_ORI {
+                    let hi = (raw & 0xFFFF) << 16;
+                    let lo = next & 0xFFFF;
+                    Some((hi | lo, false))
+                } else if same_reg && next_op == OP_ADDIU {
+                    let hi = ((raw & 0xFFFF) << 16) as i32;
+                    let lo = (next & 0xFFFF) as i16 as i32;
+                    Some((hi.wrapping_add(lo) as u32, true))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match fused {
+                Some((combined, is_addiu)) => {
+                    ins.imm = combined;
+                    if is_addiu { MipsExecutor::<T,C>::exec_lui_simm32 } else { MipsExecutor::<T,C>::exec_lui_imm32 }
+                }
+                None => { ins.set_imm_lui(raw); MipsExecutor::<T,C>::exec_lui }
+            }
+        }
+        #[cfg(not(feature = "opcodefusion"))]
         OP_LUI    => { ins.set_imm_lui(raw); MipsExecutor::<T,C>::exec_lui }
         OP_COP0   => MipsExecutor::<T,C>::exec_cop0,
         OP_COP1 => match rs as u32 {
@@ -4724,7 +5102,7 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
     ins.sa      = sa;
     ins.funct   = funct;
     ins.handler = handler as usize;
-    ins.decoded = true;
+    ins.flags   = 0; // decoded; clears FLAG_IMM_IS_NEXT too (always consumed by now)
 }
 
 // Field extraction helpers have been replaced by DecodedInstr fields

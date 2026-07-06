@@ -3,7 +3,7 @@ mod tests {
     use std::sync::Mutex;
     use std::collections::HashMap;
     use crate::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
-    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
+    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_COMPLETE_SKIP8, EXEC_BREAKPOINT, EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
     use crate::mips_isa::*;
     use crate::mips_tlb::PassthroughTlb;
     use crate::mips_cache_v2::{PassthroughCache, MipsCache, R4000Cache};
@@ -2881,6 +2881,339 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2), 7);
         assert_eq!(exec.step(), EXEC_COMPLETE, "cache-hit ADDU r3,r1,r2");
         assert_eq!(exec.core.read_gpr(3), 49);
+    }
+
+    #[test]
+    fn test_decoded_instr_size() {
+        // DecodedInstr lives in the flat L2 decoded-instruction array (SIZE/4
+        // entries — hundreds of thousands at the default 1MB L2), so any growth
+        // here multiplies across the whole array and degrades cache-line packing
+        // for every fetch, not just branches. A prior attempt to add delay-slot
+        // fusion lookahead as `next: Option<u32>` grew this from 24 to 32 bytes
+        // (Option<u32> can't be niche-packed) and measurably regressed
+        // whetstone/dhrystone. The flags-byte + transient-imm design must not
+        // reintroduce that growth.
+        assert_eq!(std::mem::size_of::<DecodedInstr>(), 24, "DecodedInstr grew past its 24-byte budget");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_branch_nop_fusion() {
+        // Exercise the fused branch+NOP-delay-slot path (see FLAG_IMM_IS_NEXT):
+        // BEQ/BNE/JR taken through the real I-cache with a literal NOP in the
+        // delay slot must jump straight to the target in one step(), never
+        // setting in_delay_slot, and must still execute a normal instruction
+        // placed after the NOP when not taken.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+
+        // Offset 0:  BEQ r0, r0, +3 (always taken -> offset 0 + 4 + 3*4 = 16)
+        // Offset 4:  NOP (delay slot, fused away)
+        // Offset 8:  ADDIU r1, r0, 111  (must NOT execute — skipped by the branch)
+        // Offset 12: ADDIU r2, r0, 222  (must NOT execute)
+        // Offset 16: ADDIU r3, r0, 42   (branch target)
+        let beq_taken = make_i(OP_BEQ as u32, 0, 0, 3);
+        let nop = 0u32;
+        let addiu_r1 = make_i(OP_ADDIU as u32, 0, 1, 111);
+        let addiu_r2 = make_i(OP_ADDIU as u32, 0, 2, 222);
+        let addiu_r3 = make_i(OP_ADDIU as u32, 0, 3, 42);
+        mem.set_double(0,  ((beq_taken as u64) << 32) | nop as u64);
+        mem.set_double(8,  ((addiu_r1 as u64) << 32) | addiu_r2 as u64);
+        mem.set_double(16, ((addiu_r3 as u64) << 32) | nop as u64);
+
+        // Not-taken case lives in a separate 128-byte L2 line (offset 128+) so
+        // writing it doesn't mutate a line that's already been fetched/cached
+        // above — memory must be written before it's ever fetched, same as real
+        // hardware requires a cache flush for genuinely self-modifying code.
+        let bne_never = make_i(OP_BNE as u32, 0, 0, 3);
+        mem.set_double(128, ((bne_never as u64) << 32) | nop as u64);
+        mem.set_double(136, ((addiu_r1 as u64) << 32) | nop as u64);
+
+        // JR ra fused case in its own line too.
+        let jr_ra = make_r(OP_SPECIAL as u32, 31, 0, 0, 0, FUNCT_JR as u32);
+        mem.set_double(256, ((jr_ra as u64) << 32) | nop as u64);
+
+        exec.core.pc = pc_base;
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "fused taken BEQ should report EXEC_COMPLETE, not EXEC_BRANCH_DELAY");
+        assert_eq!(exec.core.pc, pc_base + 16, "PC should jump straight to branch target");
+        assert!(!exec.in_delay_slot, "fused path must never set in_delay_slot");
+
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "ADDIU r3,r0,42");
+        assert_eq!(exec.core.read_gpr(3), 42);
+        assert_eq!(exec.core.read_gpr(1), 0, "skipped ADDIU r1 must not have executed");
+        assert_eq!(exec.core.read_gpr(2), 0, "skipped ADDIU r2 must not have executed");
+
+        // Not-taken case: BNE r0,r0 (never taken) + NOP delay slot, then a real
+        // instruction right after — must execute (PC+=8 skip of branch+NOP only).
+        exec.core.pc = pc_base + 128;
+        exec.core.write_gpr(1, 0);
+        exec.step();
+        assert_eq!(exec.core.pc, pc_base + 136, "PC should skip branch+NOP (PC+=8)");
+        assert!(!exec.in_delay_slot);
+        assert_eq!(exec.step(), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(1), 111, "instruction after skipped NOP must execute");
+
+        // JR ra fused with NOP delay slot: unconditional, PC=target directly.
+        exec.core.pc = pc_base + 256;
+        exec.core.write_gpr(31, pc_base + 300);
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "fused JR should report EXEC_COMPLETE");
+        assert_eq!(exec.core.pc, pc_base + 300, "PC should jump straight to r31");
+        assert!(!exec.in_delay_slot);
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_branch_nop_fusion_self_modifying_delay_slot() {
+        // If the delay slot word is rewritten AFTER the branch has already been
+        // fetched/decoded once (picking the fused handler), the writeback path
+        // must mark the branch's slot FLAG_NOT_DECODED again — otherwise the
+        // cached fused handler pointer goes stale and the newly-written
+        // delay-slot instruction would be silently skipped forever.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+
+        let beq_taken = make_i(OP_BEQ as u32, 0, 0, 3);
+        let nop = 0u32;
+        let addiu_r3 = make_i(OP_ADDIU as u32, 0, 3, 42);
+        mem.set_double(0, ((beq_taken as u64) << 32) | nop as u64);
+        mem.set_double(16, ((addiu_r3 as u64) << 32) | nop as u64);
+
+        // First execution: decode-time fusion picks exec_beq_nop.
+        exec.core.pc = pc_base;
+        exec.step();
+        assert_eq!(exec.core.pc, pc_base + 16);
+        exec.step();
+        assert_eq!(exec.core.read_gpr(3), 42);
+
+        // Now overwrite the delay slot (offset 4) with a real instruction via the
+        // standard self-modifying-code idiom real guest code must use: SW, then
+        // CACHE Hit_Writeback_Invalidate (D) to push the store to L2, then CACHE
+        // Hit_Invalidate (I) so the next fetch re-reads L2 instead of a stale
+        // I-cache line. A raw backing-memory poke wouldn't be visible to the
+        // cache at all — this exercises the real invalidation path in
+        // writeback_l1d_line that syncs l2.instrs (and, via our fetch() change,
+        // recomputes `next` and forces a re-decode).
+        let addiu_r1 = make_i(OP_ADDIU as u32, 0, 1, 77);
+        exec.core.write_gpr(4, addiu_r1 as u64);
+        exec.core.write_gpr(5, pc_base);
+        let sw = make_i(OP_SW, 5, 4, 4); // SW r4, 4(r5)
+        assert_eq!(exec.exec(sw), EXEC_COMPLETE);
+        let cache_hwbinv_d = make_i(OP_CACHE, 5, C_HWBINV | CACH_PD, 4);
+        assert_eq!(exec.exec(cache_hwbinv_d), EXEC_COMPLETE);
+        let cache_hinv_i = make_i(OP_CACHE, 5, C_HINV | CACH_PI, 4);
+        assert_eq!(exec.exec(cache_hinv_i), EXEC_COMPLETE);
+
+        exec.core.pc = pc_base;
+        exec.core.write_gpr(1, 0);
+        exec.core.write_gpr(3, 0);
+        let s = exec.step();
+        assert_eq!(s, EXEC_BRANCH_DELAY, "must re-decode as unfused branch once delay slot is no longer a NOP");
+        assert_eq!(exec.delay_slot_target, pc_base + 16);
+        let s2 = exec.step();
+        assert_eq!(s2, EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(1), 77, "rewritten delay-slot instruction must execute, not be skipped");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_lui_ori_addiu_fusion() {
+        // LUI+ORI and LUI+ADDIU are the standard 32-bit-immediate materialization
+        // idiom (`lui rX,hi; {ori,addiu} rX,rX,lo`) and should fuse into a single
+        // handler call (exec_lui_imm32 / exec_lui_simm32) when the second
+        // instruction is same-register. Neither ORI nor ADDIU can fault, so
+        // there's no exception-exclusion concern like with branch delay slots.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+
+        // All instruction words are written before the first fetch touches this
+        // L2 line — writing to `mem` after a line is cached doesn't invalidate
+        // it (that's what real self-modifying code needs an explicit CACHE flush
+        // for; see test_branch_nop_fusion_self_modifying_delay_slot), so every
+        // word this test depends on must be in place up front.
+        //
+        // Offset 0:  LUI v1, 0xa874 ; ORI v1, v1, 0x74f0 (no carry: bit15 of lo
+        //            set, but ORI never carries — just verifies OR-combine).
+        // Offset 8:  LUI v0, 0x1234 ; ADDIU v0, v0, 0x5678 (lo16 bit15 clear: no carry).
+        // Offset 16: LUI v0, 0x1234 ; ADDIU v0, v0, 0xFFFF (lo16 = -1: carries,
+        //            borrowing 1 from the hi16 half — must match exec_addiu's
+        //            wrapping-add semantics exactly, not a naive OR).
+        // Offset 24: LUI v0, 0x1234 ; ADDIU v1, v0, 0x5678 — different DEST
+        //            register (v1 vs v0) — must NOT fuse.
+        // Offset 32: NOP NOP (landing pad for the unfused case above).
+        let lui = make_i(OP_LUI as u32, 0, 3, 0xa874);
+        let ori = make_i(OP_ORI as u32, 3, 3, 0x74f0);
+        let lui2 = make_i(OP_LUI as u32, 0, 2, 0x1234);
+        let addiu2 = make_i(OP_ADDIU as u32, 2, 2, 0x5678);
+        let lui3 = make_i(OP_LUI as u32, 0, 2, 0x1234);
+        let addiu3 = make_i(OP_ADDIU as u32, 2, 2, 0xFFFF);
+        let lui4 = make_i(OP_LUI as u32, 0, 2, 0x1234);
+        let addiu4 = make_i(OP_ADDIU as u32, 2, 3, 0x5678);
+        let nop = 0u32;
+        mem.set_double(0, ((lui as u64) << 32) | ori as u64);
+        mem.set_double(8, ((lui2 as u64) << 32) | addiu2 as u64);
+        mem.set_double(16, ((lui3 as u64) << 32) | addiu3 as u64);
+        mem.set_double(24, ((lui4 as u64) << 32) | addiu4 as u64);
+        mem.set_double(32, ((nop as u64) << 32) | nop as u64);
+
+        exec.core.pc = pc_base;
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE_SKIP8, "fused LUI+ORI should complete in one step");
+        assert_eq!(exec.core.pc, pc_base + 8, "PC should skip both fused instructions");
+        assert_eq!(exec.core.read_gpr(3) as u32, 0xa87474f0);
+        // Upper 32 bits: LUI's result is sign-extended (0xa874<<16 has bit31 set),
+        // and ORI never touches or clears the upper bits — must still be all 1s.
+        assert_eq!(exec.core.read_gpr(3), 0xFFFFFFFFa87474f0);
+
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE_SKIP8, "fused LUI+ADDIU should complete in one step");
+        assert_eq!(exec.core.pc, pc_base + 16);
+        assert_eq!(exec.core.read_gpr(2), 0x12345678);
+
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE_SKIP8);
+        assert_eq!(exec.core.pc, pc_base + 24);
+        // lui=0x12340000, addiu adds sign_extend(0xFFFF)=-1 -> 0x1233FFFF
+        assert_eq!(exec.core.read_gpr(2), 0x1233FFFF);
+
+        exec.core.pc = pc_base + 24;
+        exec.core.write_gpr(2, 0);
+        exec.core.write_gpr(3, 0);
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "unfused LUI should report plain EXEC_COMPLETE");
+        assert_eq!(exec.core.pc, pc_base + 28, "unfused: PC advances by 4, not 8");
+        // 0x1234's bit 15 is clear, so LUI's sign-extension is a no-op here.
+        assert_eq!(exec.core.read_gpr(2), 0x0000000012340000, "LUI alone must have run");
+        let s2 = exec.step();
+        assert_eq!(s2, EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc_base + 32);
+        assert_eq!(exec.core.read_gpr(3), 0x12345678, "ADDIU v1,v0,0x5678 using v0 set by LUI");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_addr_calc_load_store_fusion() {
+        // ADDU/SUBU/ADDIU immediately followed by a load/store using the
+        // arithmetic op's destination as base register should fuse into one
+        // handler call (exec_addu_ls/exec_subu_ls/exec_addiu_ls), skipping the
+        // separate fetch/decode of the load/store — any offset is fine, the
+        // fused handler reads the load/store's own offset field.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+        let nop = 0u32;
+
+        // Offset 0: ADDIU t0, a0, 4 ; LW v0, 8(t0)  (nonzero base-calc imm AND
+        // nonzero load offset, to prove neither is dropped).
+        let addiu = make_i(OP_ADDIU as u32, 4 /*a0*/, 8 /*t0*/, 4);
+        let lw = make_i(OP_LW as u32, 8 /*t0*/, 2 /*v0*/, 8);
+        mem.set_double(0, ((addiu as u64) << 32) | lw as u64);
+
+        // Offset 8: ADDU t1, a0, a1 ; SW v0, 0(t1)
+        let addu = make_r(OP_SPECIAL as u32, 4, 5, 9 /*t1*/, 0, FUNCT_ADDU as u32);
+        let sw = make_i(OP_SW, 9 /*t1*/, 2 /*v0*/, 0);
+        mem.set_double(8, ((addu as u64) << 32) | sw as u64);
+
+        // Backing memory for the LW at effective address a0(4)+4+8.
+        let base_addr = 0x2000u64;
+        mem.set_word(base_addr + 4 + 8, 0xCAFEF00D);
+        mem.set_double(16, ((nop as u64) << 32) | nop as u64); // landing pad
+
+        exec.core.write_gpr(4 /*a0*/, base_addr);
+        exec.core.pc = pc_base;
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "fused ADDIU+LW should report plain EXEC_COMPLETE");
+        assert_eq!(exec.core.pc, pc_base + 8, "PC should skip both fused instructions");
+        assert_eq!(exec.core.read_gpr(8 /*t0*/), base_addr + 4, "ADDIU result must still be written");
+        // 0xCAFEF00D has bit 31 set, so LW sign-extends to 64 bits.
+        assert_eq!(exec.core.read_gpr(2 /*v0*/), 0xFFFFFFFFCAFEF00D, "LW must load through the fused address");
+
+        exec.core.write_gpr(5 /*a1*/, 0x10);
+        let s = exec.step();
+        assert_eq!(s, EXEC_COMPLETE, "fused ADDU+SW should report plain EXEC_COMPLETE");
+        assert_eq!(exec.core.pc, pc_base + 16);
+        assert_eq!(exec.core.read_gpr(9 /*t1*/), base_addr + 0x10);
+        assert_eq!(mem.get_word(base_addr + 0x10), 0xCAFEF00D, "SW must store v0 through the fused address");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_addr_calc_load_store_fusion_fault() {
+        // A fused pair whose load/store faults (misaligned access here, for
+        // simplicity) must report the exception, and cp0_epc must point at
+        // the LOAD/STORE's own address — not the address-calc instruction's —
+        // exactly as if the two had executed unfused. This is why the fused
+        // handler advances PC by 4 for the address-calc BEFORE running the
+        // load/store: handle_exception reads self.core.pc directly.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+
+        // ADDIU t0, a0, 0 ; LW v0, 1(t0)  -- offset 1 misaligns any word base.
+        let addiu = make_i(OP_ADDIU as u32, 4, 8, 0);
+        let lw = make_i(OP_LW as u32, 8, 2, 1);
+        mem.set_double(0, ((addiu as u64) << 32) | lw as u64);
+
+        exec.core.write_gpr(4, 0x3000);
+        exec.core.pc = pc_base;
+        let s = exec.step();
+        assert!(s & EXEC_IS_EXCEPTION != 0, "misaligned fused load must fault");
+        assert_eq!((s >> 2) & 0x1F, EXC_ADEL);
+        assert_eq!(exec.core.cp0_epc, pc_base + 4,
+            "cp0_epc must point at the LOAD's address (pc_base+4), not the ADDIU's (pc_base)");
+        assert_eq!(exec.core.read_gpr(8), 0x3000, "ADDIU result must still have been written before the fault");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_addr_calc_load_store_fusion_in_delay_slot() {
+        // If the fused ADDIU+LW is itself sitting in another branch's delay
+        // slot, it can't also skip to the load/store — a delay slot is
+        // exactly one instruction. Must fall back to plain ADDIU completion
+        // (which lets exec_decoded's normal EXEC_COMPLETE-in-delay-slot path
+        // redirect PC to delay_slot_target), leaving the LW to be
+        // fetched/decoded/executed normally as the real next instruction.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+        let nop = 0u32;
+
+        // Offset 0: BEQ r0,r0,+3 (always taken -> target = 0+4+3*4 = 16)
+        // Offset 4: ADDIU t0,a0,4 ; LW v0,8(t0)   <- delay slot (NOT a NOP,
+        //           so branch fusion itself does not kick in here; this is
+        //           purely testing addr-calc+load fusion's own delay-slot check)
+        // Offset 16: branch target landing pad
+        let beq_taken = make_i(OP_BEQ as u32, 0, 0, 3);
+        let addiu = make_i(OP_ADDIU as u32, 4, 8, 4);
+        let lw = make_i(OP_LW as u32, 8, 2, 8);
+        mem.set_double(0, ((beq_taken as u64) << 32) | addiu as u64);
+        mem.set_double(8, ((lw as u64) << 32) | nop as u64);
+        mem.set_double(16, ((nop as u64) << 32) | nop as u64);
+
+        let base_addr = 0x4000u64;
+        mem.set_word(base_addr + 4 + 8, 0xABCD1234);
+        exec.core.write_gpr(4, base_addr);
+
+        exec.core.pc = pc_base;
+        let s = exec.step();
+        assert_eq!(s, EXEC_BRANCH_DELAY, "BEQ taken, real delay slot begins");
+        assert_eq!(exec.core.pc, pc_base + 4);
+
+        // Execute the ADDIU (in the delay slot): must NOT fuse away the LW —
+        // it should behave like plain ADDIU and let PC redirect to the branch
+        // target via the delay-slot mechanism.
+        let s2 = exec.step();
+        assert_eq!(s2, EXEC_COMPLETE, "ADDIU in delay slot falls back to plain completion");
+        assert_eq!(exec.core.pc, pc_base + 16, "PC must redirect to branch target, not pc+8");
+        assert!(!exec.in_delay_slot);
+        assert_eq!(exec.core.read_gpr(8), base_addr + 4, "ADDIU result must still be written");
+        assert_eq!(exec.core.read_gpr(2), 0, "LW must NOT have executed as part of the fused pair");
+
+        // The LW at offset 8 was never consumed — confirm it's still there
+        // and executes normally on its own next time it's reached. (Not
+        // reached by falling through here since branch redirected past it;
+        // this just documents that the fused handler didn't corrupt/consume
+        // that memory word.)
+        assert_eq!(mem.get_word(8), lw);
     }
 
     #[test]

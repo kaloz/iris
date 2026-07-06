@@ -8,7 +8,7 @@
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
-use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE};
+use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_MISS, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -493,7 +493,7 @@ impl MipsCache for PassthroughCache {
         let r = self.downstream.read32(phys_addr as u32);
         if r.is_ok() {
             let slot = unsafe { &mut *self.fetch_scratch.get() };
-            if slot.raw != r.data { slot.decoded = false; }
+            slot.flags = FLAG_NOT_DECODED;
             slot.raw = r.data;
             FetchInstrResult::hit(slot as *const DecodedInstr)
         } else {
@@ -1360,20 +1360,50 @@ impl R4000Cache {
 
         // R4K: sync l2.instrs for the updated region so fetch() sees fresh instruction words.
         // R5K: l2.instrs is empty; ic_instrs will be re-filled from l2.data on next L1I miss.
+        // Also recomputes delay-slot fusion lookahead (FLAG_IMM_IS_NEXT) inline,
+        // where raw values are already hot — see fill_l2_line for why this must
+        // not happen in fetch()'s hot path instead. r0/r1 (one chunk) are known
+        // together, so r0's neighbor (r1) resolves immediately; r1's neighbor is
+        // next iteration's r0, so it's finished one iteration late via `prev_s1`.
         #[cfg(not(feature = "r5k"))]
         {
             let l2_instrs = self.l2.instrs.get_mut();
             let instrs_start = (l2_idx << L2Cache::INSTR_SHIFT) + offset_in_l2_line * 2;
+            #[cfg(feature = "opcodefusion")]
+            let dline_base = phys_addr & !(DCache::LINE_MASK as u64);
+            #[cfg(feature = "opcodefusion")]
+            let mut prev_s1: Option<usize> = None;
             for i in 0..DCache::CHUNKS_PER_LINE {
                 let chunk = dc_data[l1_start_chunk + i];
                 let r0 = (chunk >> 32) as u32;
                 let r1 = chunk as u32;
-                let s0 = &mut l2_instrs[instrs_start + i * 2];
-                if s0.raw != r0 { s0.decoded = false; }
+                let idx0 = instrs_start + i * 2;
+                let idx1 = idx0 + 1;
+                #[cfg(feature = "opcodefusion")]
+                if let Some(prev_idx) = prev_s1.take() {
+                    let prev_phys = (dline_base as usize) + (i * 2 - 1) * 4;
+                    if prev_phys & ICache::LINE_MASK != ICache::LINE_MASK - 3 {
+                        let prev = &mut l2_instrs[prev_idx];
+                        prev.imm = r0;
+                        prev.flags |= FLAG_IMM_IS_NEXT;
+                    }
+                }
+                let s0 = &mut l2_instrs[idx0];
+                s0.flags = FLAG_NOT_DECODED;
                 s0.raw = r0;
-                let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
-                if s1.raw != r1 { s1.decoded = false; }
+                #[cfg(feature = "opcodefusion")]
+                {
+                    let word0_phys = (dline_base as usize) + (i * 2) * 4;
+                    if word0_phys & ICache::LINE_MASK != ICache::LINE_MASK - 3 {
+                        s0.imm = r1;
+                        s0.flags |= FLAG_IMM_IS_NEXT;
+                    }
+                }
+                let s1 = &mut l2_instrs[idx1];
+                s1.flags = FLAG_NOT_DECODED;
                 s1.raw = r1;
+                #[cfg(feature = "opcodefusion")]
+                { prev_s1 = Some(idx1); }
             }
         }
 
@@ -1493,10 +1523,48 @@ impl R4000Cache {
         // Do not add data_as_words() accessors on L2 or fetch indexing will silently break.
         #[cfg(not(feature = "r5k"))]
         let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
+        // Delay-slot fusion lookahead (FLAG_IMM_IS_NEXT) is computed inline below,
+        // where raw values are already hot, instead of in fetch()'s hot path —
+        // fetch() must stay a plain shared-borrow read for the common case (cache
+        // hit on an already-decoded instruction); taking get_mut() unconditionally
+        // on every fetch() call regressed whetstone/dhrystone measurably even with
+        // the actual write gated behind a branch, almost certainly by defeating
+        // aliasing assumptions on the hottest path in the interpreter. r0/r1 (one
+        // chunk) are known together, so r0's neighbor (r1) resolves immediately;
+        // r1's neighbor is next iteration's r0, so it's finished one iteration
+        // late via `prev_s1`. An L2 line always contains a whole number of L1I
+        // lines, so the neighbor is only out-of-bounds at each L1I sub-line's
+        // last word (checked via physical address, via `prev_s1`/`fuse_pair!`).
+        #[cfg(all(not(feature = "r5k"), feature = "opcodefusion"))]
+        macro_rules! fuse_pair {
+            ($l2_instrs:expr, $prev_s1:expr, $i:expr, $idx0:expr, $idx1:expr, $r0:expr, $r1:expr) => {
+                if let Some(prev_idx) = $prev_s1.take() {
+                    let prev_phys = (line_base as usize) + ($i * 2 - 1) * 4;
+                    if prev_phys & ICache::LINE_MASK != ICache::LINE_MASK - 3 {
+                        let prev = &mut $l2_instrs[prev_idx];
+                        prev.imm = $r0;
+                        prev.flags |= FLAG_IMM_IS_NEXT;
+                    }
+                }
+                let word0_phys = (line_base as usize) + ($i * 2) * 4;
+                if word0_phys & ICache::LINE_MASK != ICache::LINE_MASK - 3 {
+                    let s0 = &mut $l2_instrs[$idx0];
+                    s0.imm = $r1;
+                    s0.flags |= FLAG_IMM_IS_NEXT;
+                }
+                $prev_s1 = Some($idx1);
+            };
+        }
+        #[cfg(all(not(feature = "r5k"), not(feature = "opcodefusion")))]
+        macro_rules! fuse_pair {
+            ($l2_instrs:expr, $prev_s1:expr, $i:expr, $idx0:expr, $idx1:expr, $r0:expr, $r1:expr) => {};
+        }
         if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
             // Fast path: single pass over source — rotate into l2.data and fill l2.instrs.
             #[cfg(not(feature = "r5k"))]
             let l2_instrs = self.l2.instrs.get_mut();
+            #[cfg(not(feature = "r5k"))]
+            let mut prev_s1: Option<usize> = None;
             for i in 0..L2Cache::CHUNKS_PER_LINE {
                 let val = unsafe { (*src.add(i)).rotate_left(32) };
                 l2_data[start_chunk + i] = val;
@@ -1504,12 +1572,15 @@ impl R4000Cache {
                 {
                     let r0 = (val >> 32) as u32;
                     let r1 = val as u32;
-                    let s0 = &mut l2_instrs[instrs_start + i * 2];
-                    if s0.raw != r0 { s0.decoded = false; }
+                    let idx0 = instrs_start + i * 2;
+                    let idx1 = idx0 + 1;
+                    let s0 = &mut l2_instrs[idx0];
+                    s0.flags = FLAG_NOT_DECODED;
                     s0.raw = r0;
-                    let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
-                    if s1.raw != r1 { s1.decoded = false; }
+                    let s1 = &mut l2_instrs[idx1];
+                    s1.flags = FLAG_NOT_DECODED;
                     s1.raw = r1;
+                    fuse_pair!(l2_instrs, prev_s1, i, idx0, idx1, r0, r1);
                 }
             }
         } else {
@@ -1519,16 +1590,20 @@ impl R4000Cache {
             #[cfg(not(feature = "r5k"))]
             {
                 let l2_instrs = self.l2.instrs.get_mut();
+                let mut prev_s1: Option<usize> = None;
                 for i in 0..L2Cache::CHUNKS_PER_LINE {
                     let val = dest[i];
                     let r0 = (val >> 32) as u32;
                     let r1 = val as u32;
-                    let s0 = &mut l2_instrs[instrs_start + i * 2];
-                    if s0.raw != r0 { s0.decoded = false; }
+                    let idx0 = instrs_start + i * 2;
+                    let idx1 = idx0 + 1;
+                    let s0 = &mut l2_instrs[idx0];
+                    s0.flags = FLAG_NOT_DECODED;
                     s0.raw = r0;
-                    let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
-                    if s1.raw != r1 { s1.decoded = false; }
+                    let s1 = &mut l2_instrs[idx1];
+                    s1.flags = FLAG_NOT_DECODED;
                     s1.raw = r1;
+                    fuse_pair!(l2_instrs, prev_s1, i, idx0, idx1, r0, r1);
                 }
             }
         }
@@ -1623,10 +1698,10 @@ impl R4000Cache {
                     let w0 = (chunk >> 32) as u32;
                     let w1 = chunk as u32;
                     let d0 = &mut ic_instrs[ic_slot_base + i * 2];
-                    if d0.raw != w0 { d0.decoded = false; }
+                    d0.flags = FLAG_NOT_DECODED;
                     d0.raw = w0;
                     let d1 = &mut ic_instrs[ic_slot_base + i * 2 + 1];
-                    if d1.raw != w1 { d1.decoded = false; }
+                    d1.flags = FLAG_NOT_DECODED;
                     d1.raw = w1;
                 }
             } else {
@@ -1640,10 +1715,10 @@ impl R4000Cache {
                         let w0 = (chunk >> 32) as u32;
                         let w1 = chunk as u32;
                         let d0 = &mut ic_instrs[ic_slot_base + i * 2];
-                        if d0.raw != w0 { d0.decoded = false; }
+                        d0.flags = FLAG_NOT_DECODED;
                         d0.raw = w0;
                         let d1 = &mut ic_instrs[ic_slot_base + i * 2 + 1];
-                        if d1.raw != w1 { d1.decoded = false; }
+                        d1.flags = FLAG_NOT_DECODED;
                         d1.raw = w1;
                     }
                 } else {
@@ -1652,7 +1727,7 @@ impl R4000Cache {
                         let r = self.downstream.read32(word_addr);
                         let w = if r.is_ok() { r.data } else { 0 };
                         let d = &mut ic_instrs[ic_slot_base + i];
-                        if d.raw != w { d.decoded = false; }
+                        d.flags = FLAG_NOT_DECODED;
                         d.raw = w;
                     }
                 }
@@ -1909,6 +1984,9 @@ impl MipsCache for R4000Cache {
         }
 
         {
+            // Plain shared-borrow read, matching the pre-fusion hot path exactly.
+            // FLAG_IMM_IS_NEXT is precomputed at fill time (see fill_l2_line), not
+            // here — see the comment there for why fetch() must not take get_mut().
             let l2_slot_idx = ((phys_addr as usize) & (L2_CACHE_SIZE - 1)) >> 2;
             let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
             FetchInstrResult::hit(slot)
@@ -2625,9 +2703,9 @@ impl MipsCache for R4000Cache {
         self.l2.tags_mut().fill(L2Tag::default());
         self.l2.data_mut().fill(0);
         #[cfg(not(feature = "r5k"))]
-        for s in self.l2.instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
+        for s in self.l2.instrs.get_mut().iter_mut() { s.flags = FLAG_NOT_DECODED; s.raw = 0; }
         #[cfg(feature = "r5k")]
-        for s in self.ic_instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
+        for s in self.ic_instrs.get_mut().iter_mut() { s.flags = FLAG_NOT_DECODED; s.raw = 0; }
         #[cfg(feature = "r5k")]
         unsafe {
             (*self.ic_lru.get()).fill(0u64);
@@ -2667,9 +2745,9 @@ impl Resettable for R4000Cache {
         self.l2.tags_mut().fill(L2Tag::default());
         self.l2.data_mut().fill(0);
         #[cfg(not(feature = "r5k"))]
-        for s in self.l2.instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
+        for s in self.l2.instrs.get_mut().iter_mut() { s.flags = FLAG_NOT_DECODED; s.raw = 0; }
         #[cfg(feature = "r5k")]
-        for s in self.ic_instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
+        for s in self.ic_instrs.get_mut().iter_mut() { s.flags = FLAG_NOT_DECODED; s.raw = 0; }
         #[cfg(feature = "r5k")]
         unsafe {
             (*self.ic_lru.get()).fill(0u64);
@@ -2766,9 +2844,9 @@ impl R4000Cache {
                 for i in 0..L2Cache::CHUNKS_PER_LINE {
                     let chunk = l2_data_slice[chunks_start + i];
                     l2_instrs[instrs_start + i * 2].raw = (chunk >> 32) as u32;
-                    l2_instrs[instrs_start + i * 2].decoded = false;
+                    l2_instrs[instrs_start + i * 2].flags = FLAG_NOT_DECODED;
                     l2_instrs[instrs_start + i * 2 + 1].raw = chunk as u32;
-                    l2_instrs[instrs_start + i * 2 + 1].decoded = false;
+                    l2_instrs[instrs_start + i * 2 + 1].flags = FLAG_NOT_DECODED;
                 }
             }
         }

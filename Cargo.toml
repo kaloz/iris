@@ -18,9 +18,18 @@ developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TL
 # the snapshot determinism validator (Phase 3.3). Default OFF preserves the
 # wallclock-anchored timer that interactive desktop builds expect.
 ci_clock = []
+# MIPS opcode fusion: branch/jump+NOP delay slot, LUI+ORI/ADDIU (32-bit
+# immediate materialization), and ADDU/SUBU/ADDIU+load/store (address-calc
+# then dereference) each collapse into a single decode/dispatch. Real perf
+# win (whetstone 85.1 -> 95.2 MIPS across the three stages), but a fused
+# pair's second instruction is never independently fetched/decoded/dispatched
+# — so a PC/VirtFetch/PhysFetch breakpoint set on that instruction's address
+# silently never fires. Incompatible with reliable interactive debugging;
+# implied by `lightning` (same "give up debuggability for speed" tradeoff).
+opcodefusion = []
 # Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
 # Incompatible with interactive debugging. For end-user / benchmarking builds only.
-lightning = []
+lightning = ["opcodefusion"]
 # O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces linear scan
 # for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
 # downstream tooling that passes --features tlbvmap still compiles cleanly.
