@@ -23,10 +23,20 @@ use crate::snapshot::{get_field, u64_slice_to_toml, load_u64_slice, toml_u64, to
 pub const MIPS_LOG_INSN: u32 = 0x0001; // per-instruction disassembly trace
 pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
 pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
+pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
 
+#[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
     devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+}
+
+// Without `developer`, dlog_dev! is a no-op, so callers gate on this constant `false`
+// instead of paying an atomic load per call site to check a flag that can never fire.
+#[cfg(not(feature = "developer"))]
+#[inline(always)]
+fn mips_log(_bit: u32) -> bool {
+    false
 }
 
 // Exception codes (from MIPS R4000 documentation)
@@ -1944,9 +1954,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let cc = (d.raw >> 18) & 0x7;
         let tf = ((d.raw >> 16) & 0x1) != 0;
         let cc_value = self.core.get_fpu_cc(cc);
-        if cc_value == tf {
+        let taken = cc_value == tf;
+        if taken {
             let rs_val = self.core.read_gpr(rs_reg);
             self.core.write_gpr(rd_reg, rs_val);
+        }
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU mov{} PC={:016x} cc{}={} taken={}",
+                if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
         EXEC_COMPLETE
     }
@@ -3532,8 +3547,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) / f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
+        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+        let ft_val = f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
+        let result = fs_val / ft_val;
         (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU div.s PC={:016x} {} / {} = {}", self.core.pc, fs_val, ft_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fsqrt_s(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3606,8 +3626,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).trunc() as i32;
+        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+        let result = fs_val.trunc() as i32;
         (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU trunc.w.s PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fceil_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3631,9 +3655,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let cc = (d.raw >> 18) & 0x7;
         let tf = ((d.raw >> 16) & 0x1) != 0;
-        if self.core.get_fpu_cc(cc) == tf {
+        let cc_value = self.core.get_fpu_cc(cc);
+        let taken = cc_value == tf;
+        if taken {
             let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
             (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
+        }
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU fmov{}.s PC={:016x} cc{}={} taken={}",
+                if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
         EXEC_COMPLETE
     }
@@ -3659,8 +3689,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = 1.0 / f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+        let result = 1.0 / fs_val;
         (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU recip.s PC={:016x} 1 / {} = {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_frsqrt_s(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3683,8 +3717,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).round() as i32;
+        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+        let result = fs_val.round() as i32;
         (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU cvt.w.s PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fcvt_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3712,6 +3750,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let cond = self.fpu_compare_s(fs_val, ft_val, funct_val);
         let cc = fd_reg & 0x7;
         self.core.set_fpu_cc(cc, cond);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU c.{:x}.s PC={:016x} cc{}={} fs={} ft={}",
+                funct_val, self.core.pc, cc, cond, fs_val, ft_val);
+        }
         EXEC_COMPLETE
     }
 
@@ -3749,8 +3791,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg) / read_d(&self.core, ft_reg);
+        let fs_val = read_d(&self.core, fs_reg);
+        let ft_val = read_d(&self.core, ft_reg);
+        let result = fs_val / ft_val;
         write_d(&mut self.core, fd_reg, result);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU div.d PC={:016x} {} / {} = {}", self.core.pc, fs_val, ft_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fsqrt_d(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3826,8 +3873,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_d)(&self.core, fs_reg).trunc() as i32;
+        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
+        let result = fs_val.trunc() as i32;
         (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU trunc.w.d PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fceil_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3851,10 +3902,16 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let cc = (d.raw >> 18) & 0x7;
         let tf = ((d.raw >> 16) & 0x1) != 0;
-        if self.core.get_fpu_cc(cc) == tf {
+        let cc_value = self.core.get_fpu_cc(cc);
+        let taken = cc_value == tf;
+        if taken {
             let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
             let val = read_d(&self.core, fs_reg);
             write_d(&mut self.core, fd_reg, val);
+        }
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU fmov{}.d PC={:016x} cc{}={} taken={}",
+                if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
         EXEC_COMPLETE
     }
@@ -3883,8 +3940,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = 1.0 / read_d(&self.core, fs_reg);
+        let fs_val = read_d(&self.core, fs_reg);
+        let result = 1.0 / fs_val;
         write_d(&mut self.core, fd_reg, result);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU recip.d PC={:016x} 1 / {} = {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_frsqrt_d(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3908,8 +3969,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_d)(&self.core, fs_reg).round() as i32;
+        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
+        let result = fs_val.round() as i32;
         (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU cvt.w.d PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+        }
         self.fpu_update_fcsr()
     }
     fn exec_fcvt_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -3938,6 +4003,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let cond = self.fpu_compare_d(fs_val, ft_val, funct_val);
         let cc = fd_reg & 0x7;
         self.core.set_fpu_cc(cc, cond);
+        if mips_log(MIPS_LOG_FPU) {
+            dlog_dev!(LogModule::Mips, "FPU c.{:x}.d PC={:016x} cc{}={} fs={} ft={}",
+                funct_val, self.core.pc, cc, cond, fs_val, ft_val);
+        }
         EXEC_COMPLETE
     }
 
