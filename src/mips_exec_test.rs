@@ -3,7 +3,7 @@ mod tests {
     use std::sync::Mutex;
     use std::collections::HashMap;
     use crate::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
-    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_COMPLETE_SKIP8, EXEC_BREAKPOINT, EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
+    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_COMPLETE_NO_INC, EXEC_COMPLETE_SKIP8, EXEC_BREAKPOINT, EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
     use crate::mips_isa::*;
     use crate::mips_tlb::PassthroughTlb;
     use crate::mips_cache_v2::{PassthroughCache, MipsCache, R4000Cache};
@@ -401,6 +401,40 @@ mod tests {
     }
 
     #[test]
+    fn test_load_store_pc_advances() {
+        // Regression test: every load/store dispatch-target handler must
+        // advance PC by 4 on a normal (non-faulting) completion. Handlers
+        // that route their status through a shared finish/complete helper
+        // (e.g. store instructions returning write_data's raw status) can
+        // silently skip the PC-advancing step if that helper only special-
+        // cases the exception path and forgets the plain-EXEC_COMPLETE path
+        // — that exact bug (finish_status not calling handle_exec_complete)
+        // let every SB/SH/SW/SD/SWL/SWR/SDL/SDR/SWC1/SDC1 instruction execute
+        // successfully while leaving PC frozen, an infinite loop on real
+        // firmware. Covers stores, loads, and the unaligned-access family,
+        // since each uses a different internal plumbing path.
+        let (mut exec, _mem) = create_executor();
+        exec.core.cp0_status |= STATUS_KX; // enable 64-bit ops (SD/LD/SDL/SDR)
+        exec.core.write_gpr(2, 0x2000); // base register for all accesses below
+        exec.core.write_gpr(1, 0x1122334455667788); // value register
+
+        let ops: &[(&str, u32)] = &[
+            ("SB", OP_SB), ("SH", OP_SH), ("SW", OP_SW), ("SD", OP_SD),
+            ("SWL", OP_SWL), ("SWR", OP_SWR), ("SDL", OP_SDL), ("SDR", OP_SDR),
+            ("LB", OP_LB), ("LBU", OP_LBU), ("LH", OP_LH), ("LHU", OP_LHU),
+            ("LW", OP_LW), ("LWU", OP_LWU), ("LD", OP_LD),
+            ("LWL", OP_LWL), ("LWR", OP_LWR), ("LDL", OP_LDL), ("LDR", OP_LDR),
+        ];
+        for (name, op) in ops {
+            let pc_before = exec.core.pc;
+            let instr = make_i(*op, 2, 1, 0);
+            let status = exec.exec(instr);
+            assert_eq!(status, EXEC_COMPLETE, "{name} should report EXEC_COMPLETE");
+            assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "{name} must advance PC by 4");
+        }
+    }
+
+    #[test]
     fn test_load_store_64bit() {
         let (mut exec, mem) = create_executor();
 
@@ -635,8 +669,10 @@ mod tests {
 
         // Execute ERET instruction
         // COP0 with RS=TLB (0x10) and FUNCT=ERET (0x18)
+        // ERET sets PC directly (no delay slot) and reports EXEC_COMPLETE_NO_INC
+        // so exec_decoded's normal PC+4 doesn't clobber it.
         let eret_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x18;
-        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE_NO_INC);
 
         // Verify PC was restored from EPC and EXL was cleared
         assert_eq!(exec.core.pc, 0xBFC00100);
@@ -647,7 +683,7 @@ mod tests {
         exec.core.cp0_status = 0x04;  // ERL bit set
         exec.core.pc = 0xBFC00400;
 
-        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE_NO_INC);
 
         // Verify PC was restored from ErrorEPC and ERL was cleared
         assert_eq!(exec.core.pc, 0xBFC00300);
@@ -1317,8 +1353,10 @@ mod tests {
         mem.set_word(0x2000, 0x40490FDB); // pi (3.14159...) in float
         exec.core.write_gpr(5, 0x2000);
         let lwc1_instr = make_i(OP_LWC1, 5, 0, 0); // ft=0 (f0)
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(lwc1_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_w(0), 0x40490FDB);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "LWC1 must advance PC by 4");
         // Verify it's actually pi
         let pi_val = exec.core.read_fpr_s(0);
         assert!((pi_val - 3.14159265).abs() < 0.0001);
@@ -1327,22 +1365,28 @@ mod tests {
         mem.set_word(0x2004, 0);
         exec.core.write_gpr(6, 0x2004);
         let swc1_instr = make_i(OP_SWC1, 6, 0, 0);
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(swc1_instr), EXEC_COMPLETE);
         assert_eq!(mem.get_word(0x2004), 0x40490FDB);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "SWC1 must advance PC by 4");
 
         // Test LDC1 - Load Doubleword to FPU
         mem.set_double(0x3000, 0x400921FB_54442D18); // pi in double precision
         exec.core.write_gpr(7, 0x3000);
         let ldc1_instr = make_i(OP_LDC1, 7, 1, 0); // ft=1 (f1)
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(ldc1_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_l(1), 0x400921FB_54442D18);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "LDC1 must advance PC by 4");
 
         // Test SDC1 - Store Doubleword from FPU
         mem.set_double(0x3008, 0);
         exec.core.write_gpr(8, 0x3008);
         let sdc1_instr = make_i(OP_SDC1, 8, 1, 0);
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(sdc1_instr), EXEC_COMPLETE);
         assert_eq!(mem.get_double(0x3008), 0x400921FB_54442D18);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "SDC1 must advance PC by 4");
     }
 
     #[test]
@@ -2428,30 +2472,44 @@ mod tests {
         // LWXC1 f3, r2(r1)
         // rs=base(1), rt=index(2), fd=3 (in sa field 10..6)
         let lwxc1 = make_cop1x(1, 2, 0, 3, FUNCT_LWXC1);
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(lwxc1), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_s(3), 1.0);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "LWXC1 must advance PC by 4");
 
         // SWXC1 fs, index(base)
         // fs is in rd field (15..11)
         exec.core.write_fpr_s(4, 2.0); // 0x40000000
         exec.core.write_gpr(5, 0x2000);
         exec.core.write_gpr(6, 8);
-        
+
         // SWXC1 f4, r6(r5)
         // rs=5, rt=6, rd=4 (fs)
         let swxc1 = make_cop1x(5, 6, 4, 0, FUNCT_SWXC1);
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(swxc1), EXEC_COMPLETE);
         assert_eq!(mem.get_word(0x2008), 0x40000000);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "SWXC1 must advance PC by 4");
 
         // LDXC1 / SDXC1 (Double)
         mem.set_double(0x3008, 0x3FF0000000000000); // 1.0 double
         exec.core.write_gpr(7, 0x3000);
         exec.core.write_gpr(8, 8);
-        
+
         // LDXC1 f0, r8(r7)
         let ldxc1 = make_cop1x(7, 8, 0, 0, FUNCT_LDXC1);
+        let pc_before = exec.core.pc;
         assert_eq!(exec.exec(ldxc1), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_d(0), 1.0);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "LDXC1 must advance PC by 4");
+
+        // SDXC1 f0, r8(r7) -> store 1.0 double to 0x3008
+        mem.set_double(0x3008, 0);
+        let sdxc1 = make_cop1x(7, 8, 0, 0, FUNCT_SDXC1);
+        let pc_before = exec.core.pc;
+        assert_eq!(exec.exec(sdxc1), EXEC_COMPLETE);
+        assert_eq!(mem.get_double(0x3008), 0x3FF0000000000000);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4), "SDXC1 must advance PC by 4");
     }
 
     #[test]
@@ -2935,7 +2993,7 @@ mod tests {
 
         exec.core.pc = pc_base;
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE, "fused taken BEQ should report EXEC_COMPLETE, not EXEC_BRANCH_DELAY");
+        assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused taken BEQ sets PC directly, not EXEC_BRANCH_DELAY");
         assert_eq!(exec.core.pc, pc_base + 16, "PC should jump straight to branch target");
         assert!(!exec.in_delay_slot, "fused path must never set in_delay_slot");
 
@@ -2959,7 +3017,7 @@ mod tests {
         exec.core.pc = pc_base + 256;
         exec.core.write_gpr(31, pc_base + 300);
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE, "fused JR should report EXEC_COMPLETE");
+        assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused JR sets PC directly");
         assert_eq!(exec.core.pc, pc_base + 300, "PC should jump straight to r31");
         assert!(!exec.in_delay_slot);
     }

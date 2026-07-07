@@ -987,11 +987,60 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         !self.skip_breakpoints
     }
 
-    /// Store branch target and return EXEC_BRANCH_DELAY.
+    /// Terminal action for a handler taking a branch/jump: arm the delay slot
+    /// and advance PC to the delay-slot instruction. If a delay slot is
+    /// already active (branch-in-delay-slot, unusual but legal), the existing
+    /// one is left alone — only its target-of-record differs, PC still just
+    /// advances by 4 to fetch/execute whatever sits there.
     #[inline(always)]
     fn branch_delay(&mut self, target: u64) -> ExecStatus {
         self.delay_slot_target = target;
+        if !self.in_delay_slot {
+            self.in_delay_slot = true;
+        }
+        self.core.pc = self.core.pc.wrapping_add(4);
         EXEC_BRANCH_DELAY
+    }
+
+    /// Terminal action for a handler that completes normally: advance into a
+    /// pending delay slot if one is active, else PC += 4. Every dispatch-target
+    /// exec_* handler that completes without branching calls this as its last
+    /// action instead of returning the bare EXEC_COMPLETE constant.
+    #[inline(always)]
+    fn handle_exec_complete(&mut self) -> ExecStatus {
+        if self.in_delay_slot {
+            self.core.pc = self.delay_slot_target;
+            self.in_delay_slot = false;
+        } else {
+            self.core.pc = self.core.pc.wrapping_add(4);
+        }
+        EXEC_COMPLETE
+    }
+
+    /// Terminal action for "branch likely not taken" / a fused straight-line
+    /// sequence completing: PC += 8, no delay-slot interaction.
+    #[inline(always)]
+    fn handle_branch_likely_skip(&mut self) -> ExecStatus {
+        self.core.pc = self.core.pc.wrapping_add(8);
+        EXEC_BRANCH_LIKELY_SKIP
+    }
+
+    /// Finish a handler given a raw status straight out of read_data/write_data/
+    /// translate (i.e. not yet run through handle_exception): dispatches to
+    /// handle_exception if the EXEC_IS_EXCEPTION bit is set, otherwise passes
+    /// EXEC_BREAKPOINT/EXEC_RETRY straight through unchanged (both are already
+    /// terminal — no PC mutation needed, matching the old exec_decoded match's
+    /// `EXEC_RETRY => {}` / `EXEC_BREAKPOINT => {}` arms).
+    #[inline(always)]
+    fn finish_status(&mut self, status: ExecStatus) -> ExecStatus {
+        if status & EXEC_IS_EXCEPTION != 0 {
+            self.handle_exception(status)
+        } else if status == EXEC_COMPLETE {
+            self.handle_exec_complete()
+        } else {
+            // EXEC_RETRY / EXEC_BREAKPOINT: already terminal, no PC mutation.
+            status
+        }
     }
 
     /// Step one instruction (fetch and execute).
@@ -1272,12 +1321,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     fn exec_reserved(&mut self, d: &DecodedInstr) -> ExecStatus {
-        self.reserved_instruction(d)
+        let s = self.reserved_instruction(d);
+        self.handle_exception(s)
     }
 
     /// No-op handler — used as the default for zero-initialised DecodedInstr.
     fn exec_nop(&mut self, _d: &DecodedInstr) -> ExecStatus {
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     /// Handle an exception: update CP0 registers and jump to handler vector.
@@ -1971,7 +2021,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, (rt_val << sa_val) as u32 as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_movci(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_reg = d.rs as u32;
@@ -1988,21 +2038,21 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             dlog_dev!(LogModule::Mips, "FPU mov{} PC={:016x} cc{}={} taken={}",
                 if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_srl(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_sra(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32) as i32;
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_sllv(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2010,7 +2060,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = (rs_val & 0x1F) as u32;
         self.core.write_gpr(rd_reg, (rt_val << sa_val) as u32 as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_srlv(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2018,7 +2068,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = (rs_val & 0x1F) as u32;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_srav(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2026,7 +2076,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = (rs_val & 0x1F) as u32;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_jr(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = self.core.read_gpr(d.rs as u32);
@@ -2055,33 +2105,35 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.branch_delay(target)
     }
     fn exec_syscall(&mut self, _d: &DecodedInstr) -> ExecStatus {
-        exec_exception(EXC_SYS)
+        let s = exec_exception(EXC_SYS);
+        self.handle_exception(s)
     }
     fn exec_break(&mut self, _d: &DecodedInstr) -> ExecStatus {
-        exec_exception(EXC_BP)
+        let s = exec_exception(EXC_BP);
+        self.handle_exception(s)
     }
     fn exec_sync(&mut self, _d: &DecodedInstr) -> ExecStatus {
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_mfhi(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, self.core.hi);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_mthi(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         self.core.hi = rs_val;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_mflo(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, self.core.lo);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_mtlo(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         self.core.lo = rs_val;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_mult(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i32 as i64;
@@ -2089,7 +2141,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let result = rs_val * rt_val;
         self.core.lo = (result as u32) as i32 as i64 as u64;
         self.core.hi = (result >> 32) as u32 as i32 as i64 as u64;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_multu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as u32 as u64;
@@ -2097,32 +2149,32 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let result = rs_val * rt_val;
         self.core.lo = (result as u32) as i32 as i64 as u64;
         self.core.hi = (result >> 32) as u32 as i32 as i64 as u64;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_div(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i32;
         let rt_val = self.core.read_gpr(d.rt as u32) as i32;
         if rt_val == 0 {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
             let quotient = rs_val.wrapping_div(rt_val);
             let remainder = rs_val.wrapping_rem(rt_val);
             self.core.lo = quotient as i64 as u64;
             self.core.hi = remainder as i64 as u64;
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
     fn exec_divu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as u32;
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
         if rt_val == 0 {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
             let quotient = rs_val / rt_val;
             let remainder = rs_val % rt_val;
             self.core.lo = quotient as i32 as i64 as u64;
             self.core.hi = remainder as i32 as i64 as u64;
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
     fn exec_dmult(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2131,7 +2183,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let result = rs_val * rt_val;
         self.core.lo = result as u128 as u64;
         self.core.hi = (result >> 64) as u128 as u64;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dmultu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as u128;
@@ -2139,30 +2191,30 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let result = rs_val * rt_val;
         self.core.lo = result as u64;
         self.core.hi = (result >> 64) as u64;
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_ddiv(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
         if rt_val == 0 {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else if rs_val == i64::MIN && rt_val == -1 {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
             self.core.lo = rs_val.wrapping_div(rt_val) as u64;
             self.core.hi = rs_val.wrapping_rem(rt_val) as u64;
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
     fn exec_ddivu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         if rt_val == 0 {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
             self.core.lo = rs_val / rt_val;
             self.core.hi = rs_val % rt_val;
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
     fn exec_add(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2172,9 +2224,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match rs_val.checked_add(rt_val) {
             Some(result) => {
                 self.core.write_gpr(rd_reg, result as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
     fn exec_addu(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2182,7 +2234,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val.wrapping_add(rt_val) as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_sub(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i32;
@@ -2191,9 +2243,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match rs_val.checked_sub(rt_val) {
             Some(result) => {
                 self.core.write_gpr(rd_reg, result as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
     fn exec_subu(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2201,7 +2253,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val.wrapping_sub(rt_val) as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ADDU fused with an immediately-following load/store that uses ADDU's
@@ -2253,7 +2305,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[inline(always)]
     fn exec_fused_addr_load_store_tail(&mut self, addr: u64, next_raw: u32) -> ExecStatus {
         if self.in_delay_slot {
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
         self.core.pc = self.core.pc.wrapping_add(4);
 
@@ -2295,11 +2347,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         };
         // PC was already advanced for the address-calc instruction above (and
         // we know we're not in a delay slot, or we'd have bailed earlier), so
-        // on success exec_decoded's normal EXEC_COMPLETE fast path correctly
-        // adds the load/store's own PC+4 — no need to touch PC again here.
-        // On fault, `status` already carries the exception; handle_exception
-        // reads self.core.pc (already at the load/store's address) for cp0_epc.
-        status
+        // on success handle_exec_complete's normal PC+4 (relative to that)
+        // correctly lands past the load/store itself. On fault, `status`
+        // carries the exception; handle_exception reads self.core.pc (already
+        // at the load/store's address) for cp0_epc.
+        if status == EXEC_COMPLETE {
+            self.handle_exec_complete()
+        } else {
+            self.handle_exception(status)
+        }
     }
     
     fn exec_and(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2307,42 +2363,42 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val & rt_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_or(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val | rt_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_xor(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val ^ rt_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_nor(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, !(rs_val | rt_val));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_slt(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, if rs_val < rt_val { 1 } else { 0 });
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_sltu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, if rs_val < rt_val { 1 } else { 0 });
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dadd(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
@@ -2351,9 +2407,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match rs_val.checked_add(rt_val) {
             Some(result) => {
                 self.core.write_gpr(rd_reg, result as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
     fn exec_daddu(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2361,7 +2417,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val.wrapping_add(rt_val));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsub(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
@@ -2370,9 +2426,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match rs_val.checked_sub(rt_val) {
             Some(result) => {
                 self.core.write_gpr(rd_reg, result as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
     fn exec_dsubu(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -2380,93 +2436,93 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, rs_val.wrapping_sub(rt_val));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_tge(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
-        if rs_val >= rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val >= rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tgeu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
-        if rs_val >= rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val >= rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tlt(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
-        if rs_val < rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val < rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tltu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
-        if rs_val < rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val < rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_teq(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
-        if rs_val == rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val == rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tne(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
-        if rs_val != rt_val { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val != rt_val { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_movz(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         if rt_val == 0 { self.core.write_gpr(rd_reg, rs_val); }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_movn(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         if rt_val != 0 { self.core.write_gpr(rd_reg, rs_val); }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsll(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, rt_val << sa_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsrl(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, rt_val >> sa_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsra(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsll32(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, rt_val << (sa_val + 32));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsrl32(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, rt_val >> (sa_val + 32));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsra32(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32) as i64;
         let rd_reg = d.rd as u32;
         let sa_val = d.sa as u32;
         self.core.write_gpr(rd_reg, (rt_val >> (sa_val + 32)) as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsllv(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2474,7 +2530,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = rs_val & 0x3F;
         self.core.write_gpr(rd_reg, rt_val << sa_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsrlv(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2482,7 +2538,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = rs_val & 0x3F;
         self.core.write_gpr(rd_reg, rt_val >> sa_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_dsrav(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2490,7 +2546,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_reg = d.rd as u32;
         let sa_val = rs_val & 0x3F;
         self.core.write_gpr(rd_reg, (rt_val >> sa_val) as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     // Jump and Branch Instructions
 
@@ -2543,7 +2599,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -2565,9 +2621,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.core.pc = target;
             EXEC_COMPLETE_NO_INC
         } else if self.in_delay_slot {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2579,7 +2635,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -2596,9 +2652,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.core.pc = target;
             EXEC_COMPLETE_NO_INC
         } else if self.in_delay_slot {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2609,7 +2665,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -2620,7 +2676,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -2632,7 +2688,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2644,7 +2700,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2655,7 +2711,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2666,7 +2722,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         }
     }
 
@@ -2675,70 +2731,70 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_bltz(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val < 0 { self.branch_delay(target) } else { EXEC_COMPLETE }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
     }
     fn exec_bgez(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val >= 0 { self.branch_delay(target) } else { EXEC_COMPLETE }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
     }
     fn exec_bltzl_ri(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val < 0 { self.branch_delay(target) } else { EXEC_BRANCH_LIKELY_SKIP }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_branch_likely_skip() }
     }
     fn exec_bgezl_ri(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val >= 0 { self.branch_delay(target) } else { EXEC_BRANCH_LIKELY_SKIP }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_branch_likely_skip() }
     }
     fn exec_tgei(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
-        if rs_val >= d.imms64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val >= d.imms64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tgeiu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val_u = self.core.read_gpr(d.rs as u32);
-        if rs_val_u >= d.immu64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val_u >= d.immu64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tlti(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
-        if rs_val < d.imms64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val < d.imms64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tltiu(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val_u = self.core.read_gpr(d.rs as u32);
-        if rs_val_u < d.immu64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val_u < d.immu64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_teqi(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
-        if rs_val == d.imms64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val == d.imms64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_tnei(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
-        if rs_val != d.imms64() { exec_exception(EXC_TR) } else { EXEC_COMPLETE }
+        if rs_val != d.imms64() { let s = exec_exception(EXC_TR); self.handle_exception(s) } else { self.handle_exec_complete() }
     }
     fn exec_bltzal(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val < 0 { self.branch_delay(target) } else { EXEC_COMPLETE }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
     }
     fn exec_bgezal(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val >= 0 { self.branch_delay(target) } else { EXEC_COMPLETE }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
     }
     fn exec_bltzall(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val < 0 { self.branch_delay(target) } else { EXEC_BRANCH_LIKELY_SKIP }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_branch_likely_skip() }
     }
     fn exec_bgezall(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val >= 0 { self.branch_delay(target) } else { EXEC_BRANCH_LIKELY_SKIP }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_branch_likely_skip() }
     }
     // Immediate arithmetic/logic instructions
 
@@ -2754,9 +2810,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             Some(result) => {
                 // Sign-extend 32-bit result to 64 bits
                 self.core.write_gpr(rt_reg, result as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
 
@@ -2769,7 +2825,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_reg = d.rt as u32;
         // Wrapping add, then sign-extend to 64 bits
         self.core.write_gpr(rt_reg, rs_val.wrapping_add(imm_val) as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ADDIU fused with an immediately-following load/store that uses ADDIU's
@@ -2796,9 +2852,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match rs_val.checked_add(d.imms64()) {
             Some(result) => {
                 self.core.write_gpr(rt_reg, result as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            None => exec_exception(EXC_OV),
+            None => { let s = exec_exception(EXC_OV); self.handle_exception(s) }
         }
     }
 
@@ -2807,7 +2863,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, rs_val.wrapping_add(d.immu64()));
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // SLTI - Set on Less Than Immediate (signed)
@@ -2815,7 +2871,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, if rs_val < d.imms64() { 1 } else { 0 });
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // SLTIU - Set on Less Than Immediate Unsigned (sign-extended imm compared as unsigned)
@@ -2823,7 +2879,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, if rs_val < d.immu64() { 1 } else { 0 });
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ANDI - AND Immediate (zero-extended)
@@ -2831,7 +2887,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, rs_val & d.immi64());
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ORI - OR Immediate (zero-extended)
@@ -2839,7 +2895,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, rs_val | d.immi64());
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // XORI - XOR Immediate (zero-extended)
@@ -2847,13 +2903,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32);
         let rt_reg = d.rt as u32;
         self.core.write_gpr(rt_reg, rs_val ^ d.immi64());
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // LUI - Load Upper Immediate (pre-shifted and sign-extended at decode)
     fn exec_lui(&mut self, d: &DecodedInstr) -> ExecStatus {
         self.core.write_gpr(d.rt as u32, d.immu64());
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // LUI fused with a same-register ORI the
@@ -2872,10 +2928,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             // once PC lands on delay_slot_target; d.raw is still the original LUI
             // word (only d.imm was repurposed for the fused combine).
             self.core.write_gpr(d.rt as u32, ((d.raw & 0xFFFF) << 16) as i32 as i64 as u64);
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
         self.core.write_gpr(d.rt as u32, d.immu64());
-        EXEC_COMPLETE_SKIP8
+        self.handle_branch_likely_skip()
     }
 
     // LUI fused with a same-register ADDIU — `lui rX,hi; addiu rX,rX,lo`.
@@ -2891,10 +2947,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             // target — fall back to plain LUI semantics and let it be fetched
             // and executed normally once PC lands on delay_slot_target.
             self.core.write_gpr(d.rt as u32, ((d.raw & 0xFFFF) << 16) as i32 as i64 as u64);
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
         self.core.write_gpr(d.rt as u32, d.immu64());
-        EXEC_COMPLETE_SKIP8
+        self.handle_branch_likely_skip()
     }
 
     // Load/Store instructions (converted to use new interface)
@@ -2909,9 +2965,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             Ok(value) => {
                 // Sign-extend byte to 64 bits
                 self.core.write_gpr(rt_reg, value as i8 as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -2924,9 +2980,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match self.read_data::<1>(virt_addr) {
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -2940,9 +2996,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             Ok(value) => {
                 // Sign-extend halfword to 64 bits
                 self.core.write_gpr(rt_reg, value as i16 as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -2955,9 +3011,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match self.read_data::<2>(virt_addr) {
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -2971,9 +3027,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             Ok(value) => {
                 // Sign-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -2987,9 +3043,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             Ok(value) => {
                 // Zero-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3002,9 +3058,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match self.read_data::<8>(virt_addr) {
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3014,7 +3070,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<1>(virt_addr, rt_val)
+        let status = self.write_data::<1>(virt_addr, rt_val);
+        self.finish_status(status)
     }
 
     // SH - Store Halfword
@@ -3023,7 +3080,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<2>(virt_addr, rt_val)
+        let status = self.write_data::<2>(virt_addr, rt_val);
+        self.finish_status(status)
     }
 
     // SW - Store Word
@@ -3032,7 +3090,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<4>(virt_addr, rt_val)
+        let status = self.write_data::<4>(virt_addr, rt_val);
+        self.finish_status(status)
     }
 
     // SD - Store Doubleword (MIPS III, 64-bit)
@@ -3041,7 +3100,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<8>(virt_addr, rt_val)
+        let status = self.write_data::<8>(virt_addr, rt_val);
+        self.finish_status(status)
     }
 
     // LWL - Load Word Left
@@ -3075,9 +3135,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
                 // Sign-extend to 64 bits
                 self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3112,9 +3172,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
                 // Sign-extend to 64 bits
                 self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3139,7 +3199,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let aligned8  = virt_addr & !7;
         let half      = (virt_addr & 4) as usize; // 0 = upper dword half, 4 = lower
         let dw_shift  = (4 - half) << 3;          // 32 for upper half, 0 for lower
-        self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift)
+        let status = self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift);
+        self.finish_status(status)
     }
 
     // SWR - Store Word Right
@@ -3163,7 +3224,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let aligned8  = virt_addr & !7;
         let half      = (virt_addr & 4) as usize; // 0 = upper dword half, 4 = lower
         let dw_shift  = (4 - half) << 3;          // 32 for upper half, 0 for lower
-        self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift)
+        let status = self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift);
+        self.finish_status(status)
     }
 
     // LDL - Load Doubleword Left (MIPS III)
@@ -3190,9 +3252,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 let result = (mem_dword << shift) | (rt_val & !mask);
 
                 self.core.write_gpr(rt_reg, result);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3220,9 +3282,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 let result = (mem_dword >> shift) | (rt_val & !mask);
 
                 self.core.write_gpr(rt_reg, result);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3242,7 +3304,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let mask = 0xFFFFFFFFFFFFFFFFu64 >> shift;
         let value = rt_val >> shift;
 
-        self.write_data64_masked(aligned_addr, value, mask)
+        let status = self.write_data64_masked(aligned_addr, value, mask);
+        self.finish_status(status)
     }
 
     // SDR - Store Doubleword Right (MIPS III)
@@ -3261,7 +3324,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let mask = 0xFFFFFFFFFFFFFFFFu64 << shift;
         let value = rt_val << shift;
 
-        self.write_data64_masked(aligned_addr, value, mask)
+        let status = self.write_data64_masked(aligned_addr, value, mask);
+        self.finish_status(status)
     }
 
 
@@ -3292,7 +3356,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let phys_addr = if needs_translation {
             // Hit operations need address translation
             let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
-            if tr.is_exception() { return tr.status; }
+            if tr.is_exception() { return self.handle_exception(tr.status); }
             tr.phys as u64
         } else {
             // Index operations use virt_addr as index, no translation needed
@@ -3316,7 +3380,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.core.cp0_taghi = 0;
         }
 
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
 
@@ -3339,9 +3403,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
                 }
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3355,14 +3419,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if !self.cache.get_llbit() {
             // Store failed, set rt to 0
             self.core.write_gpr(rt_reg, 0);
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
 
         // Check if address matches the LL address
         let tr = self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr);
         if tr.is_exception() {
             self.cache.set_llbit(false);
-            return tr.status;
+            return self.finish_status(tr.status);
         }
         let phys_addr = tr.phys as u64;
         let ll_addr = (self.cache.get_lladdr() as u64) << 4;
@@ -3373,11 +3437,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
             }
-            status
+            self.finish_status(status)
         } else {
             self.core.write_gpr(rt_reg, 0);
             self.cache.set_llbit(false);
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -3398,9 +3462,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
                 }
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(status) => status
+            Err(status) => self.finish_status(status)
         }
     }
 
@@ -3414,14 +3478,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if !self.cache.get_llbit() {
             // Store failed, set rt to 0
             self.core.write_gpr(rt_reg, 0);
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
 
         // Check if address matches the LLD address
         let tr = self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr);
         if tr.is_exception() {
             self.cache.set_llbit(false);
-            return tr.status;
+            return self.finish_status(tr.status);
         }
         let phys_addr = tr.phys as u64;
         let ll_addr = (self.cache.get_lladdr() as u64) << 4;
@@ -3433,12 +3497,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
             }
-            status
+            self.finish_status(status)
         } else {
             // Store failed (address mismatch), set rt to 0 and clear LLBit
             self.core.write_gpr(rt_reg, 0);
             self.cache.set_llbit(false);
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -3447,7 +3511,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // Prefetch is a hint and can be implemented as a NOP
         // In a real implementation, this might trigger cache line fetches
         // For now, we just complete without doing anything
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // COP0 Instructions
@@ -3463,14 +3527,17 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             RS_CFC0 | RS_CTC0 => {
                 // CFC0/CTC0 are deprecated on R4000 - no separate control registers exist
                 // All CP0 registers are accessed via MFC0/MTC0
-                self.reserved_instruction(d)
+                let s = self.reserved_instruction(d);
+                self.handle_exception(s)
             }
             RS_BC0 => {
                 // BC0 (Branch on CP0 condition) is not used on R4000
-                self.reserved_instruction(d)
+                let s = self.reserved_instruction(d);
+                self.handle_exception(s)
             }
             _ => {
-                self.reserved_instruction(d)
+                let s = self.reserved_instruction(d);
+                self.handle_exception(s)
             }
         }
     }
@@ -3484,7 +3551,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let value = self.core.read_cp0(rd_val);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // DMFC0 - Doubleword Move From CP0 (MIPS III)
@@ -3494,7 +3561,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if rd_val == 1 { self.flush_cycles(); }
         let value = self.core.read_cp0(rd_val);
         self.core.write_gpr(rt_reg, value);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // MTC0 - Move To CP0
@@ -3504,7 +3571,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // Sign-extend from 32 bits
         self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
         self.handle_cp0_side_effects(rd_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
@@ -3513,7 +3580,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
         self.handle_cp0_side_effects(rd_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     fn handle_cp0_side_effects(&mut self, reg: u32) {
@@ -3530,14 +3597,17 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let funct_val = d.funct as u32;
 
         match funct_val {
-            FUNCT_TLBR => self.exec_tlbr(),
-            FUNCT_TLBWI => self.exec_tlbwi(),
-            FUNCT_TLBWR => self.exec_tlbwr(),
-            FUNCT_TLBP => self.exec_tlbp(),
-            FUNCT_ERET => self.exec_eret(),
-            FUNCT_WAIT => EXEC_COMPLETE, // phi opcode: invalid but not RI on R4000 (NOP)
+            // exec_tlbr/wi/wr/p always return bare EXEC_COMPLETE (no other
+            // status possible), so run them for effect then finish here.
+            FUNCT_TLBR => { self.exec_tlbr(); self.handle_exec_complete() }
+            FUNCT_TLBWI => { self.exec_tlbwi(); self.handle_exec_complete() }
+            FUNCT_TLBWR => { self.exec_tlbwr(); self.handle_exec_complete() }
+            FUNCT_TLBP => { self.exec_tlbp(); self.handle_exec_complete() }
+            FUNCT_ERET => self.exec_eret(), // already EXEC_COMPLETE_NO_INC — PC set directly, terminal as-is
+            FUNCT_WAIT => self.handle_exec_complete(), // phi opcode: invalid but not RI on R4000 (NOP)
             _ => {
-                self.reserved_instruction(d)
+                let s = self.reserved_instruction(d);
+                self.handle_exception(s)
             }
         }
     }
@@ -3664,22 +3734,28 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
     // ===== COP1 (FPU) Instructions =====
 
-    /// Set Cause.CE to the given coprocessor number and return EXC_CPU.
+    /// Set Cause.CE to the given coprocessor number and dispatch EXC_CPU.
+    /// Always used as an immediate `return self.cpu_unusable(..)` from a
+    /// dispatch-target handler, so it's the terminal action itself.
     #[inline]
     fn cpu_unusable(&mut self, ce: u32) -> ExecStatus {
         self.core.cp0_cause = (self.core.cp0_cause & !CAUSE_CE_MASK) | ((ce & 3) << CAUSE_CE_SHIFT);
-        exec_exception(EXC_CPU)
+        let s = exec_exception(EXC_CPU);
+        self.handle_exception(s)
     }
 
     /// After a FPU arithmetic op: read host exception flags, update FCSR cause+flag bits,
     /// and raise EXC_FPE if any enabled exception fired, otherwise EXEC_COMPLETE.
     /// Must be called after the result is written; host FP flags are cleared by this call.
     #[inline]
+    /// Always used as the terminal tail call of an FPU arithmetic exec_*
+    /// handler (`self.fpu_update_fcsr()`, nothing runs after), so this is the
+    /// terminal action itself: completes normally or dispatches EXC_FPE.
     fn fpu_update_fcsr(&mut self) -> ExecStatus {
         let flags = crate::platform::get_fpu_status(); // bits [6:2]: FV,FZ,FO,FU,FI
         crate::platform::clear_fpu_status();
         if flags == 0 {
-            return EXEC_COMPLETE;
+            return self.handle_exec_complete();
         }
         // Promote flag bits [6:2] → cause bits [16:12] (shift up by 10)
         let causes = (flags & FCSR_FM) << 10;
@@ -3690,14 +3766,16 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // to match real R4400 hardware behavior (hardware punts to software on underflow trap)
         if (causes & FCSR_CU) != 0 && (self.core.fpu_fcsr & 0x100) != 0 {
             self.core.fpu_fcsr |= FCSR_CE;
-            return exec_exception(EXC_FPE);
+            let s = exec_exception(EXC_FPE);
+            return self.handle_exception(s);
         }
         // Raise FPE if any cause bit has its corresponding enable bit set
         // Causes are 5 bits above enables: (causes >> 5) aligns them with enables
         if ((causes >> 5) & (self.core.fpu_fcsr & FCSR_EM)) != 0 {
-            return exec_exception(EXC_FPE);
+            let s = exec_exception(EXC_FPE);
+            return self.handle_exception(s);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // MFC1 - Move Word From FPU
@@ -3707,7 +3785,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32;
         let value = (self.fpr_read_w)(&self.core, fs_reg) as i32 as i64 as u64;
         self.core.write_gpr(rt_reg, value);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // DMFC1 - Move Doubleword From FPU (MIPS III)
@@ -3717,7 +3795,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32;
         let value = (self.fpr_read_l)(&self.core, fs_reg);
         self.core.write_gpr(rt_reg, value);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // CFC1 - Move Control Word From FPU
@@ -3727,7 +3805,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32;
         let value = self.core.read_fpu_control(fs_reg);
         self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // MTC1 - Move Word To FPU
@@ -3736,7 +3814,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
         let fs_reg = d.rd as u32;
         (self.fpr_write_w)(&mut self.core, fs_reg, rt_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // DMTC1 - Move Doubleword To FPU (MIPS III)
@@ -3745,7 +3823,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let fs_reg = d.rd as u32;
         (self.fpr_write_l)(&mut self.core, fs_reg, rt_val);
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // CTC1 - Move Control Word To FPU
@@ -3758,10 +3836,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if fs_reg == 31 {
             let fcsr = self.core.fpu_fcsr;
             if (fcsr & FCSR_CE) != 0 || (((fcsr & FCSR_CM) >> 5) & (fcsr & FCSR_EM)) != 0 {
-                return exec_exception(EXC_FPE);
+                let s = exec_exception(EXC_FPE);
+                return self.handle_exception(s);
             }
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // BC1 - Branch on FPU Condition Code
@@ -3777,9 +3856,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if condition {
             self.branch_delay(target)
         } else if likely {
-            EXEC_BRANCH_LIKELY_SKIP
+            self.handle_branch_likely_skip()
         } else {
-            EXEC_COMPLETE
+            self.handle_exec_complete()
         }
     }
 
@@ -3834,19 +3913,22 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).abs();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits()); EXEC_COMPLETE
+        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
+        self.handle_exec_complete()
     }
     fn exec_fmov_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let value = (self.fpr_read_l)(&self.core, fs_reg);
-        (self.fpr_write_l)(&mut self.core, fd_reg, value); EXEC_COMPLETE
+        (self.fpr_write_l)(&mut self.core, fd_reg, value);
+        self.handle_exec_complete()
     }
     fn exec_fneg_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let result = -f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits()); EXEC_COMPLETE
+        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
+        self.handle_exec_complete()
     }
     fn exec_fround_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3931,7 +4013,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             dlog_dev!(LogModule::Mips, "FPU fmov{}.s PC={:016x} cc{}={} taken={}",
                 if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_fmovz_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3940,7 +4022,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
             (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_fmovn_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3949,7 +4031,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
             (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_frecip_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4010,7 +4092,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (funct_val & 0x8) != 0 && (fs_val.is_nan() || ft_val.is_nan()) {
             self.core.fpu_fcsr |= FCSR_CV | 0x40; // set Cause V + Flag V
             if (self.core.fpu_fcsr & 0x800) != 0 { // EV enable bit
-                return exec_exception(EXC_FPE);
+                let s = exec_exception(EXC_FPE);
+                return self.handle_exception(s);
             }
         }
         let cond = self.fpu_compare_s(fs_val, ft_val, funct_val);
@@ -4020,7 +4103,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             dlog_dev!(LogModule::Mips, "FPU c.{:x}.s PC={:016x} cc{}={} fs={} ft={}",
                 funct_val, self.core.pc, cc, cond, fs_val, ft_val);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ===== COP1 D-format (Double-precision) =====
@@ -4080,20 +4163,23 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
         let result = read_d(&self.core, fs_reg).abs();
-        write_d(&mut self.core, fd_reg, result); EXEC_COMPLETE
+        write_d(&mut self.core, fd_reg, result);
+        self.handle_exec_complete()
     }
     fn exec_fmov_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let value = (self.fpr_read_l)(&self.core, fs_reg);
-        (self.fpr_write_l)(&mut self.core, fd_reg, value); EXEC_COMPLETE
+        (self.fpr_write_l)(&mut self.core, fd_reg, value);
+        self.handle_exec_complete()
     }
     fn exec_fneg_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
         let result = -read_d(&self.core, fs_reg);
-        write_d(&mut self.core, fd_reg, result); EXEC_COMPLETE
+        write_d(&mut self.core, fd_reg, result);
+        self.handle_exec_complete()
     }
     fn exec_fround_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4179,7 +4265,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             dlog_dev!(LogModule::Mips, "FPU fmov{}.d PC={:016x} cc{}={} taken={}",
                 if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_fmovz_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4189,7 +4275,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let val = read_d(&self.core, fs_reg);
             write_d(&mut self.core, fd_reg, val);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_fmovn_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4199,7 +4285,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let val = read_d(&self.core, fs_reg);
             write_d(&mut self.core, fd_reg, val);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_frecip_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4263,7 +4349,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (funct_val & 0x8) != 0 && (fs_val.is_nan() || ft_val.is_nan()) {
             self.core.fpu_fcsr |= FCSR_CV | 0x40; // set Cause V + Flag V
             if (self.core.fpu_fcsr & 0x800) != 0 { // EV enable bit
-                return exec_exception(EXC_FPE);
+                let s = exec_exception(EXC_FPE);
+                return self.handle_exception(s);
             }
         }
         let cond = self.fpu_compare_d(fs_val, ft_val, funct_val);
@@ -4273,7 +4360,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             dlog_dev!(LogModule::Mips, "FPU c.{:x}.d PC={:016x} cc{}={} fs={} ft={}",
                 funct_val, self.core.pc, cc, cond, fs_val, ft_val);
         }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
 
     // ===== COP1 W-format (Word fixed-point → float) =====
@@ -4323,8 +4410,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let addr = base.wrapping_add(index);
         let fd_reg = d.sa as u32;
         match self.read_data::<4>(addr) {
-            Ok(val) => { (self.fpr_write_w)(&mut self.core, fd_reg, val as u32); EXEC_COMPLETE }
-            Err(status) => status,
+            Ok(val) => { (self.fpr_write_w)(&mut self.core, fd_reg, val as u32); self.handle_exec_complete() }
+            Err(status) => self.finish_status(status),
         }
     }
     fn exec_ldxc1(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -4334,8 +4421,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let addr = base.wrapping_add(index);
         let fd_reg = d.sa as u32;
         match self.read_data::<8>(addr) {
-            Ok(val) => { (self.fpr_write_l)(&mut self.core, fd_reg, val); EXEC_COMPLETE }
-            Err(status) => status,
+            Ok(val) => { (self.fpr_write_l)(&mut self.core, fd_reg, val); self.handle_exec_complete() }
+            Err(status) => self.finish_status(status),
         }
     }
     fn exec_swxc1(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -4345,7 +4432,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_w)(&self.core, fs_reg) as u64;
-        self.write_data::<4>(addr, val)
+        let status = self.write_data::<4>(addr, val);
+        self.finish_status(status)
     }
     fn exec_sdxc1(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4354,11 +4442,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_l)(&self.core, fs_reg);
-        self.write_data::<8>(addr, val)
+        let status = self.write_data::<8>(addr, val);
+        self.finish_status(status)
     }
     fn exec_prefx(&mut self, _d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        EXEC_COMPLETE
+        self.handle_exec_complete()
     }
     fn exec_madd_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4460,9 +4549,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match self.read_data::<4>(addr) {
             Ok(value) => {
                 (self.fpr_write_w)(&mut self.core, ft_reg, value as u32);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(exc_status) => exc_status
+            Err(exc_status) => self.finish_status(exc_status)
         }
     }
 
@@ -4481,9 +4570,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         match self.read_data::<8>(addr) {
             Ok(value) => {
                 (self.fpr_write_l)(&mut self.core, ft_reg, value);
-                EXEC_COMPLETE
+                self.handle_exec_complete()
             }
-            Err(exc_status) => exc_status
+            Err(exc_status) => self.finish_status(exc_status)
         }
     }
 
@@ -4501,7 +4590,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let value = (self.fpr_read_w)(&self.core, ft_reg) as u64;
 
         // Store word to memory (alignment check done by write_data)
-        self.write_data::<4>(addr, value)
+        let status = self.write_data::<4>(addr, value);
+        self.finish_status(status)
     }
 
     // SDC1 - Store Doubleword from FPU
@@ -4518,7 +4608,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let value = (self.fpr_read_l)(&self.core, ft_reg);
 
         // Store doubleword to memory (alignment check done by write_data)
-        self.write_data::<8>(addr, value)
+        let status = self.write_data::<8>(addr, value);
+        self.finish_status(status)
     }
 
     // FPU single-precision comparison
@@ -4702,7 +4793,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         snapshot.memory_writes = std::mem::take(&mut self.pending_memory_writes);
         self.undo_buffer.push(snapshot);
     }
-    /// Execute the given decoded instruction.
+    /// Execute the given decoded instruction. Every dispatch-target exec_*
+    /// handler is now fully self-contained: it calls handle_exec_complete /
+    /// branch_delay / handle_branch_likely_skip / handle_exception itself as
+    /// its terminal action, so PC and in_delay_slot are already correct by
+    /// the time control returns here — this is a plain tail call.
     #[inline(always)]
     pub fn exec_decoded(&mut self, d: &DecodedInstr) -> ExecStatus {
         #[cfg(feature = "instr_stats")]
@@ -4710,41 +4805,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
         let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let status = f(self, d);
-
-        // Handle delay slot state machine — fast path for the common case
-        if status == EXEC_COMPLETE {
-            if self.in_delay_slot {
-                self.core.pc = self.delay_slot_target;
-                self.in_delay_slot = false;
-            } else {
-                self.core.pc = self.core.pc.wrapping_add(4);
-            }
-            return EXEC_COMPLETE;
-        }
-        match status {
-            EXEC_BRANCH_DELAY => {
-                if self.in_delay_slot {
-                    // Branch in delay slot - unusual but legal
-                } else {
-                    self.in_delay_slot = true;
-                }
-                self.core.pc = self.core.pc.wrapping_add(4);
-            }
-            EXEC_BRANCH_LIKELY_SKIP => { // == EXEC_COMPLETE_SKIP8
-                self.core.pc = self.core.pc.wrapping_add(8);
-            }
-            EXEC_COMPLETE_NO_INC => {
-                return EXEC_COMPLETE;
-            }
-            EXEC_RETRY => {}
-            EXEC_BREAKPOINT => {}
-            s if s & EXEC_IS_EXCEPTION != 0 => {
-                return self.handle_exception(s);
-            }
-            _ => {}
-        }
-        status
+        f(self, d)
     }
 
 }
