@@ -39,8 +39,12 @@ under `sudo` changes nothing, which makes the failure look unrelated to ports.
 ## Fix
 
 Allocate the injected source port from a separate 512..1023 counter when the
-forward targets 513/514. 512 ports is ample; the NAT key
-`(guest_ip, guest_port, sport)` stays unique.
+forward targets 513/514. The chosen port becomes part of the
+`tcp_fwd_pending` / `tcp_nat` / `tcp_tw` keys, so probe past any port still live
+for that guest port rather than blindly cycling — a wrapped counter would
+otherwise overwrite an in-flight or established entry and break that connection.
+512 ports covers any realistic number of concurrent rsh/rlogin sessions; if the
+range is somehow exhausted, drop the accept.
 
 ## Guest-side setup this still needs
 
