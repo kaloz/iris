@@ -202,6 +202,28 @@ The emulator prints a line for each rule that binds successfully at startup:
 iris: TCP port forward 127.0.0.1:2323 → guest:23
 ```
 
+#### rsh / rlogin
+
+Forwards to guest port 514 (`shell`) or 513 (`login`) are given a source port in
+the reserved 512–1023 range, because `rshd`/`rlogind` reject any client outside
+it. The guest sees the connection as coming from the **gateway** (`192.168.0.1`),
+not from the host's own address, so set up the trust against that:
+
+```sh
+# on IRIX — /etc/inetd.conf must have:  shell stream tcp nowait root /usr/etc/rshd rshd
+echo '192.168.0.1 gateway' >> /etc/hosts
+echo 'gateway yourname'     > /.rhosts     # ~/.rhosts for non-root; hosts.equiv never applies to root
+chmod 600 /.rhosts
+```
+
+```bash
+rsh -p 2514 root@127.0.0.1 uname -a
+```
+
+The rsh stderr channel (the reverse connection rshd opens back to the client)
+does not survive NAT — use a client that sends `0` as the stderr port, as `rcp`
+and most modern implementations do.
+
 #### Testing
 
 ```bash

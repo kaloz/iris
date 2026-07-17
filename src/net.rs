@@ -1048,6 +1048,8 @@ pub struct NatEngine {
     tcp_fwd_pending: HashMap<(u32, u16, u16), TcpFwdPending>,
     // Monotonically increasing counter for generating ephemeral ports for inbound forwards.
     fwd_ephemeral_next: u16,
+    // Same, for forwards to BSD r-services, which reject any source port outside 512..1023.
+    fwd_reserved_next: u16,
     // Number of configured (static) forwards at the front of `tcp_fwd_listeners`;
     // anything past this index is a transient FTP-ALG data forward (bounded, FIFO).
     fwd_static_count: usize,
@@ -1157,6 +1159,7 @@ impl NatEngine {
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
+               fwd_reserved_next: 512,
                guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new(),
                xdmcp_sessions: HashMap::new() }
     }
@@ -2394,9 +2397,18 @@ impl NatEngine {
             }
         }
         for (stream, guest_port) in accepted {
-            let ephemeral = self.fwd_ephemeral_next;
-            self.fwd_ephemeral_next = self.fwd_ephemeral_next.wrapping_add(1);
-            if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
+            // rshd/rlogind reject a client whose source port isn't reserved, and the
+            // guest only ever sees the port synthesized here, not the host client's.
+            let ephemeral = if matches!(guest_port, 513 | 514) {
+                let p = self.fwd_reserved_next;
+                self.fwd_reserved_next = if p >= 1023 { 512 } else { p + 1 };
+                p
+            } else {
+                let p = self.fwd_ephemeral_next;
+                self.fwd_ephemeral_next = self.fwd_ephemeral_next.wrapping_add(1);
+                if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
+                p
+            };
 
             let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
             // Forward to the guest's *actual* IP (learned from its traffic), not
