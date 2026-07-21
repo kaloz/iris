@@ -1048,6 +1048,8 @@ pub struct NatEngine {
     tcp_fwd_pending: HashMap<(u32, u16, u16), TcpFwdPending>,
     // Monotonically increasing counter for generating ephemeral ports for inbound forwards.
     fwd_ephemeral_next: u16,
+    // Same, for forwards to BSD r-services, which reject any source port outside 512..1023.
+    fwd_reserved_next: u16,
     // Number of configured (static) forwards at the front of `tcp_fwd_listeners`;
     // anything past this index is a transient FTP-ALG data forward (bounded, FIFO).
     fwd_static_count: usize,
@@ -1157,6 +1159,7 @@ impl NatEngine {
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
+               fwd_reserved_next: 512,
                guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new(),
                xdmcp_sessions: HashMap::new() }
     }
@@ -2378,6 +2381,36 @@ impl NatEngine {
     // guest's ethernet as if gateway_ip:ephemeral opened a connection to the guest.
     // The accepted TcpStream is stored in tcp_fwd_pending until the guest replies
     // with SYN-ACK (handled in handle_tcp above).
+    // Pick a source port for a synthesized inbound-forward connection that isn't
+    // already live for this guest port. Forwards to rsh/rlogin (513/514) must use
+    // a reserved 512..=1023 port or the guest's rshd/rlogind rejects them; all
+    // others use the 49152.. ephemeral range. The chosen port becomes part of the
+    // tcp_fwd_pending / tcp_nat / tcp_tw keys, so probe past any still in use — a
+    // blindly wrapped counter would otherwise overwrite a live entry and break
+    // that connection. Returns None if every port in the range is occupied.
+    fn alloc_fwd_sport(&mut self, guest_ip: Ipv4Addr, guest_port: u16) -> Option<u16> {
+        let reserved = matches!(guest_port, 513 | 514);
+        let (lo, hi) = if reserved { (512u16, 1023u16) } else { (49152u16, 65535u16) };
+        let gi = u32::from(guest_ip);
+        let gw = u32::from(self.config.gateway_ip);
+        let mut cur = if reserved { self.fwd_reserved_next } else { self.fwd_ephemeral_next };
+        if cur < lo || cur > hi { cur = lo; }
+        let mut chosen = None;
+        for _ in 0..=(hi - lo) {
+            let p = cur;
+            cur = if p >= hi { lo } else { p + 1 };
+            if !self.tcp_fwd_pending.contains_key(&(gi, guest_port, p))
+                && !self.tcp_nat.contains_key(&(gw, p, guest_port))
+                && !self.tcp_tw.contains_key(&(gw, p, guest_port))
+            {
+                chosen = Some(p);
+                break;
+            }
+        }
+        if reserved { self.fwd_reserved_next = cur; } else { self.fwd_ephemeral_next = cur; }
+        chosen
+    }
+
     fn poll_tcp_fwd_listeners(&mut self) {
         // Collect accepted streams to avoid mut borrow conflict while iterating listeners.
         let mut accepted: Vec<(TcpStream, u16)> = Vec::new();
@@ -2394,11 +2427,6 @@ impl NatEngine {
             }
         }
         for (stream, guest_port) in accepted {
-            let ephemeral = self.fwd_ephemeral_next;
-            self.fwd_ephemeral_next = self.fwd_ephemeral_next.wrapping_add(1);
-            if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
-
-            let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
             // Forward to the guest's *actual* IP (learned from its traffic), not
             // the assumed NAT client address — a static guest can be on any host.
             let guest_ip   = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
@@ -2409,13 +2437,20 @@ impl NatEngine {
             // IRIX will drop it (broadcast dst MAC with unicast dst IP is rejected).
             let Some(guest_mac) = self.guest_mac else {
                 dlog_dev!(LogModule::Net, "NAT FWD TCP: guest MAC not yet known, deferring SYN for guest:{}", guest_port);
-                // Put the stream back — we'll retry next poll cycle once we've seen a frame.
-                // Simplest approach: re-queue by pushing back into accepted list isn't possible
-                // here, so just drop this accept and let the host retry.
+                // Drop this accept without consuming a source port; the host will retry.
                 // In practice the guest MAC is always known by the time port-forward traffic arrives.
                 drop(stream);
                 continue;
             };
+
+            // Synthesize the client's source port (the guest never sees the host
+            // client's real one). None means the range is exhausted — drop the accept.
+            let Some(ephemeral) = self.alloc_fwd_sport(guest_ip, guest_port) else {
+                dlog_dev!(LogModule::Net, "NAT FWD TCP: no free source port for guest:{}, dropping accept", guest_port);
+                drop(stream);
+                continue;
+            };
+            let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
 
             dlog_dev!(LogModule::Net, "NAT FWD TCP inject SYN {}:{} → {}:{}", gw_ip, ephemeral, guest_ip, guest_port);
             let seg = tcp_segment(gw_ip, guest_ip, ephemeral, guest_port,
