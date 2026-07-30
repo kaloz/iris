@@ -12,7 +12,6 @@ pub struct OverlaySource<'a> {
     pub height:           usize,
     pub topscan:          usize,  // pre-increment value (overlay adds 1)
     pub cursor_x_adjust:  i32,
-    pub fb_x_offset:      i32,
     pub vc2_regs:         &'a [u16; 32],
     pub xmap_mode:        &'a [u32; 32],
     pub xmap_cursor_cmap: u8,
@@ -103,7 +102,7 @@ impl DebugOverlay {
         let cursor_en    = (display_ctrl & VC2_CTRL_CURSOR_EN) != 0;
         let cursor_x_reg = src.vc2_regs[VC2_REG_CURRENT_CURSOR_X   as usize];
         let cursor_y_reg = src.vc2_regs[VC2_REG_WORKING_CURSOR_Y   as usize];
-        let cursor_x_hot = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust - src.fb_x_offset;
+        let cursor_x_hot = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust;
         let cursor_y_hot = (cursor_y_reg as i32) - 31;
         let cursor_cmap_msb = src.xmap_cursor_cmap;
         let popup_cmap_msb  = src.xmap_popup_cmap;

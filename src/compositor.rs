@@ -28,8 +28,6 @@ pub struct CompositorSource<'a> {
     pub topscan:          usize,
     /// Cursor X hot-spot correction derived from VT timing
     pub cursor_x_adjust:  i32,
-    /// Horizontal framebuffer read offset (XYWIN.x − 0x1000; typically 2)
-    pub fb_x_offset:      i32,
     /// Visible display dimensions decoded from VC2 video timings
     pub width:            usize,
     pub height:           usize,
@@ -127,7 +125,7 @@ impl SwCompositor {
         let cursor_en      = (display_ctrl & VC2_CTRL_CURSOR_EN)  != 0;
         let cursor_size_64 = (display_ctrl & VC2_CTRL_CURSOR_SIZE) != 0;
 
-        let cursor_x_hot  = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust - src.fb_x_offset;
+        let cursor_x_hot  = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust;
         let cursor_y_hot  = (cursor_y_reg as i32) - 31;
 
         let cursor_cmap_msb = src.xmap_cursor_cmap;
@@ -143,12 +141,11 @@ impl SwCompositor {
         let buf          = &mut self.buf;
 
         let topscan       = src.topscan + 1;
-        let fb_x_offset_u = src.fb_x_offset as usize;
 
         for y in 0..height {
             let fb_y = (topscan + y) & 0x3FF;
             for x in 0..width {
-                let fb_x    = x + fb_x_offset_u;
+                let fb_x    = x;
                 let idx     = fb_y * 2048 + fb_x;
                 let out_idx = y    * 2048 + x;
                 let did5    = did_buf[y * 2048 + fb_x];

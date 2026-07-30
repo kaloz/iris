@@ -34,7 +34,6 @@ uniform usampler2D u_ramdac;
 uniform usampler2D u_xmap;
 
 uniform int  u_topscan;
-uniform int  u_fb_x_offset;
 uniform int  u_cursor_x_hot;
 uniform int  u_cursor_y_hot;
 uniform bool u_cursor_en;
@@ -92,7 +91,7 @@ void main() {
     }
 
     int fb_y  = (u_topscan + 1 + y) & 0x3FF;
-    int fb_x  = x + u_fb_x_offset;
+    int fb_x  = x;
 
     uint did5 = texelFetch(u_did, ivec2(fb_x, y), 0).r & 0x1Fu;
     uint mode = texelFetch(u_xmap, ivec2(int(did5), 0), 0).r;
@@ -443,10 +442,15 @@ impl Compositor for GlCompositor {
         let fbo        = self.fbo.unwrap();
         let vao        = self.vao.unwrap();
 
-        // ── Upload per-frame buffers (always full-frame) ────────────────────────
-        Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, w, h);
-        Self::upload_fb_u32(gl, tex_aux, src.fb_aux, w, h);
+        // ── Upload per-frame buffers ─────────────────────────────────────────────
+        // tex_rgb/tex_aux must be uploaded in full: fb_y = (topscan+1+y)&0x3FF can
+        // wrap to any framebuffer row regardless of the visible window height, so
+        // uploading only [0,h) leaves rows [h,FB_H) stale whenever topscan != 0.
+        Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, FB_W, FB_H);
+        Self::upload_fb_u32(gl, tex_aux, src.fb_aux, FB_W, FB_H);
         if !src.status_bar_only {
+            // tex_did is indexed by display row `y` directly (not fb_y), so the
+            // visible w×h window is all that's ever sampled.
             Self::upload_fb_u8(gl, tex_did, src.did, w, h);
         }
 
@@ -477,7 +481,7 @@ impl Compositor for GlCompositor {
 
         let cursor_x_reg = src.vc2_regs[VC2_REG_CURRENT_CURSOR_X as usize];
         let cursor_y_reg = src.vc2_regs[VC2_REG_WORKING_CURSOR_Y as usize];
-        let cursor_x_hot = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust - src.fb_x_offset;
+        let cursor_x_hot = (cursor_x_reg as i32) - 31 + src.cursor_x_adjust;
         let cursor_y_hot = (cursor_y_reg as i32) - 31;
 
         if cursor_en {
@@ -526,7 +530,6 @@ impl Compositor for GlCompositor {
             let unif = |name: &str| gl.get_uniform_location(program, name);
 
             gl.uniform_1_i32(unif("u_topscan").as_ref(),        src.topscan as i32);
-            gl.uniform_1_i32(unif("u_fb_x_offset").as_ref(),    src.fb_x_offset);
             gl.uniform_1_i32(unif("u_cursor_x_hot").as_ref(),   cursor_x_hot);
             gl.uniform_1_i32(unif("u_cursor_y_hot").as_ref(),   cursor_y_hot);
             gl.uniform_1_i32(unif("u_cursor_en").as_ref(),      cursor_en as i32);

@@ -52,8 +52,6 @@ pub struct Rex3Screen {
     pub topscan:         usize,
     /// Cursor X correction from VT timing decode
     pub cursor_x_adjust: i32,
-    /// Horizontal read offset into the framebuffer (XYWIN.x − 0x1000; typically 2)
-    pub fb_x_offset:     i32,
 
     /// When true, renderers may skip full compositor work and refresh only the
     /// status bar (heartbeat frames with no FB/palette change).
@@ -81,7 +79,6 @@ impl Rex3Screen {
             xmap_popup_cmap:  0,
             topscan:          0,
             cursor_x_adjust:  0,
-            fb_x_offset:      2,
             status_bar_only:  false,
             fb_borrowed:      false,
         }
@@ -269,7 +266,6 @@ impl Rex3Screen {
             vc2_regs:         &self.vc2_regs,
             topscan:          self.topscan,
             cursor_x_adjust:  self.cursor_x_adjust,
-            fb_x_offset:      self.fb_x_offset,
             width:            self.width,
             height:           self.height,
             status_bar_only:  self.status_bar_only,
@@ -287,7 +283,6 @@ impl Rex3Screen {
             height:           self.height,
             topscan:          self.topscan,
             cursor_x_adjust:  self.cursor_x_adjust,
-            fb_x_offset:      self.fb_x_offset,
             vc2_regs:         &self.vc2_regs,
             xmap_mode:        &self.xmap_mode,
             xmap_cursor_cmap: self.xmap_cursor_cmap,
@@ -355,9 +350,11 @@ pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usiz
                     }
                 }
 
-                let visible = (state_c & VT_CBLANK_XMAP_N) != 0
-                    && (state_a & VT_VIS_LN_VC_N)    == 0
-                    && (state_a & VT_DSPLY_EN_RO_N)   == 0;
+                let visible = (state_c & VT_CBLANK_XMAP_N) != 0;
+                   // && (state_a & VT_VIS_LN_VC_N)    == 0
+                   // && (state_a & VT_DSPLY_EN_RO_N)   == 0;
+                   // including these allow us for more precise 1024/1280 visible pixels
+                   // but we need two more to account for IRIX keeping 2 pixels on the left blank
 
                 if visible {
                     if visible_pixel.is_none() { visible_pixel = Some(pixel_offset); }
@@ -406,7 +403,7 @@ pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usiz
                 11
             }
         };
-        (w, h, cursor_x_adjust)
+        (w, h, cursor_x_adjust-2)
     } else {
         (0, 0, 0)
     }
