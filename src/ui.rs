@@ -17,7 +17,7 @@ use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
 use crate::wd33c93a::Wd33c93a;
 use glutin::config::ConfigTemplateBuilder;
-use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
+use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, PossiblyCurrentContext, Version};
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, SwapInterval, WindowSurface, Surface};
@@ -51,9 +51,23 @@ struct GlState {
 #[derive(Clone, Copy, PartialEq)]
 enum ScaleSnap { Scale1x, Scale2x }
 
+// Which context we actually got. GlCompositor and the texelFetch/integer-sampler
+// shaders need GL 3.2 core (usampler2D, #version 150). If the driver can't give us
+// that, we drop to a plain GL 2.1-compatible context and switch to SwCompositor +
+// a legacy (#version 120) copy-only shader — no integer textures, no texelFetch.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum GlTier { Core32, Legacy }
+
 struct GlRenderer {
     window:      Arc<Window>,
     gl_config:   glutin::config::Config,
+    // Created on the main thread (where the window/display were set up) and
+    // handed across to the refresh thread, which only calls make_current() on
+    // it. Some drivers (notably proprietary NVIDIA) are picky about GLX calls
+    // that validate against the drawable/FBConfig being issued from a thread
+    // other than the one that created the X11 connection/window.
+    not_current_context: Option<NotCurrentContext>,
+    gl_tier: GlTier,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
     // Current emulated display resolution (width, height), published for the
@@ -74,15 +88,13 @@ unsafe impl Send for GlRenderer {}
 
 impl GlRenderer {
     fn init_gl(&mut self) {
-        let raw_window_handle = self.window.raw_window_handle();
         let gl_display = self.gl_config.display();
 
-        let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));
-        let not_current_gl_context = unsafe {
-            gl_display
-                .create_context(&self.gl_config, &context_attributes)
-                .expect("failed to create context")
-        };
+        // The context itself was already created on the main thread in Ui::new()
+        // (see comment on not_current_context); here we only make it current on
+        // the refresh thread.
+        let not_current_gl_context = self.not_current_context.take()
+            .expect("GL context missing — init_gl() called more than once");
 
         let attrs = self.window.build_surface_attributes(Default::default());
         let gl_surface = unsafe {
@@ -101,13 +113,18 @@ impl GlRenderer {
 
         let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
 
+        // In the Legacy tier we don't have GL 3.2 core (no texelFetch, no usampler2D),
+        // so both the vertex and fragment shaders are written as plain GLSL 120 —
+        // varying/gl_FragColor instead of in/out — and there is no integer shader at all.
+        let legacy = self.gl_tier == GlTier::Legacy;
+
         let (integer_program, viewport_info_loc, scale_factor_loc,
              fallback_program, fallback_tex_loc, fallback_ortho_loc,
              vao, main_vbo, status_vbo) = unsafe {
 
             // Shared vertex shader: pixel-coordinate ortho projection.
             // ortho = (win_w, win_h); (0,0)=top-left, y increases downward.
-            let vs_src = "
+            let vs_src_150 = "
                 #version 150
                 in vec2 position;
                 in vec2 tex_coord;
@@ -119,10 +136,22 @@ impl GlRenderer {
                     v_tex_coord = tex_coord;
                 }
             ";
+            let vs_src_120 = "
+                #version 120
+                attribute vec2 position;
+                attribute vec2 tex_coord;
+                varying vec2 v_tex_coord;
+                uniform vec2 ortho;
+                void main() {
+                    vec2 ndc = (position / ortho) * 2.0 - 1.0;
+                    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+                    v_tex_coord = tex_coord;
+                }
+            ";
 
             // ── Integer shader: texelFetch, no filtering. Used at 1x and 2x. ──
-            // scale_factor must be an exact integer (1 or 2).
-            // quad_y = bottom edge of quad in GL pixels from bottom of window.
+            // scale_factor must be an exact integer (1 or 2). GL 3.2 core only —
+            // there is no legacy equivalent, Legacy tier always uses the fallback shader.
             let integer_fs_src = "
                 #version 150
                 in vec2 v_tex_coord;
@@ -143,7 +172,7 @@ impl GlRenderer {
 
             // ── Fallback shader: UV sampler with trilinear filtering. ──
             // Caller sets TEXTURE_MIN_FILTER = LINEAR_MIPMAP_LINEAR and generates mipmaps.
-            let fallback_fs_src = "
+            let fallback_fs_src_150 = "
                 #version 150
                 in vec2 v_tex_coord;
                 out vec4 color;
@@ -152,6 +181,17 @@ impl GlRenderer {
                     color = texture(tex, v_tex_coord);
                 }
             ";
+            let fallback_fs_src_120 = "
+                #version 120
+                varying vec2 v_tex_coord;
+                uniform sampler2D tex;
+                void main() {
+                    gl_FragColor = texture2D(tex, v_tex_coord);
+                }
+            ";
+
+            let vs_src = if legacy { vs_src_120 } else { vs_src_150 };
+            let fallback_fs_src = if legacy { fallback_fs_src_120 } else { fallback_fs_src_150 };
 
             let compile_shader = |kind: u32, src: &str| -> Option<glow::Shader> {
                 let s = gl.create_shader(kind).unwrap();
@@ -179,8 +219,12 @@ impl GlRenderer {
             let vs = compile_shader(glow::VERTEX_SHADER, vs_src)
                 .expect("vertex shader must compile");
 
-            // Integer program — try to compile; fall back to fallback_program if it fails.
-            let int_fs    = compile_shader(glow::FRAGMENT_SHADER, integer_fs_src);
+            // Integer program is GL 3.2 core only (#version 150, texelFetch) and has no
+            // legacy equivalent — linking it against the 120 vertex shader would be an
+            // invalid mixed-version program, so skip it outright in Legacy tier and always
+            // draw through fallback_program there. In Core32 tier, try to compile it;
+            // fall back to fallback_program if it fails.
+            let int_fs    = if legacy { None } else { compile_shader(glow::FRAGMENT_SHADER, integer_fs_src) };
             let int_prog  = int_fs.and_then(|fs| link_program(vs, fs));
 
             // Fallback program — must always compile.
@@ -396,8 +440,9 @@ impl Renderer for GlRenderer {
         let sb_h_px = STATUS_BAR_HEIGHT as f32 * scale_f;
         let sb_h_i  = sb_h_px as i32;
 
-        // Use integer texelFetch shader only at exactly 1x or 2x.
-        let use_integer = scale_f == 1.0 || scale_f == 2.0;
+        // Use integer texelFetch shader only at exactly 1x or 2x, and only when we
+        // actually have a Core32 context — Legacy tier has no texelFetch shader at all.
+        let use_integer = self.gl_tier == GlTier::Core32 && (scale_f == 1.0 || scale_f == 2.0);
         let scale_i = scale_f.round() as i32;
 
         // Recompute quads when anything changes.
@@ -583,22 +628,70 @@ impl Ui {
             })
             .unwrap();
 
-        let window      = Arc::new(window.unwrap());
+        let window = Arc::new(window.unwrap());
+
+        // Create the GL context here on the main thread, i.e. the same thread
+        // that created the window/display above. The refresh thread only
+        // makes it current later (in GlRenderer::init_gl); it never calls
+        // create_context itself. See the not_current_context field comment.
+        let raw_window_handle = window.raw_window_handle();
+        let gl_display = gl_config.display();
+
+        // Try, in order: (1) explicit GL 3.2 core — what GlCompositor and the
+        // texelFetch/integer shaders need; (2) explicit GL 2.1 compatibility —
+        // enough for SwCompositor + the legacy (#version 120) copy shader;
+        // (3) whatever the driver considers default, as a last resort. Some
+        // drivers (seen on NVIDIA proprietary) reject an unversioned/ambiguous
+        // context request with BadValue but accept an explicit version, so this
+        // also guards against the original bug independent of the tier we land on.
+        let attempts: &[(GlTier, ContextApi, Option<GlProfile>)] = &[
+            (GlTier::Core32, ContextApi::OpenGl(Some(Version::new(3, 2))), Some(GlProfile::Core)),
+            (GlTier::Legacy, ContextApi::OpenGl(Some(Version::new(2, 1))), Some(GlProfile::Compatibility)),
+            (GlTier::Legacy, ContextApi::OpenGl(None), None),
+        ];
+
+        let mut result = None;
+        for (tier, api, profile) in attempts {
+            let mut builder = ContextAttributesBuilder::new().with_context_api(*api);
+            if let Some(p) = profile {
+                builder = builder.with_profile(*p);
+            }
+            let context_attributes = builder.build(Some(raw_window_handle));
+            match unsafe { gl_display.create_context(&gl_config, &context_attributes) } {
+                Ok(ctx) => { result = Some((*tier, ctx)); break; }
+                Err(e) => eprintln!("iris: GL context attempt {:?} failed: {e}", tier),
+            }
+        }
+        let (gl_tier, not_current_context) = result
+            .expect("failed to create a GL context under any requested version/profile");
+        eprintln!("iris: using GL tier {:?}", gl_tier);
+
         let window_size = Arc::new(Mutex::new(None));
         let scale_snap  = Arc::new(Mutex::new(None));
         // Seed with the Indy's default 1280×1024; the render thread republishes
         // the real resolution on the first frame and on any mode change.
         let display_res = Arc::new(Mutex::new((1280u32, 1024u32)));
 
+        // GlCompositor needs GL 3.2 core (usampler2D/texelFetch); Legacy tier falls
+        // back to SwCompositor, which only ever uploads a plain RGBA texture.
+        let use_gl_compositor = gl_tier == GlTier::Core32;
+        let compositor: Box<dyn Compositor> = if use_gl_compositor {
+            Box::new(GlCompositor::new())
+        } else {
+            Box::new(SwCompositor::new())
+        };
+
         let renderer = GlRenderer {
             window:      window.clone(),
             gl_config,
+            not_current_context: Some(not_current_context),
+            gl_tier,
             window_size: window_size.clone(),
             scale_snap:  scale_snap.clone(),
             display_res: display_res.clone(),
             state:       None,
-            compositor:       Box::new(GlCompositor::new()),
-            use_gl_compositor: true,
+            compositor,
+            use_gl_compositor,
             current_w:     0,
             current_h:     0,
             current_win_w: 0,
