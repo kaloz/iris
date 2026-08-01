@@ -3918,8 +3918,6 @@ impl Rex3 {
                     overlay.draw_snapshot.clear();
                     overlay.draw_snapshot.extend(ring.iter_newest_first().copied());
                 }
-                overlay.reset_frame();
-
                 self.diag.fetch_or(Self::DIAG_LOCK_RENDERER, Ordering::Relaxed);
                 let mut renderer = self.renderer.lock();
 
@@ -4169,7 +4167,14 @@ impl Rex3 {
             REX3_SLOPEALPHA => ctx.slopealpha = from_slope(val),
             REX3_SLOPEGRN => ctx.slopegrn = from_slope(val),
             REX3_SLOPEBLUE => ctx.slopeblue = from_slope(val),
-            REX3_WRMASK => ctx.wrmask = val,
+            REX3_WRMASK => {
+                //if val & 0xFFFFFF == 0x6db6db {
+                //    eprintln!("REX3 process_register WRMASK write: val={:08x} -> forcing 0xffffff", val);
+                //    ctx.wrmask = 0xFFFFFF;
+                //} else {
+                    ctx.wrmask = val;
+                //}
+            }
             REX3_COLORI => ctx.set_colori(val),
             REX3_COLORX => ctx.colorx = from_color_red(val, ctx.drawmode1),
             REX3_SLOPERED1 => ctx.slopered = from_slope_red(val),

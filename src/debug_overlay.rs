@@ -75,9 +75,10 @@ impl DebugOverlay {
         self.show_cmap || self.show_disp_debug || self.show_draw_debug
     }
 
-    /// Record a DID→mode observation during the composition pixel loop.
-    /// Called by Rex3Screen after compose() fills seen_modes tracking.
-    pub fn record_mode(&mut self, did5: u8, raw: u32) {
+    /// Record a DID→mode observation. Called from render()'s did[]/xmap_mode scan
+    /// when show_disp_debug is on — did[] is the shared source of truth read by
+    /// both compositors, so this works regardless of which one rendered the frame.
+    fn record_mode(&mut self, did5: u8, raw: u32) {
         let n = self.seen_modes_count;
         if let Some(e) = self.seen_modes[..n].iter_mut().find(|e| e.did5 == did5 && e.raw == raw) {
             e.pix_count += 1;
@@ -85,11 +86,6 @@ impl DebugOverlay {
             self.seen_modes[n] = SeenMode { did5, raw, pix_count: 1 };
             self.seen_modes_count += 1;
         }
-    }
-
-    /// Reset per-frame tracking (call at the start of each compose pass).
-    pub fn reset_frame(&mut self) {
-        self.seen_modes_count = 0;
     }
 
     /// Render overlay into the CPU buffer and upload to the GL texture.
@@ -143,6 +139,20 @@ impl DebugOverlay {
 
         // ── DID/XMAP mode table overlay ──────────────────────────────────────────
         if self.show_disp_debug && height > 0 {
+            // did[] is the shared source of truth (both SwCompositor and GlCompositor's
+            // shader read from it) — classify on-screen DIDs against xmap_mode directly
+            // here instead of hooking per-pixel compose paths, so this works regardless
+            // of which compositor rendered the frame.
+            self.seen_modes_count = 0;
+            for y in 0..height {
+                let row_base = y * 2048;
+                for x in 0..width {
+                    let did5 = src.did[row_base + x];
+                    let raw = src.xmap_mode[did5 as usize];
+                    self.record_mode(did5, raw);
+                }
+            }
+
             let topscan = src.topscan + 1;
             let cx = cursor_x_hot.clamp(0, width as i32 - 1) as usize;
             let cy = cursor_y_hot.clamp(0, height as i32 - 1) as usize;
