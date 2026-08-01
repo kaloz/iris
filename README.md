@@ -233,6 +233,29 @@ IRIS_JIT=1 cargo run --release --features jit
 | `IRIS_JIT_VERIFY` | 0 | Run each block through interpreter and compare (debug) |
 | `IRIS_JIT_PROBE` | 200 | Base probe interval (steps between cache checks) |
 
+### MIPS JIT v2 (`--features jitv2`) — experimental
+
+Not a port of the JIT above — a new design built on different principles.
+The original JIT is a speculative, tiered block compiler with rollback (a
+compiled block can be wrong and gets caught/undone later); v2 deletes that
+failure mode instead of managing it: it compiles whole physical-page regions
+(not single basic blocks) to native code via Cranelift, with memory-resident
+registers and no speculation — a compiled region is either exactly
+equivalent to the interpreter or it never gets published. Not the default
+engine yet — build it in alongside `jit` to compare, or on its own to try it
+standalone. Enabled automatically at runtime once the feature is compiled in
+(no `IRIS_JIT=1` needed). See `rules/jitv2/jit-v2-design.md` for the full
+design and `HACKING.md`'s JIT v2 section for tuning.
+
+```
+cargo run --release --features jitv2,rex-jit
+```
+
+Extra features: `jitv2_lockstep` (shadow-compiles and cross-checks every
+dispatch against the interpreter — slow, diagnostic only) and
+`jitv2_corpus_dump` (dumps compile-request page snapshots to `jitv2_corpus/`
+instead of compiling, for building an offline test corpus).
+
 ### REX3 graphics JIT (`--features rex-jit`)
 
 Cranelift-based JIT for the REX3 graphics chip draw pipeline. Compiles a

@@ -66,6 +66,24 @@ default = ["tlbvmap"]
 jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
+# JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
+# Unconditionally-correct-at-publish redesign, replacing the speculative v1
+# tiered JIT. Built incrementally behind this flag; does not imply `jit`.
+jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
+# jitv2 dev tool: dump every compile-request's 4KB page snapshot to
+# jitv2_corpus/ instead of (alongside) actually compiling. Used to build a
+# corpus for offline analyzer/codegen development; off by default so normal
+# jitv2 runs never touch the filesystem from the compile thread.
+jitv2_corpus_dump = ["jitv2"]
+# jitv2 dev tool: temporary in-process lockstep verifier. On every dispatch,
+# classifies the current instruction (alu/branch/load-store/fpu) and, for the
+# categories currently wired up (alu only, to start), inline-compiles just
+# that one instruction, runs it against a saved core snapshot, restores real
+# core state, then runs the interpreter and asserts the two agree — a much
+# faster way to bisect a live-boot divergence into single instructions than
+# chopping the whole boot into recompiled binaries each time. Not for normal
+# runs (pays a compile per matching instruction, none of it cached).
+jitv2_lockstep = ["jitv2"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 # CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
@@ -127,6 +145,8 @@ cranelift-jit        = { version = "0.134", optional = true }
 cranelift-module     = { version = "0.134", optional = true }
 cranelift-native     = { version = "0.134", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
+region               = { version = "3.0",   optional = true }
+wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package = "wasmtime-internal-jit-icache-coherence" }
 libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
@@ -191,6 +211,16 @@ path = "src/iris_ci_main.rs"
 name = "chd_extract"
 path = "src/bin/chd_extract.rs"
 required-features = ["chd"]
+
+[[bin]]
+name = "jitv2_analyze"
+path = "src/bin/jitv2_analyze.rs"
+required-features = ["jitv2"]
+
+[[bin]]
+name = "jitv2_verify"
+path = "src/bin/jitv2_verify.rs"
+required-features = ["jitv2"]
 
 # Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
 # SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary

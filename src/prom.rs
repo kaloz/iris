@@ -15,6 +15,12 @@ struct PromInner {
     data: Vec<u32>,
     clock: AtomicU64,
     running: AtomicBool,
+    /// JIT v2 (rules/jitv2/jit-v2-design.md §2.4): "rom device points all generation
+    /// pointers to single u64 initialized to 0" — ROM content never mutates, so every
+    /// page shares this one counter and it is never bumped. A compiled artifact's gen
+    /// check against it therefore never fails due to ROM-side invalidation.
+    #[cfg(feature = "jitv2")]
+    gen: AtomicU64,
 }
 
 pub struct PromPort {
@@ -66,6 +72,8 @@ impl Prom {
                 data,
                 clock: AtomicU64::new(0),
                 running: AtomicBool::new(false),
+                #[cfg(feature = "jitv2")]
+                gen: AtomicU64::new(0),
             }),
         }
     }
@@ -185,6 +193,11 @@ impl BusDevice for PromPort {
     fn write64(&self, _addr: u32, _val: u64) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 {
+        &self.inner.gen as *const AtomicU64
     }
 }
 

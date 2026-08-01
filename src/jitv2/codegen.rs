@@ -1,0 +1,5777 @@
+//! JIT v2 codegen: translate a walked region (`jitv2/analyzer.rs`) into
+//! Cranelift IR (§3.1 — "one Cranelift IR block per instruction").
+//!
+//! This is the first pass only: allocate a Cranelift `Block` for every
+//! instruction the analyzer marked `visited`, plus one entry block that
+//! jumps straight to the entry instruction's block. No instruction
+//! semantics are emitted yet — every per-instruction block is empty (would
+//! trap if run as-is). Filling in real semantics, wiring the fallthrough/
+//! taken edges between blocks, and materializing exit stubs for
+//! `fallthrough_exit`/`taken_exit` land in follow-up passes.
+//!
+//! Standalone `cranelift_codegen::ir::Block` handles aren't stored in
+//! `analyzer.rs`'s `CompiledInstr` — that module stays free of the Cranelift
+//! dependency, so `block_id` is a plain `Option<u32>` there. `Block`
+//! implements `EntityRef`/`From<u32>`, so the conversion here is a bare cast.
+
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{self, AbiParam, Block, InstBuilder, MemFlagsData, Value};
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::Context;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_module::Module;
+
+use crate::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
+use crate::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::mips_core::MipsCore;
+use crate::mips_exec::{EXEC_COMPLETE, EXEC_IS_EXCEPTION};
+
+/// Cranelift codegen context, reused across compile jobs like `Analyzer`
+/// (§2.3's per-page scratch-buffer pattern) — `Context`/`FunctionBuilderContext`
+/// own reusable scratch allocations Cranelift would otherwise reallocate
+/// per function.
+pub struct Codegen {
+    module: cranelift_jit::JITModule,
+    ctx: Context,
+    builder_ctx: FunctionBuilderContext,
+    func_id_counter: u32,
+    /// Compiled machine code size, in bytes, of the most recent successful
+    /// `compile_region` call — see that function's "Read code size before
+    /// clearing context" comment for why this can't just be returned
+    /// directly. Dev-only (`j2 pcp`/`j2 stats` diagnostic); `handle_request`
+    /// reads it immediately after `compile_region` returns `Some` and
+    /// forwards it to `page.publish` as `JitEntry::code_size`.
+    #[cfg(feature = "developer")]
+    last_code_size: u32,
+    /// Set right before `compile_region` returns `None` iff that failure
+    /// was `ModuleError::Allocation` — the `ArenaMemoryProvider` running out
+    /// of its `ARENA_RESERVE_SIZE` reservation (real message observed live:
+    /// "pre-allocated jit memory region exhausted") — as opposed to
+    /// `ModuleError::Compilation` (a genuine codegen-gap/verifier failure,
+    /// which should sticky-denylist the offset, not trigger a flush).
+    /// Unconditional, not `developer`-gated: unlike `last_code_size`, this
+    /// drives real behavior (`comp::handle_request`'s flush-on-exhaustion),
+    /// not just a diagnostic. `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s
+    /// function-count proxy was sized against small, single-instruction
+    /// regions; now that `MAX_INSTRS_PER_COMPILE` (`comp.rs`) allows much
+    /// larger straight-line functions, a handful of unusually large
+    /// compiles can exhaust the byte-size-bounded arena before the
+    /// function-*count* threshold ever trips — this is the belt-and-suspenders
+    /// catch for exactly that gap, same reasoning as
+    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s own doc comment already
+    /// anticipated ("handled too... as a belt-and-suspenders").
+    last_compile_ran_out_of_memory: bool,
+    /// Set when the most recent `None` return from `compile_region` came
+    /// from `self.module.define_function`'s `ModuleError::Compilation` arm
+    /// (a real Cranelift verifier rejection) rather than the upfront
+    /// no-emitter-for-this-instruction loop — `comp::handle_request` reads
+    /// this via `last_decline_was_verifier_error()` immediately after a
+    /// `None` result to classify the rejection for `JitStats::reject_reasons`
+    /// (`RejectReason::CraneliftVerifierError` vs
+    /// `RejectReason::AnalyzerCodegenDisagreement`). Always cleared at the
+    /// top of `compile_region` (mirrors `last_compile_ran_out_of_memory`'s
+    /// own reset-at-entry discipline) so a stale `true` from a previous call
+    /// can never leak into a later, unrelated decline.
+    #[cfg(feature = "developer")]
+    last_decline_was_verifier_error: bool,
+    /// Shared with the `PagedArenaMemoryProvider` this `Codegen`'s `module`
+    /// was built with — see `PagedArenaState`'s own doc comment for why this
+    /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
+    /// after every compile.
+    paged_state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+}
+
+/// Per-instruction emission context: the three values that are the same for
+/// every emit call made while compiling one instruction's body (`builder`,
+/// `module`, `core_ptr` — Cranelift's own builder/module handles plus the
+/// live `MipsCore*` argument), together with `raw`/`word`, which genuinely
+/// describe *this* instruction (its encoding and its compile-time word
+/// offset within the page) — not an arbitrary register number or an
+/// unrelated branch/slot target word, which stay explicit parameters on the
+/// handful of helpers that operate on those instead (`emit_read_gpr(reg)`,
+/// `emit_word_addr(word)` for a *target*, etc.).
+///
+/// `word` is what `emit_check_mem_exc` needs to synthesize the correct
+/// exception PC on a fault (see that function's doc comment): a plain
+/// sequential instruction's body never writes `core.pc` per-instruction
+/// (only exit points do, to keep a straight-line compiled run cheap — that's
+/// the entire point of compiling it), so without `word` here, `core.pc`
+/// stays stale from wherever the compiled unit last wrote it, and a mid-unit
+/// fault reports the wrong EPC.
+///
+/// `entry_word` is the region's own entry word (`compile_region`'s own
+/// parameter of the same name, copied in here unmodified for the whole
+/// compile) — needed by `emit_exception_exit` to know when `ctx.word ==
+/// entry_word`, the one case where synthesizing `core.pc` from `ctx.word`
+/// would be wrong: a physical word can be compiled once as an ordinary
+/// entry and *also*, on a later dispatch, be reached because the
+/// interpreter's own dispatch loop landed on it as some other branch's
+/// delay slot (`core.in_delay_slot` already true, `core.pc` already correct,
+/// both set by the interpreter *before* calling into this compiled
+/// function — see `MipsExecutor::branch_delay`/`handle_exec_complete`).
+/// Every other word in the region never has this ambiguity: a non-entry
+/// head instruction's `in_delay_slot` is deterministically false (this
+/// compiled unit's own control flow guarantees it), and a slot's is
+/// explicitly managed by `emit_slot_semantics` itself. See
+/// `emit_exception_exit`'s doc comment for the actual check.
+///
+/// `exit_block` is the compiled function's one shared exit-to-interpreter
+/// block (`BlockSkeleton::exit_block`/`compile_region`'s own local of the
+/// same name) — needed by `emit_check_mem_exc` to bail there (via
+/// `emit_bail`) on a non-exception nonzero status (`EXEC_RETRY`/
+/// `EXEC_BREAKPOINT`) instead of routing it into `emit_exception_exit`,
+/// which must only ever run for a real exception (`EXEC_IS_EXCEPTION` set).
+struct EmitCtx<'a, 'b> {
+    builder: &'a mut FunctionBuilder<'b>,
+    module: &'a mut dyn cranelift_module::Module,
+    core_ptr: Value,
+    raw: u32,
+    word: WordOffset,
+    entry_word: WordOffset,
+    /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
+    /// call site is currently being emitted with this `ctx` — `true` only
+    /// while emitting a delay slot's own inlined semantics
+    /// (`emit_slot_semantics` sets this before calling into the slot's
+    /// semantics emitter), `false` for every ordinary (non-slot) head
+    /// instruction, including one that's independently reachable as this
+    /// same region's own branch/jump target (§6.1.4 dual semantics) — that
+    /// occurrence is a structurally separate `ctx`/emission from the
+    /// inlined-slot one, with its own `bd = false`, never sharing state with
+    /// it. `emit_exception_exit` passes this straight through to
+    /// `exception_other_word_block` as a literal, so BD is always written
+    /// unconditionally at the exception-exit call site itself rather than
+    /// trusted from whatever's already live in `core.in_delay_slot`.
+    bd: bool,
+    exit_block: Block,
+    /// Two-stage shared exception-raise blocks (see their own doc comments
+    /// on `BlockSkeleton`) — `emit_exception_exit` picks which outer stage
+    /// to jump to at *compile* time (`ctx.word == ctx.entry_word` is always
+    /// known when emitting a given call site), so no call site ever pays a
+    /// runtime check for something that's actually fixed for that site.
+    exception_call_block: Block,
+    exception_entry_word_block: Block,
+    exception_other_word_block: Block,
+}
+
+/// Result of the block-allocation first pass: every visited instruction's
+/// word offset paired with the `Block` codegen created for it, plus the
+/// dedicated entry block that jumps to `entry_word`'s block, plus the shared
+/// exit-to-interpreter block. Not yet a finished function — no instruction
+/// bodies, no edges between the per-instruction blocks besides the entry jump.
+pub struct BlockSkeleton {
+    /// The function-entry Cranelift block (unsealed until the caller finishes
+    /// wiring the CFG). Jumps unconditionally to `entry_word`'s block.
+    pub entry_block: Block,
+    /// Single shared "exit to interpreter" block for the whole function
+    /// (§3.3 — every clean exit, preamble bail or fallthrough_exit/taken_exit
+    /// stub alike, jumps here instead of each emitting its own copy of the
+    /// materialize-PC-and-return sequence). Takes one `i64` block param: the
+    /// exiting instruction's word offset. Its body is emitted here, in
+    /// `build_block_skeleton`, since it never varies — only the jumps into
+    /// it do. Left unsealed: its predecessors (every bail site in the
+    /// function) aren't all known until the whole function is built; the
+    /// caller must seal it once emission is complete. Use [`emit_bail`] at
+    /// every exit site instead of duplicating this block's body.
+    pub exit_block: Block,
+    /// Shared "raise an architectural exception" machinery for the whole
+    /// function — the code-density counterpart of `exit_block`, but for
+    /// `emit_exception_exit`'s call sites instead of `emit_bail`'s (overflow
+    /// traps, TEQ/TNE-family traps, memory faults, FPU exceptions, the
+    /// CU1/FR guard: every one of them used to emit its own full inline copy
+    /// of the delay-slot-synthesis check + `handle_exception_fn` call, which
+    /// showed up directly in compiled code size for any region touching more
+    /// than one of them). Split into three blocks, two-stage, rather than
+    /// one block taking `word` as a runtime param: `ctx.word == ctx.entry_word`
+    /// is always known at *compile* time for any given `emit_exception_exit`
+    /// call site (only ever one fixed `entry_word` per region), so there is
+    /// no need to pay a runtime check for it — each call site picks the
+    /// right outer stage directly.
+    ///
+    /// - [`Self::exception_other_word_block`]: outer stage for every
+    ///   non-entry-word call site — unconditionally synthesizes `fault_pc`
+    ///   AND writes `core.in_delay_slot` from its own `bd` param (never
+    ///   trusts either field's live value on entry) before falling into the
+    ///   inner stage. Params: `(core_ptr, word: i64, bd: i8, status: i32)` —
+    ///   `word`/`bd` are genuine runtime values here since this one block is
+    ///   shared across every non-entry word in the region, both inside a
+    ///   delay slot's own inlined semantics (`bd=true`) and not (`bd=false`)
+    ///   — see `emit_exception_exit`'s doc comment.
+    /// - [`Self::exception_entry_word_block`]: outer stage for entry-word
+    ///   call sites — unconditional, no synthesis and no check at all (just
+    ///   falls into the inner stage). Correct because `core.pc`/
+    ///   `core.in_delay_slot` are guaranteed already correct on arrival at
+    ///   entry_word by construction: the interpreter's own dispatch sets
+    ///   them correctly on the external-entry path, and `entry_word_block`
+    ///   (the target of every *internal* edge into entry_word — see its doc
+    ///   comment in `compile_region_uncommitted`) materializes them itself
+    ///   before falling into the shared body, since that's the only point
+    ///   that knows the edge is internal. See
+    ///   `emit_exception_entry_word_block_body`'s doc comment for why a
+    ///   runtime check *here* cannot substitute for that — by this point
+    ///   there is no signal left to distinguish the two arrival paths.
+    ///   Params: `(core_ptr, status: i32)`.
+    /// - [`Self::exception_call_block`]: inner stage, the actual
+    ///   `handle_exception_fn` call + return — assumes `core.pc`/
+    ///   `core.in_delay_slot` are already correct on entry (both outer
+    ///   stages guarantee this before falling through). Params:
+    ///   `(core_ptr, status: i32)`.
+    ///
+    /// All three bodies are emitted once here, in `build_block_skeleton`.
+    /// Left unsealed for the same reason `exit_block` is — the caller must
+    /// seal them once every exception-exit site has been emitted.
+    pub exception_call_block: Block,
+    pub exception_entry_word_block: Block,
+    pub exception_other_word_block: Block,
+    /// (word offset, allocated block) for every instruction in the region,
+    /// in ascending word-offset order (mirrors `instrs_linear`'s order).
+    pub instr_blocks: Vec<(WordOffset, Block)>,
+}
+
+/// `opt_level` used by every `Codegen::new_module()` call from here on —
+/// process-wide, not per-`Codegen`, since `opt_level` is baked into the ISA
+/// `Flags` at module-construction time and can't be changed for an
+/// already-built `JITModule`. `j2 opt [none|speed]` flips this; it only
+/// takes effect on the *next* `Codegen::new()`/`reset()` (a flush, or a
+/// fresh process), not retroactively for functions already compiled — same
+/// "takes effect on the next relevant event" contract as `j2 batch`/`j2
+/// inline`. `AtomicBool` (not the setting's own string) since only two
+/// values are ever offered here; `true` = "speed".
+///
+/// Defaults to `false` (`none`) under `developer` — diagnostics builds want
+/// the simplest, most predictable codegen output, not real Cranelift
+/// optimization passes reordering/eliding IR mid-investigation — and to
+/// `true` (`speed`) otherwise, since production runs want the faster
+/// generated code `speed` produces.
+static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
+
+impl Codegen {
+    /// Set the `opt_level` used by future `Codegen::new()`/`reset()` calls.
+    /// `speed` trades slower compiles for faster generated code (real
+    /// register allocation, instruction selection heuristics tuned for
+    /// runtime cost rather than compile cost); `none` (the default) is what
+    /// this codegen has always used — compile latency matters more than
+    /// codegen quality for `opt_level=none`-sized single/few-instruction
+    /// regions, but `speed` is worth comparing once regions grow larger
+    /// (`MAX_INSTRS_PER_COMPILE`).
+    pub fn set_opt_level_speed(speed: bool) {
+        CODEGEN_OPT_LEVEL_SPEED.store(speed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn opt_level_speed() -> bool {
+        CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Upfront reservation for `ArenaMemoryProvider` — see `new_module`'s
+    /// own doc comment for why this exists at all. Sized generously: this is
+    /// a `PROT_NONE` virtual-address-space reservation (cheap — nothing is
+    /// actually committed/faulted-in until code is written there), not a
+    /// RAM commitment, and 64-bit address space is abundant, so there's no
+    /// real cost to reserving far more than we expect to use. 512MiB is
+    /// comfortably above the ~27MB of compiled code observed for ~130k
+    /// functions live (roughly ~215 bytes/function average), leaving room
+    /// for `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s full 1_000_000 functions
+    /// (~200MB+ at that rate) plus slack for larger-than-average regions.
+    const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
+
+    /// Host mmap page granularity `ArenaMemoryProvider` rounds every
+    /// function's segment up to (`memory/arena.rs`'s own `align_up(size,
+    /// page::size())`, via the `region` crate — a transitive dependency of
+    /// `cranelift-jit`, not depended on directly here, so this is a named
+    /// assumption rather than a call to `region::page::size()`). 4KiB is
+    /// correct for every platform this project actually targets
+    /// (`target-cpu=native` x86-64/aarch64 Linux and macOS) — if that ever
+    /// changes, this is the one place to update, not a magic number buried
+    /// in `code_bytes_used`'s arithmetic.
+    ///
+    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s own doc comment already derived
+    /// this fact independently (confirmed live: the arena exhausts at
+    /// *exactly* `ARENA_RESERVE_SIZE / HOST_PAGE_SIZE` functions, not a
+    /// byte-size estimate) — this constant makes that same fact available
+    /// to `Jitv2::code_bytes_used`'s per-entry accounting instead of just
+    /// the flush-threshold math.
+    pub const HOST_PAGE_SIZE: u64 = 4096;
+
+    /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
+    /// `alloc::alloc`s, which on Linux still routes through mmap for
+    /// large/page-sized allocations) a fresh chunk sized to fit exactly
+    /// each function that doesn't fit whatever's left in the current chunk
+    /// (`memory.rs`'s own `// TODO: Allocate more at a time.` — it never
+    /// over-allocates or reuses freed space). With small `opt_level=none`
+    /// regions and no coalescing, that's close to one distinct VMA per
+    /// compiled function — confirmed live: a process with ~130k compiled
+    /// functions was sitting at exactly `vm.max_map_count` (262144)
+    /// mappings, and the next mmap call of any kind (even an unrelated new
+    /// thread's stack guard page) then failed. `ArenaMemoryProvider`
+    /// reserves one big contiguous region up front instead and
+    /// bump-allocates every function into it — one mapping total,
+    /// regardless of function count, for as long as it fits within
+    /// `ARENA_RESERVE_SIZE`.
+    fn new_module() -> (cranelift_jit::JITModule, std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>) {
+        let mut flag_builder = settings::builder();
+        let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
+        flag_builder.set("opt_level", opt_level).unwrap();
+        flag_builder.set("is_pic", "false").unwrap();
+        let isa_builder = cranelift_native::builder().expect("host ISA not supported");
+        let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
+        let mut jit_builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        let arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(Self::ARENA_RESERVE_SIZE, paged_state.clone())
+            .expect("failed to reserve jitv2 Codegen arena");
+        jit_builder.memory_provider(Box::new(arena));
+        (cranelift_jit::JITModule::new(jit_builder), paged_state)
+    }
+
+    pub fn new() -> Self {
+        let (module, paged_state) = Self::new_module();
+        Self {
+            ctx: module.make_context(),
+            module,
+            builder_ctx: FunctionBuilderContext::new(),
+            func_id_counter: 0,
+            #[cfg(feature = "developer")]
+            last_code_size: 0,
+            last_compile_ran_out_of_memory: false,
+            #[cfg(feature = "developer")]
+            last_decline_was_verifier_error: false,
+            paged_state,
+        }
+    }
+
+    /// True iff the most recent successful `compile_region`/
+    /// `compile_region_uncommitted` call's allocation started a brand-new
+    /// host-page segment (as opposed to packing into, or growing, the
+    /// previously-allocated one) — the exact, non-heuristic page-crossing
+    /// signal `PagedArenaMemoryProvider` exists to provide (see its module
+    /// doc comment). Edge-triggered: reading this clears it, so each call
+    /// reports only what happened since the last read, not a sticky "have we
+    /// ever crossed" flag. `worker_loop`'s batching loop polls this after
+    /// every deferred compile to decide when to flush the pending batch —
+    /// unconditional (not `developer`-gated), unlike `packing_stats` below:
+    /// this drives real batching behavior, not just a diagnostic.
+    pub fn provider_crossed_page(&self) -> bool {
+        self.paged_state.crossed_page()
+    }
+
+    /// `(bytes_actually_used, bytes_reserved)` across every segment the
+    /// underlying `PagedArenaMemoryProvider` has ever allocated — see
+    /// `PagedArenaState::packing_stats`. `j2 stats`'s packing-quality report,
+    /// but also unconditional (not `developer`-gated): the `.1` (reserved)
+    /// half now drives the real flush decision in both `worker_loop` and the
+    /// inline-compile path (`CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`), so it
+    /// can't be diagnostics-only anymore.
+    pub fn packing_stats(&self) -> (u64, u64) {
+        self.paged_state.packing_stats()
+    }
+
+    /// Reclaim every executable-memory page this `Codegen` has ever
+    /// finalized and start fresh with a new, empty `JITModule`. Plain
+    /// `Drop`/replacement (`*self = Codegen::new()`) does **not** do this —
+    /// `cranelift_jit::Memory`'s `Drop` impl deliberately `mem::forget`s
+    /// every allocation instead of freeing it, specifically so a dangling
+    /// `JitFn` pointer can never become a use-after-free; the only way to
+    /// actually reclaim the memory is `JITModule::free_memory`, which is
+    /// `unsafe` for exactly the mirror-image reason (every `JitFn` this
+    /// module ever returned becomes an immediately-dangling pointer the
+    /// moment this returns).
+    ///
+    /// # Safety
+    /// The caller must guarantee no `JitFn` obtained from this `Codegen`
+    /// (via any earlier `compile_region` call) is still reachable/callable
+    /// anywhere after this returns — e.g. `jitv2_lockstep`'s
+    /// `lockstep_flush_if_grown`, which clears `lockstep_cache` (the only
+    /// place those pointers are ever stored — never published into the real
+    /// `page`/`entries` table) in the same operation.
+    pub unsafe fn reset(&mut self) {
+        let (new_module, new_paged_state) = Self::new_module();
+        let old_module = std::mem::replace(&mut self.module, new_module);
+        unsafe { old_module.free_memory(); }
+        self.paged_state = new_paged_state;
+        self.ctx = self.module.make_context();
+        self.func_id_counter = 0;
+        #[cfg(feature = "developer")]
+        { self.last_code_size = 0; }
+        self.last_compile_ran_out_of_memory = false;
+    }
+
+    /// Number of functions compiled into this `Codegen`'s `JITModule` since
+    /// construction or the last `reset()` — a simple, dependency-free proxy
+    /// for its Cranelift memory-arena growth (no Cranelift-internal byte-size
+    /// API needed, same reasoning as `jitv2_lockstep`'s own
+    /// `LOCKSTEP_CACHE_FLUSH_THRESHOLD`). Callers with an unbounded compile
+    /// lifetime (`comp::handle_request`'s worker loop, `jitv2_inline_compile`)
+    /// should flush once this crosses a threshold — `cranelift_jit::Memory`
+    /// never frees on drop/replace (see `reset`'s own doc comment), so
+    /// nothing else naturally bounds this.
+    pub fn function_count(&self) -> u32 {
+        self.func_id_counter
+    }
+
+    /// Compiled machine code size, in bytes, of the most recent successful
+    /// `compile_region` call — see `last_code_size`'s own field doc comment.
+    #[cfg(feature = "developer")]
+    pub fn last_code_size(&self) -> u32 {
+        self.last_code_size
+    }
+
+    /// Whether the most recent `compile_region` call returned `None`
+    /// because the arena is out of memory, as opposed to a real codegen
+    /// decline — see `last_compile_ran_out_of_memory`'s own field doc
+    /// comment. `comp::handle_request` checks this immediately after a
+    /// `None` result to decide whether to sticky-denylist the offset or
+    /// flush and let it retry.
+    pub fn last_compile_ran_out_of_memory(&self) -> bool {
+        self.last_compile_ran_out_of_memory
+    }
+
+    /// Whether the most recent `compile_region` call's `None` return came
+    /// from Cranelift's own verifier (`ModuleError::Compilation`) rather
+    /// than the upfront no-emitter-for-this-instruction loop — see the
+    /// field's own doc comment. Meaningless (always `false`) after a
+    /// successful compile or an arena-out-of-memory decline; callers should
+    /// only consult this immediately after a `None` result that
+    /// `last_compile_ran_out_of_memory()` says isn't OOM.
+    #[cfg(feature = "developer")]
+    pub fn last_decline_was_verifier_error(&self) -> bool {
+        self.last_decline_was_verifier_error
+    }
+
+    /// First codegen pass over a walked region (§3.1): create the function
+    /// signature (`JitFn`'s shape — `extern "C" fn(*mut MipsCore) -> ExecStatus`,
+    /// i.e. one pointer param, one `i32` return), then allocate one Cranelift
+    /// `Block` per visited instruction plus the dedicated entry block that
+    /// jumps to `entry_word`'s block.
+    ///
+    /// `instrs` is the analyzer's walked buffer (`Analyzer::walk`'s first
+    /// return value); `entry_word` must be a visited offset in it (the same
+    /// one passed to `walk`).
+    ///
+    /// Writes each instruction's allocated block back into
+    /// `instrs[offset].block_id` (as `block.as_u32()`) so later passes can
+    /// look up "what block did instruction X get" directly from the walked
+    /// buffer instead of re-deriving it from `BlockSkeleton::instr_blocks`.
+    ///
+    /// Blocks are left unsealed — Cranelift requires every predecessor of a
+    /// block to be known before sealing it, and this pass only establishes
+    /// the entry edge; internal edges (fallthrough/taken) are wired by the
+    /// next pass, which is also responsible for sealing.
+    pub fn build_block_skeleton(
+        &mut self,
+        instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE],
+        entry_word: WordOffset,
+    ) -> BlockSkeleton {
+        self.ctx.func.signature = self.jit_fn_signature();
+        self.ctx.func.name = ir::UserFuncName::user(0, self.func_id_counter);
+        self.func_id_counter += 1;
+
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+
+        let mut instr_blocks = Vec::new();
+        let mut entry_word_block = None;
+        for instr in instrs_linear(instrs) {
+            let block = builder.create_block();
+            if instr.word == entry_word {
+                entry_word_block = Some(block);
+            }
+            instr_blocks.push((instr.word, block));
+        }
+        let entry_word_block = entry_word_block
+            .expect("entry_word must be a visited offset in the walked buffer");
+
+        builder.switch_to_block(entry_block);
+        builder.ins().jump(entry_word_block, &[]);
+        builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
+
+        // Shared exit-to-interpreter block (see BlockSkeleton::exit_block's
+        // doc comment). Params: (core_ptr, word_offset). core_ptr must be
+        // its own block param — not the entry_block value captured above —
+        // because a block with multiple/deferred predecessors can only use
+        // values defined in blocks that dominate it; threading it as a param
+        // is how Cranelift wants a value made available across an
+        // as-yet-unknown set of incoming edges.
+        let exit_block = builder.create_block();
+        let ptr_ty = builder.func.signature.params[0].value_type;
+        let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
+        let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
+        builder.switch_to_block(exit_block);
+        emit_exit_block_body(&mut builder, exit_core_ptr, word_offset_param);
+        // Not sealed: predecessors are every bail site across the whole
+        // function, established incrementally as later passes emit them.
+
+        // Shared exception-raise machinery (see BlockSkeleton's own doc
+        // comment for the two-stage rationale) — same block-param pattern as
+        // exit_block above, split into three blocks so no call site ever
+        // pays a runtime word==entry_word check.
+        let exception_call_block = builder.create_block();
+        let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
+        let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
+        builder.switch_to_block(exception_call_block);
+        emit_exception_call_block_body(&mut self.module, &mut builder, call_core_ptr, call_status_param);
+
+        let exception_other_word_block = builder.create_block();
+        let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
+        let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
+        let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
+        let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
+        builder.switch_to_block(exception_other_word_block);
+        emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
+
+        let exception_entry_word_block = builder.create_block();
+        let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
+        let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
+        builder.switch_to_block(exception_entry_word_block);
+        emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
+        // None of the three sealed here: predecessors (every emit_exception_exit
+        // call site, plus the two outer stages' own jumps into
+        // exception_call_block) are established incrementally as later
+        // passes emit them.
+
+        // Write blocks back into the walked buffer so later passes can find
+        // "the block for instruction at word W" via instrs[w].block_id
+        // directly, without threading instr_blocks through separately.
+        for &(word, block) in &instr_blocks {
+            instrs[word as usize].block_id = Some(block.as_u32());
+        }
+
+        // builder is dropped here (not finalized) — this pass only stakes
+        // out the block graph's nodes and the single entry edge. The next
+        // pass reopens each block via switch_to_block, emits its
+        // instruction's semantics, wires fallthrough/taken edges, and seals
+        // once all of a block's predecessors are known.
+        drop(builder);
+
+        BlockSkeleton { entry_block, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, instr_blocks }
+    }
+
+    /// Signature for `JitFn` (`jitv2/jitv2.rs`): `extern "C" fn(*mut MipsCore) -> ExecStatus`.
+    fn jit_fn_signature(&self) -> ir::Signature {
+        let mut sig = self.module.make_signature();
+        let ptr_type = self.module.target_config().pointer_type();
+        sig.params.push(AbiParam::new(ptr_type)); // *mut MipsCore
+        sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus (u32)
+        sig
+    }
+
+    /// Compile a walked region (`Analyzer::walk`/`walk_bounded`'s output)
+    /// into a callable `JitFn`, end to end: one Cranelift block per
+    /// **head** instruction (§3.1) — branch/jump delay slots do not get
+    /// their own block, see below — both per-unit preambles (§3.2), each
+    /// head instruction's semantics/control-flow, and the edges between
+    /// blocks or out to the shared exit block.
+    ///
+    /// Two-pass block wiring: pass 1 allocates every head instruction's
+    /// block; pass 2 emits bodies and every outgoing edge (fallthrough,
+    /// taken, exit) *without sealing*, since a branch's taken target can be
+    /// any word in the region — including backward (loop back-edges) — so a
+    /// block's full predecessor set isn't known until every other
+    /// instruction has been emitted; pass 3 seals every block once all
+    /// edges exist. (The single-linear-chain shape used before this
+    /// function supported branches was a special case where "seal
+    /// immediately, next block is always the very next list entry" happened
+    /// to be safe — no longer true in general.)
+    ///
+    /// **Delay slots are inlined, never independently chained (§6.1.4
+    /// "indivisible unit" / "never a CFG edge").** The interpreter's
+    /// `branch_delay`/`in_delay_slot`/`delay_slot_target` two-dispatch
+    /// mechanism is executor-private state compiled code cannot reach (and
+    /// does not need to): a branch/jump's delay slot always executes exactly
+    /// once, regardless of whether the branch is taken, so its semantics are
+    /// emitted directly inside the branch/jump's own block, unconditionally,
+    /// before the condition test / target jump. The analyzer still marks the
+    /// slot's own `CompiledInstr` as `visited` (so `instrs_linear` yields it)
+    /// — pass 1 recognizes it (`is_delay_slot_of`) and skips allocating an
+    /// independent block for it, so it is never reachable as its own
+    /// fallthrough-chained node.
+    ///
+    /// **Batch scope**: `Sequential` instructions (`lookup_semantics`),
+    /// conditional/unconditional branches and jumps including the annulling
+    /// "Likely" family and link-writing variants (`lookup_branch_or_jump`),
+    /// and register-indirect JR/JALR (`lookup_regjump` — target only known
+    /// at runtime, always exits via [`emit_runtime_pc_exit`] rather than
+    /// the shared `exit_block`). A branch/jump/regjump at 0xFFC
+    /// (`StopReason::ForeignPageSlot`) is a normal visited head like any
+    /// other — `emit_branch_or_jump`/`emit_regjump`'s own `foreign_page_slot`
+    /// check handles the missing on-page slot by arming
+    /// `core.in_delay_slot`/`core.delay_slot_target` instead of inlining it,
+    /// same as the interpreter's `branch_delay`.
+    ///
+    /// Returns `None` if any visited instruction has no emitter yet.
+    /// Returns `Some(JitFn)` — a raw function pointer valid for as long as
+    /// `self` (its `JITModule`) lives; callers must not drop `self` while
+    /// the returned function might still be called.
+    ///
+    /// No `page_base` parameter, deliberately: the compiled function is
+    /// position-independent (§2.2) — every address it ever materializes into
+    /// `core.pc` (branch/jump targets, delay-slot exception EPC, exit-stub
+    /// retries) is derived from a runtime load of live `core.pc`, never from
+    /// a compile-time constant baked in at codegen time. A `page_base`
+    /// parameter here previously existed and was physical (mirroring
+    /// `comp.rs`'s `phys_base`, the real production caller's only page
+    /// address) — using it to synthesize *virtual* addresses was a real bug
+    /// (harmless only for kseg0/kseg1, where physical and virtual-low-32-bits
+    /// happen to coincide) fixed this session; removing the parameter
+    /// entirely makes that class of mistake impossible to reintroduce rather
+    /// than just fixing this generation of it. `Analyzer::walk_bounded`
+    /// still takes a `page_base` — that one is a genuinely different,
+    /// necessary input: the *compile-time decision* of whether a branch/jump
+    /// target is on- or off-page, not a value ever written into `core.pc`.
+    /// `skip_entry_preamble`: when `true`, the entry word's own IP7/pending-
+    /// interrupt checks (§3.2's "check 1"/"check 2") are omitted from the
+    /// path reached directly from the function's entry — the production
+    /// caller (`comp.rs`'s `handle_request`, reached from
+    /// `mips_exec.rs::step()`'s dispatch) already ran both checks for this
+    /// exact PC, in the interpreter loop, immediately before ever calling
+    /// into compiled code; repeating them here would just recheck the same
+    /// state a second time for no reason. `false` for every other caller
+    /// (the equivalence-test harness, `jitv2_verify`): none of them are
+    /// preceded by a real interpreter dispatch loop, so the entry word's
+    /// preamble is the *only* place those checks would ever run for it —
+    /// omitting them there would silently under-test/under-implement the
+    /// checks these tools exist to verify.
+    ///
+    /// Only ever affects the entry word itself: every other head in the
+    /// region still gets its full preamble unconditionally, since nothing
+    /// but the interpreter's own dispatch (which only ever lands on
+    /// `entry_word`) can have already performed those checks for it. If an
+    /// *internal* edge (e.g. a backward branch) targets the entry word, that
+    /// transfer never went through the interpreter's dispatch either — see
+    /// `block_for_word`'s construction below, which always resolves
+    /// `entry_word` to the full preamble block, never the skipped-preamble
+    /// one, regardless of this flag.
+    /// Compile a region into Cranelift IR and hand it to `define_function`,
+    /// but do **not** finalize or return a callable pointer — the shared
+    /// first half of `compile_region`'s (immediate) and `finalize_batch`'s
+    /// (deferred) paths. Returns the `FuncId` `finalize_batch` needs to
+    /// retrieve the eventual `JitFn`; callers that need a callable pointer
+    /// right away should use `compile_region` instead, not this directly.
+    pub fn compile_region_uncommitted(
+        &mut self,
+        instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE],
+        entry_word: WordOffset,
+        compiled_for_fr1: bool,
+        skip_entry_preamble: bool,
+    ) -> Option<cranelift_module::FuncId> {
+        let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
+        #[cfg(feature = "developer")]
+        { self.last_decline_was_verifier_error = false; }
+        // Reject anything this pass doesn't support before touching
+        // Cranelift at all. `ForeignPageSlot`/`RegJump`/other exit reasons
+        // that land on a *visited* instruction (rather than terminating an
+        // edge out of the region) aren't possible per the analyzer's
+        // contract — every visited instruction must have a semantics or
+        // branch/jump emitter, full stop.
+        for instr in instrs_linear(instrs) {
+            if lookup_semantics(instr.raw).is_none()
+                && lookup_branch_or_jump(instr.raw).is_none()
+                && lookup_regjump(instr.raw).is_none()
+                && lookup_cp1_semantics(instr.raw).is_none()
+            {
+                return None; // no emitter for this instruction yet (includes excluded-adjacent shapes)
+            }
+        }
+
+        self.ctx.func.signature = self.jit_fn_signature();
+        self.ctx.func.name = ir::UserFuncName::user(0, self.func_id_counter);
+
+        // One FunctionBuilder for the whole function — block allocation,
+        // preamble/semantics emission, and finalization all happen in this
+        // single session. Splitting this across two `FunctionBuilder::new`
+        // calls (build-skeleton-then-drop, reopen-and-continue) is unsound:
+        // the builder owns SSA-construction state in `builder_ctx` that a
+        // fresh `::new` would reset against a function that already has
+        // blocks/instructions in it. `build_block_skeleton` stays a
+        // self-contained probe for the block-allocation-only tests, which
+        // never resume the builder afterward.
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+
+        // Pass 1: allocate one block per head instruction (visited, and not
+        // some other instruction's inlined delay slot), in ascending word
+        // order (instrs_linear's guarantee) — order doesn't matter for
+        // correctness here (every edge is wired explicitly in pass 2 by
+        // looking up the target word's block), just for determinism.
+        //
+        // `is_slot_only` is the analyzer's own bookkeeping (`visit_slot`/
+        // `visit`'s promotion — §6.1.4 dual semantics), not recomputed here:
+        // a word visited *only* as a delay slot never gets a block (it's
+        // inlined into its predecessor unconditionally, `emit_slot_semantics`);
+        // a word that's also reached as a genuine branch/jump target was
+        // already promoted by the walker and has real edges — those get a
+        // block like any other head.
+        let mut instr_blocks: Vec<(WordOffset, Block)> = Vec::new();
+        let mut entry_word_block = None;
+        for instr in instrs_linear(instrs) {
+            if instr.is_slot_only {
+                continue;
+            }
+            let block = builder.create_block();
+            if instr.word == entry_word {
+                entry_word_block = Some(block);
+            }
+            instr_blocks.push((instr.word, block));
+        }
+        let entry_word_block = entry_word_block
+            .expect("entry_word must be a visited, non-slot offset in the walked buffer");
+
+        // When skipping the entry word's own preamble (production path —
+        // see compile_region's doc comment on skip_entry_preamble), the
+        // entry word needs two distinct blocks: entry_word_block keeps its
+        // usual meaning (preamble + semantics, the target for every
+        // *internal* edge — a backward branch landing on entry_word never
+        // went through the interpreter's dispatch, so it must still pay the
+        // checks) and a new entry_word_body_block holds just the
+        // semantics, reached directly from the function's real entry_block,
+        // bypassing the preamble. entry_word_block's own body becomes just
+        // "run the preamble, then jump to entry_word_body_block" in this
+        // mode instead of containing the semantics itself.
+        let entry_word_body_block = if skip_entry_preamble {
+            Some(builder.create_block())
+        } else {
+            None
+        };
+
+        // entry_block must be the first block Cranelift lays out (it must
+        // stay the function's actual entry point, matching the function
+        // signature's param count) — `switch_to_block` is what places a
+        // block into layout order, not `create_block`, so entry_block must
+        // be switched into before exit_block's body is emitted, even though
+        // exit_block's *handle* was allocated earlier up in the function.
+        // (Caught by the Cranelift verifier: an earlier ordering here
+        // switched to exit_block first, silently making IT the two-param
+        // "entry block" the verifier then rejected against the one-param
+        // function signature.)
+        builder.switch_to_block(entry_block);
+        let core_ptr = builder.block_params(entry_block)[0];
+
+        let exit_block = builder.create_block();
+        let ptr_ty = builder.func.signature.params[0].value_type;
+        let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
+        let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
+
+        let exception_call_block = builder.create_block();
+        let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
+        let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
+
+        let exception_other_word_block = builder.create_block();
+        let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
+        let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
+        let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
+        let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
+
+        let exception_entry_word_block = builder.create_block();
+        let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
+        let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
+
+        // Region-wide FPU entry guard (CU1 + FR-mode), only when this region
+        // actually contains a CP1 instruction — see emit_fpu_entry_guard's
+        // doc comment. `fpr_mode` is resolved once, at compile time, from
+        // the live STATUS_FR bit; this is also the mode every FPR-access
+        // emitter in the region uses (threaded via `fr_mode` in pass 2).
+        // Still positioned in entry_block here — the guard is entry_block's
+        // own body, emitted before its terminating jump to entry_word_block.
+        let has_fpu = instrs_linear(instrs).any(|i| lookup_cp1_semantics(i.raw).is_some());
+        if has_fpu {
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+            emit_fpu_entry_guard(&mut guard_ctx, entry_word, compiled_for_fr1);
+        }
+        // Skip straight to entry_word_body_block (bypassing the preamble)
+        // when the caller says the interpreter's own dispatch loop already
+        // ran the equivalent checks for this exact PC; otherwise (the
+        // verifier/test-harness path, never preceded by a real interpreter
+        // step()) go through entry_word_block as normal, paying the
+        // preamble here same as any other head.
+        builder.ins().jump(entry_word_body_block.unwrap_or(entry_word_block), &[]);
+        builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
+
+        builder.switch_to_block(exit_block);
+        emit_exit_block_body(&mut builder, exit_core_ptr, word_offset_param);
+        // Left unsealed until every bail site below has been emitted.
+
+        builder.switch_to_block(exception_call_block);
+        emit_exception_call_block_body(&mut self.module, &mut builder, call_core_ptr, call_status_param);
+
+        builder.switch_to_block(exception_other_word_block);
+        emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
+
+        builder.switch_to_block(exception_entry_word_block);
+        emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
+        // None left sealed until every emit_exception_exit call site below
+        // has been emitted — same reasoning as exit_block above.
+
+        for &(word, block) in &instr_blocks {
+            instrs[word as usize].block_id = Some(block.as_u32());
+        }
+
+        // Word offset -> head block, for target resolution in pass 2
+        // (branch/jump taken targets, and Sequential's `word+1` for the
+        // "did I land on a block, or does this edge exit" check). A target
+        // that's *purely* a delay slot's own word (`is_slot_only`, never
+        // independently reached as a genuine target) has no block here —
+        // §6.1.4's "never a CFG edge into the slot's block" — but a word
+        // that's *both* a slot and a real target (promoted by the walker)
+        // does have one, same as any other head; `emit_target_edge`'s
+        // `None` case relies on this.
+        let block_for_word: std::collections::HashMap<WordOffset, Block> =
+            instr_blocks.iter().copied().collect();
+
+        // Pass 2: emit every head instruction's body and outgoing edges.
+        // Nothing is sealed here — a block's predecessor set (especially a
+        // backward branch target's) isn't complete until this whole pass
+        // finishes.
+        for &(word, block) in &instr_blocks {
+            builder.switch_to_block(block);
+
+            let raw = instrs[word as usize].raw;
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+
+            if word == entry_word && entry_word_body_block.is_some() {
+                // entry_word_block is reached only by internal in-region
+                // edges (emit_target_edge's None arm — always a plain
+                // fallthrough/taken-branch edge, never a delay-slot
+                // transfer) once skip_entry_preamble is set — the real
+                // external-dispatch entry bypasses straight to
+                // entry_word_body_block instead (see the jump out of
+                // entry_block above), never running any of this. So
+                // core.pc/in_delay_slot are stale here for this specific
+                // word and must be materialized before the preambles below
+                // (which is why this is emitted first, still in
+                // entry_word_block, rather than after them — deliberately
+                // NOT switching to body_block yet, so the preambles still
+                // run exactly once, in entry_word_block, same as always;
+                // switching early would make them run a second time inside
+                // body_block too, wrongly subjecting the external-entry
+                // bypass path to checks it must never pay): unconditionally
+                // false for in_delay_slot (an internal edge into entry_word
+                // is never a delay-slot landing) and vbase|entry_word*4 for
+                // pc. This is what lets exception_entry_word_block below
+                // assume state is already correct with no runtime check of
+                // its own — see its doc comment.
+                //
+                // Placed before the IP7/pending-interrupt preambles below,
+                // not after, purely defensively — both preambles bail via
+                // emit_bail, which recomputes core.pc itself from the
+                // compile-time `word` constant regardless of order, and
+                // never touches core.in_delay_slot at all. In principle a
+                // stale in_delay_slot=true could leak through such a bail if
+                // this internal-edge visit somehow followed an earlier,
+                // same-call external foreign-slot visit to this same word —
+                // but that specific sequence can't actually happen: the
+                // pre-existing foreign-slot check on entry_word's own
+                // fallthrough exit (below, `is_foreign_slot`) always exits
+                // the function immediately on that path, so a genuine
+                // foreign-slot arrival never continues on to any internal
+                // edge within the same call. Kept first anyway since it
+                // costs nothing extra either way and removes the ordering as
+                // a thing to ever reason about again.
+                let mem = MemFlagsData::trusted();
+                let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+                let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+                let pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+                let vbase = ctx.builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
+                let fault_pc = ctx.builder.ins().iadd_imm_s(vbase, (entry_word as i64) * 4);
+                ctx.builder.ins().store(mem, fault_pc, ctx.core_ptr, pc_off);
+                let false_flag = ctx.builder.ins().iconst(ir::types::I8, 0);
+                ctx.builder.ins().store(mem, false_flag, ctx.core_ptr, flag_off);
+            }
+
+            // entry_word_block's preamble is unconditional (every internal
+            // edge into entry_word — a backward branch, say — still needs
+            // it, skip_entry_preamble or not); the only thing that changes
+            // is where the *semantics* get emitted: in entry_word_block
+            // itself normally, or in the separate entry_word_body_block
+            // when skip_entry_preamble is set, with entry_word_block
+            // reduced to just "run the preamble, then jump there".
+            emit_ip7_preamble(&mut ctx, exit_block, word);
+            emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
+            // Past both preambles: this instruction is actually going to
+            // execute (neither preamble bailed to the interpreter for this
+            // word), matching step()'s per-instruction cycle count exactly —
+            // see emit_increment_cycles's doc comment for why this
+            // can't go before the preambles (a bail here falls through to
+            // the interpreter's step() re-entering at this same PC within
+            // the *same* step() call, which already incremented once at its
+            // own entry; incrementing here too would double-count).
+            emit_increment_cycles(&mut ctx);
+
+            if word == entry_word {
+                if let Some(body_block) = entry_word_body_block {
+                    ctx.builder.ins().jump(body_block, &[]);
+                    ctx.builder.switch_to_block(body_block);
+                }
+            }
+
+            if let Some(branch) = lookup_branch_or_jump(raw) {
+                emit_branch_or_jump(&mut ctx, exit_block, &block_for_word, instrs, branch, fr_mode);
+            } else if let Some(regjump) = lookup_regjump(raw) {
+                emit_regjump(&mut ctx, instrs, regjump, fr_mode);
+            } else {
+                if let Some(emit) = lookup_semantics(raw) {
+                    emit(&mut ctx);
+                } else {
+                    let emit = lookup_cp1_semantics(raw).expect("checked above");
+                    emit(&mut ctx, fr_mode);
+                }
+
+                let fallthrough_word = word + 1;
+                let plain_fallthrough = |ctx: &mut EmitCtx| {
+                    match instrs[word as usize].fallthrough_exit {
+                        Some(_) => {
+                            // Region ends here — mirrors handle_exec_complete's
+                            // `pc += 4` (§3.3 "plain boundary").
+                            emit_bail(ctx, exit_block, fallthrough_word);
+                        }
+                        None => {
+                            let next_block = *block_for_word.get(&fallthrough_word)
+                                .expect("fallthrough_exit is None -> analyzer guarantees the next word continues into the region");
+                            ctx.builder.ins().jump(next_block, &[]);
+                        }
+                    }
+                };
+
+                if word == entry_word {
+                    // The entry word — and only the entry word (see EmitCtx's
+                    // doc comment on `entry_word`) — can be reached two ways:
+                    // as an ordinary dispatch, or because the interpreter's
+                    // previous dispatch landed here via `branch_delay` (some
+                    // *other* instruction's delay slot, with `in_delay_slot`/
+                    // `delay_slot_target` already armed) and this exact word
+                    // just happened to also get compiled as a standalone
+                    // entry (e.g. the `entry_offset == 0` always-probe in
+                    // exec_decoded's dispatch gate — this is also what makes
+                    // word 0 itself safe as an entry despite potentially
+                    // inheriting a delay slot from the *previous* page's
+                    // branch at 0xFFC: this same check closes that case too,
+                    // page-agnostically). A plain Sequential
+                    // instruction's compile-time fallthrough_word has no way
+                    // to know about that pending transfer — unlike a branch/
+                    // jump's own delay slot, which `emit_slot_semantics`
+                    // manages explicitly, this word's compilation is
+                    // completely unaware it might be running as someone
+                    // else's slot. Must check `core.in_delay_slot` at runtime
+                    // and, if set, exit via `core.delay_slot_target` instead
+                    // — exactly mirroring `handle_exec_complete` — or the
+                    // pending transfer is silently discarded (found live: the
+                    // IRIX PROM reset vector's own `j realstart`, delay slot
+                    // compiled standalone, landed on the next sequential word
+                    // instead of realstart).
+                    let mem = MemFlagsData::trusted();
+                    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+                    let in_delay_slot = ctx.builder.ins().load(ir::types::I8, mem, ctx.core_ptr, flag_off);
+                    let is_foreign_slot = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, in_delay_slot, 0);
+
+                    let foreign_slot_block = ctx.builder.create_block();
+                    let plain_block = ctx.builder.create_block();
+                    ctx.builder.ins().brif(is_foreign_slot, foreign_slot_block, &[], plain_block, &[]);
+
+                    ctx.builder.switch_to_block(foreign_slot_block);
+                    ctx.builder.seal_block(foreign_slot_block);
+                    let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
+                    let target = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, target_off);
+                    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+                    ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+                    emit_absolute_pc_exit(&mut ctx, target);
+
+                    ctx.builder.switch_to_block(plain_block);
+                    ctx.builder.seal_block(plain_block);
+                    plain_fallthrough(&mut ctx);
+                } else {
+                    plain_fallthrough(&mut ctx);
+                }
+            }
+        }
+
+        // Pass 3: every block's predecessor set is now fully known.
+        for &(_, block) in &instr_blocks {
+            builder.seal_block(block);
+        }
+        if let Some(body_block) = entry_word_body_block {
+            // Single predecessor (entry_word_block's own preamble-then-jump),
+            // known from the moment it was emitted above — sealable here
+            // alongside every other block, same as the rest of pass 3.
+            builder.seal_block(body_block);
+        }
+        builder.seal_block(exit_block);
+        builder.seal_block(exception_call_block);
+        builder.seal_block(exception_other_word_block);
+        builder.seal_block(exception_entry_word_block);
+        builder.finalize(self.module.target_config());
+
+        // Anonymous, not named: this module never looks a compiled region
+        // up by name again (get_finalized_function(func_id) is always
+        // reached via the FuncId returned right here), so declare_function's
+        // format!("region_{}", ...) string allocation + `names: HashMap`
+        // insert (cranelift_module::ModuleDeclarations, `declare_function`'s
+        // own `// TODO: Can we avoid allocating names so often?`) was pure
+        // per-compile overhead with no benefit — declare_anonymous_function
+        // skips both.
+        let func_id = self.module
+            .declare_anonymous_function(&self.ctx.func.signature)
+            .expect("declare_anonymous_function");
+        // Two genuinely different failure shapes land here, and callers
+        // need to tell them apart (`last_compile_ran_out_of_memory`'s own
+        // doc comment): `ModuleError::Compilation` means this module
+        // emitted invalid IR — a real codegen bug, not a "this instruction
+        // shape isn't supported yet" decline (those are all caught earlier,
+        // before Cranelift is ever invoked) — the offset should be
+        // sticky-denylisted, same as any other codegen gap.
+        // `ModuleError::Allocation` means `ArenaMemoryProvider` ran out of
+        // its reservation — not a bug in this specific region at all, and
+        // denylisting it would be wrong (it's perfectly compilable, just
+        // not right now); the caller needs to flush and retry instead.
+        // `debug_assert!` alone is silent in release builds (debug_assertions
+        // off) and was hiding exactly this in an earlier version: the
+        // verifier's own error-formatting path (building the
+        // mismatched-successor debug string) became the actual hot path
+        // once real per-compile allocation failures started happening,
+        // invisibly, in a release run. Surfaced per build mode instead:
+        // full error text under `developer` (the diagnostics build),
+        // nothing under `lightning` (perf-critical, no per-compile string
+        // formatting ever), and a minimal one-line notice otherwise —
+        // silence here is what let a real problem masquerade as a
+        // performance cliff.
+        if let Err(e) = self.module.define_function(func_id, &mut self.ctx) {
+            let is_oom = matches!(e, cranelift_module::ModuleError::Allocation { .. });
+            self.last_compile_ran_out_of_memory = is_oom;
+            #[cfg(feature = "developer")]
+            { self.last_decline_was_verifier_error = !is_oom; }
+            #[cfg(feature = "developer")]
+            eprintln!("jitv2: compile_region failed: {e}");
+            #[cfg(not(any(feature = "developer", feature = "lightning")))]
+            eprintln!("jitv2: codegen rejected a compiled region (run a developer build for details)");
+            return None;
+        }
+        self.last_compile_ran_out_of_memory = false;
+        // Read code size before clearing context (compiled_code is cleared
+        // by clear_context) — same pattern as rex3_jit/compiler.rs and
+        // jit/compiler.rs. Captured into a field rather than returned
+        // directly, to keep this function's `Option<JitFn>` return type
+        // stable for its several other callers (equiv_test, lockstep, …).
+        #[cfg(feature = "developer")]
+        {
+            self.last_code_size = self.ctx.compiled_code()
+                .map(|cc| cc.code_buffer().len() as u32)
+                .unwrap_or(0);
+        }
+        self.module.clear_context(&mut self.ctx);
+        self.func_id_counter += 1;
+        // Heartbeat: cranelift-jit exposes no arena-size/mmap-count API of
+        // its own (`cranelift_jit::Memory` is pub(crate) — see
+        // `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s doc comment), so function_count
+        // is the only signal we have for "how far did we get before an
+        // out-of-address-space abort." Printed unconditionally (not just
+        // under `developer`) since this is exactly what you want visible in
+        // a crash log when CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES/mega_flush turns
+        // out not to be catching something — a crash with no heartbeat line
+        // near the threshold count means the flush path itself isn't firing;
+        // a crash well past several heartbeats with flushes interleaved
+        // (see flush_from_cpu_thread/flush_from_jit_thread's own eprintln!s)
+        // means the threshold is set too high for whatever's compiling.
+        if self.func_id_counter % 10_000 == 0 {
+            eprintln!("jitv2: {} functions compiled into this Codegen's arena since last reset", self.func_id_counter);
+        }
+        Some(func_id)
+    }
+
+    /// Compile a region and immediately finalize+return a callable `JitFn` —
+    /// today's synchronous contract, used by every caller that needs the
+    /// result ready to call right away (the equivalence-test harness,
+    /// `jitv2_lockstep`, and `jitv2_inline_compile`'s "run it immediately"
+    /// path — see that path's own doc comment in `mips_exec.rs` for why it
+    /// specifically cannot tolerate a deferred pointer). Thin wrapper around
+    /// `compile_region_uncommitted` + an immediate one-function
+    /// `finalize_batch` call.
+    pub fn compile_region(
+        &mut self,
+        instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE],
+        entry_word: WordOffset,
+        compiled_for_fr1: bool,
+        skip_entry_preamble: bool,
+    ) -> Option<crate::jitv2::JitFn> {
+        let func_id = self.compile_region_uncommitted(instrs, entry_word, compiled_for_fr1, skip_entry_preamble)?;
+        self.finalize_batch(&[func_id]).into_iter().next()
+    }
+
+    /// Finalize every `FuncId` in `ids` in one `finalize_definitions()` call
+    /// and return their now-callable `JitFn` pointers, in the same order —
+    /// the batched counterpart to `compile_region`'s immediate one-at-a-time
+    /// finalize. Callers accumulate `FuncId`s from `compile_region_uncommitted`
+    /// across several compiles (deferring the finalize so they pack into the
+    /// same host-page segment instead of each getting its own — see
+    /// `paged_memory`'s module doc comment) and call this once, when
+    /// `provider_crossed_page()` says the next allocation would spill onto a
+    /// new page or the caller otherwise decides to stop batching (queue
+    /// drained, etc). `ids` empty is a valid no-op (returns an empty `Vec`)
+    /// rather than a caller-side special case.
+    pub fn finalize_batch(&mut self, ids: &[cranelift_module::FuncId]) -> Vec<crate::jitv2::JitFn> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        // `.ok()` swallows a real error here the same way compile_region's
+        // old inline call did (`.ok()?`) — finalize_definitions() failing
+        // for a batch that already passed define_function successfully for
+        // every member is not a documented/expected outcome for this
+        // provider (it can only fail via the JITMemoryProvider::finalize
+        // trait method, which PagedArenaMemoryProvider's impl never errors
+        // from), so there's nothing more specific to report; every id in
+        // `ids` simply won't be callable and the caller's batch is lost —
+        // acceptable since compiled-but-never-published functions are inert
+        // (never reachable from any page's entry_table).
+        if self.module.finalize_definitions().is_err() {
+            return Vec::new();
+        }
+        ids.iter()
+            .map(|&id| {
+                let code_ptr = self.module.get_finalized_function(id);
+                unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }
+            })
+            .collect()
+    }
+}
+
+/// Emit the IP7 (CP0 Compare timer) preamble every compiled unit needs
+/// before its own semantics (§3.2 — mirror the interpreter's own checks,
+/// verbatim, at every unit boundary). Mirrors `step()`'s
+/// (`src/mips_exec.rs`) timer-advance sequence exactly:
+///
+/// ```ignore
+/// let prev = core.cp0_count;
+/// core.cp0_count = prev.wrapping_add(core.count_step);
+/// let timer_fired = (core.cp0_compare.wrapping_sub(prev) <= core.count_step);
+/// ```
+///
+/// If `timer_fired`, this function does **not** commit the `cp0_count`
+/// update — it writes `core.pc = vbase | (word_offset * 4)` (this
+/// instruction's own address; nothing has executed yet at this point) and
+/// returns `EXEC_COMPLETE` immediately, so the interpreter's `step()`
+/// re-enters at the top and redoes this exact check as the authoritative
+/// implementation (single-implementation delivery, §3.2/§7a) — it will
+/// either deliver the interrupt or, if conditions changed, proceed to
+/// actually execute the instruction. `vbase` is derived from `core.pc & !0xFFF`
+/// (already live in the struct) rather than threaded as a separate runtime
+/// parameter — §2.2's vbase and this instruction's own current page base are
+/// the same value by construction, since the whole region is one page.
+///
+/// Must be called with `builder` positioned in the block that will hold this
+/// instruction's preamble; leaves `builder` positioned in a new block (the
+/// "not fired" continuation) where the instruction's real semantics should
+/// be emitted next. That continuation block is sealed here since its only
+/// predecessor is the preamble check just emitted. `exit_block` is the
+/// function's shared exit-to-interpreter block (`BlockSkeleton::exit_block`)
+/// — the fired path jumps there via [`emit_bail`] instead of emitting its
+/// own copy of the exit sequence.
+fn emit_ip7_preamble(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
+
+    let cp0_count_off = ir::immediates::Offset32::new(core_offset_of_cp0_count());
+    let count_step_off = ir::immediates::Offset32::new(core_offset_of_count_step());
+    let cp0_compare_off = ir::immediates::Offset32::new(core_offset_of_cp0_compare());
+
+    let prev = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, cp0_count_off);
+    let count_step = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, count_step_off);
+    let new_count = ctx.builder.ins().iadd(prev, count_step);
+    let cp0_compare = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, cp0_compare_off);
+    // timer_fired = (cp0_compare - prev) <= count_step, wrapping/unsigned —
+    // matches step()'s wrapping_sub + unsigned <= exactly.
+    let delta = ctx.builder.ins().isub(cp0_compare, prev);
+    let timer_fired = ctx.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, delta, count_step);
+
+    let fired_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(timer_fired, fired_block, &[], continue_block, &[]);
+
+    // Fired: abandon the cp0_count update, exit to the interpreter
+    // immediately. Cold: the timer firing within this exact instruction's
+    // count_step window is the rare case on every single dispatch this
+    // preamble runs before.
+    ctx.builder.switch_to_block(fired_block);
+    ctx.builder.set_cold_block(fired_block);
+    ctx.builder.seal_block(fired_block);
+    emit_bail(ctx, exit_block, word_offset);
+
+    // Not fired: commit the cp0_count advance and fall through into the
+    // instruction's real semantics, emitted by the caller after this returns.
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+    ctx.builder.ins().store(mem, new_count, ctx.core_ptr, cp0_count_off);
+}
+
+/// Emit the pending-interrupt preamble every compiled unit needs before its
+/// own semantics (§3.2 "check 1" — mirror the interpreter's own pending
+/// check, verbatim, at every unit boundary): an atomic load of
+/// `core.hot.interrupts`, tested against zero, bail if nonzero. Same field, same
+/// predicate as `step()`'s own `let pending = self.core.hot.interrupts.load(...)`
+/// — this preamble does *not* replicate step()'s enabled/masked delivery
+/// logic (whether the interrupt actually gets delivered, soft-reset
+/// handling, etc.); it only decides whether to bail. On bail, the
+/// interpreter's `step()` re-enters at the top and does that full logic as
+/// the single authoritative implementation (§7a).
+///
+/// On bail: jumps to `exit_block` (the function's shared exit-to-interpreter
+/// block, `BlockSkeleton::exit_block`) via [`emit_bail`], which materializes
+/// `core.pc = vbase | (word_offset * 4)` and returns `EXEC_COMPLETE`.
+///
+/// Must be called with `builder` positioned in the block that will hold this
+/// instruction's preamble; leaves `builder` positioned in a new, sealed
+/// continuation block (the "nothing pending" path) where the next preamble
+/// or the instruction's real semantics should be emitted next.
+fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
+    let mem = MemFlagsData::trusted();
+
+    // Genuine atomic load, not a plain `load`: on an aligned, naturally-atomic
+    // width (u64, 8-byte aligned) these compile to the identical single load
+    // instruction on x86_64/aarch64 at the hardware level, but a plain
+    // Cranelift `load` carries none of Rust/LLVM-style atomics' *compiler*
+    // reordering guarantees — under opt_level=none (this codegen's default)
+    // that distinction was moot (no reordering optimization passes run to
+    // exploit it), but `Codegen::set_opt_level_speed`'s `speed` mode runs
+    // real optimization passes that are legally free to hoist, sink, or
+    // otherwise reorder a plain load across other memory operations in this
+    // region — which a pending-interrupt check must never allow (it needs to
+    // observe interrupts.store()'s effect promptly, not some stale
+    // hoisted-to-entry snapshot). `atomic_load` is specified as sequentially
+    // consistent (stronger than the interpreter's own Ordering::Relaxed
+    // load, which is a safe direction to differ in — this instruction still
+    // observes everything a Relaxed load would, just with the reordering
+    // freedom taken away). `atomic_load`'s format takes a bare pointer, not
+    // an (Offset32) field access like the plain `load` this replaced — the
+    // interrupts field's offset has to be folded into the pointer explicitly
+    // first via `iadd_imm_s`.
+    let interrupts_ptr = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, core_offset_of_interrupts() as i64);
+    let pending = ctx.builder.ins().atomic_load(ir::types::I64, mem, interrupts_ptr);
+    let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+    let has_pending = ctx.builder.ins().icmp(IntCC::NotEqual, pending, zero);
+
+    let bail_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(has_pending, bail_block, &[], continue_block, &[]);
+
+    // Cold: a pending interrupt on any given instruction dispatch is the
+    // rare case (interrupts are relatively infrequent compared to the
+    // instruction stream), same reasoning as every other bail/exception
+    // block in this module.
+    ctx.builder.switch_to_block(bail_block);
+    ctx.builder.set_cold_block(bail_block);
+    ctx.builder.seal_block(bail_block);
+    emit_bail(ctx, exit_block, word_offset);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Region-wide FPU entry guard: emitted once, in `entry_block`, only when
+/// the region being compiled contains at least one CP1 instruction — cheaper
+/// than repeating a CU1/FR-mode check per FPU instruction, and correct
+/// because both are region-wide invariants: `STATUS_CU1`/`STATUS_FR` cannot
+/// change mid-region (the only instructions that touch CP0.Status, MTC0/
+/// ERET, are `Excluded` and end the region on contact, §4.4).
+///
+/// The two failure modes are architecturally very different and get
+/// different treatment, checked in real-hardware precedence order (CU1
+/// gates everything — a real CPU never even looks at FR mode if CU1 is
+/// clear):
+///
+/// - **CU1 clear**: a real, opcode-independent MIPS exception (`EXC_CPU`,
+///   with `Cause.CE` identifying CP1). The exact exception code is known
+///   statically at compile time — no need to defer to the interpreter to
+///   determine *what* went wrong, only to `handle_exception_fn`
+///   (`deliver_exception`, §4.2 single-implementation delivery) to compute
+///   EPC/Cause/vector, same as `emit_exception_exit` does for every other
+///   JIT-detected fault. `Cause.CE` needs a direct store first —
+///   `deliver_exception` only ever touches `CAUSE_EXCCODE_MASK`, never CE.
+///
+/// - **FR mismatch** (believed unreachable for any real compiled guest
+///   binary — see the FrMode doc comment): NOT an architectural exception at
+///   all — it means this *entire compiled artifact* was built assuming a
+///   `STATUS_FR` value that's no longer live, so every FPR-access emitter in
+///   it uses the wrong register-packing scheme. Unlike CU1, simply
+///   continuing (even via the interpreter) isn't enough — this exact
+///   function must never be dispatched again. Kills the entry
+///   (`kill_entry_fn` — see its own doc comment) so the JIT gate stops
+///   re-selecting it, then forces one real interpreter dispatch
+///   (`interp_fallback_fn`) so this instruction still makes progress today;
+///   the *next* visit to this PC gets a genuine fresh compile against
+///   whatever FR mode is live then.
+///
+/// `compiled_for_fr1` is the FR mode this whole region was compiled against
+/// (`FrMode::Fr1` if `STATUS_FR` was set when compilation started); the
+/// guard checks whether the live bit still agrees.
+fn emit_fpu_entry_guard(ctx: &mut EmitCtx, entry_word: WordOffset, compiled_for_fr1: bool) {
+    let mem = MemFlagsData::trusted();
+    let status_off = ir::immediates::Offset32::new(core_offset_of_cp0_status());
+    let status = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, status_off);
+
+    let cu1_clear = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
+    let cu1_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, cu1_clear, 0);
+
+    let cu1_block = ctx.builder.create_block();
+    let fr_check_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(cu1_bad, cu1_block, &[], fr_check_block, &[]);
+
+    // Cold: CU1 disabled is the rare case for any region that actually
+    // contains FPU instructions (real guest code enables it once, early,
+    // and leaves it on).
+    ctx.builder.switch_to_block(cu1_block);
+    ctx.builder.set_cold_block(cu1_block);
+    ctx.builder.seal_block(cu1_block);
+    emit_materialize_cpu_unusable(ctx);
+
+    ctx.builder.switch_to_block(fr_check_block);
+    ctx.builder.seal_block(fr_check_block);
+    let fr_bit = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_FR as i64);
+    let fr_mismatch = if compiled_for_fr1 {
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, fr_bit, 0)
+    } else {
+        ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fr_bit, 0)
+    };
+
+    let bail_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(fr_mismatch, bail_block, &[], continue_block, &[]);
+
+    // Cold: per this function's own doc comment, an FR mismatch is believed
+    // unreachable for any real compiled guest binary — the coldest of every
+    // cold block this module marks.
+    ctx.builder.switch_to_block(bail_block);
+    ctx.builder.set_cold_block(bail_block);
+    ctx.builder.seal_block(bail_block);
+    emit_kill_entry(ctx, entry_word);
+    // Not a plain emit_bail: see emit_interp_fallback_exit's doc comment for
+    // why a bail here can't force the interpreter's real semantics to
+    // actually run (also true here: without this, the killed entry's own
+    // interpreter re-dispatch would depend on exec_decoded's gate falling
+    // through correctly, an extra dependency this makes unnecessary).
+    emit_interp_fallback_exit(ctx, entry_word);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Materialize a real `EXC_CPU` (Coprocessor Unusable, CP1) exception and
+/// deliver it via `handle_exception_fn` — the `emit_fpu_entry_guard`
+/// counterpart to `MipsExecutor::cpu_unusable(1)`. `Cause.CE` needs a direct
+/// store first: `deliver_exception` (what `handle_exception_fn` calls) only
+/// ever touches `Cause.ExcCode`, never the CE field — mirrors
+/// `cpu_unusable`'s own `cp0_cause = (cause & !CAUSE_CE_MASK) | ((ce&3) <<
+/// CAUSE_CE_SHIFT)` exactly, with `ce` hardcoded to `1` (CP1) since this
+/// guard only ever exists for a region containing CP1 instructions. The
+/// exception code itself (`EXC_CPU`) is a compile-time constant — no
+/// interpreter re-dispatch needed to determine what happened, unlike a
+/// memory-access fault's status (`emit_check_mem_exc`), which only the bus
+/// device knows until the access actually runs. Terminates the current
+/// block (delegates to `emit_exception_exit`, itself a terminator).
+fn emit_materialize_cpu_unusable(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let cause_off = ir::immediates::Offset32::new(core_offset_of_cp0_cause());
+    let cause = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, cause_off);
+    let ce_cleared = ctx.builder.ins().band_imm_s(cause, !(crate::mips_core::CAUSE_CE_MASK as i64));
+    let ce_bit = 1i64 << crate::mips_core::CAUSE_CE_SHIFT; // CP1
+    let new_cause = ctx.builder.ins().bor_imm_s(ce_cleared, ce_bit);
+    ctx.builder.ins().store(mem, new_cause, ctx.core_ptr, cause_off);
+
+    let status = ctx.builder.ins().iconst(
+        ir::types::I32,
+        crate::mips_exec::exec_exception(crate::mips_exec::EXC_CPU) as i64,
+    );
+    emit_exception_exit(ctx, status);
+}
+
+/// Call `core.kill_entry_fn(jit_ctx, entry_offset)` — see
+/// `MipsCore::kill_entry_fn`'s doc comment. Not a terminator; caller
+/// continues on (typically into `emit_interp_fallback_exit` right after).
+fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset: u16) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_kill_entry_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I16)); // entry_offset
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    let offset_val = ctx.builder.ins().iconst(ir::types::I16, entry_offset as i64);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, offset_val]);
+}
+
+/// Jump to the function's shared exit-to-interpreter block (`BlockSkeleton::
+/// exit_block`) with `(core_ptr, word_offset)` as block arguments, instead of
+/// emitting a fresh copy of the materialize-PC-and-return sequence at every
+/// bail site. Use this from every clean exit — preambles here, and
+/// `fallthrough_exit`/`taken_exit` stubs (§3.3) once those land. Does not
+/// seal or switch blocks; call from within the block that decided to bail,
+/// as its terminator.
+fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
+    let word_offset_val = ctx.builder.ins().iconst(ir::types::I64, word_offset as i64);
+    ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val)]);
+}
+
+/// Force real forward progress through `core.interp_fallback_fn` instead of
+/// a plain bail, for a condition compiled code detected but can't itself
+/// resolve (`emit_fpu_entry_guard`'s CU1/FR mismatch — the only caller).
+/// A plain `emit_bail` just re-sets `core.pc` back to this same instruction
+/// and returns `EXEC_COMPLETE`, which `exec_decoded`'s caller can't tell
+/// apart from a real retirement — if this word is still published/hot, the
+/// very next dispatch calls this identical compiled function again, which
+/// bails again, forever, without the interpreter's real semantics (the
+/// `cpu_unusable` exception, in the FPU guard's case) ever actually running
+/// (found live: `cfc1` with CU1 clear spun in place indefinitely). Instead,
+/// write `core.pc` to this instruction's real address (`interp_fallback_fn`
+/// fetches/decodes/dispatches whatever's *there*, same as any other
+/// interpreter step), call it, and return its status directly — whatever
+/// the interpreter's real handler actually did (retired, faulted, retried)
+/// is the true result of this compiled unit's dispatch, not a synthetic
+/// "nothing happened, try again" signal. Terminates the current block.
+fn emit_interp_fallback_exit(ctx: &mut EmitCtx, word_offset: WordOffset) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+
+    let vbase = emit_vbase(ctx);
+    let target_pc = ctx.builder.ins().iadd_imm_s(vbase, (word_offset as i64) * 4);
+    ctx.builder.ins().store(mem, target_pc, ctx.core_ptr, pc_off);
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let status = ctx.builder.inst_results(call)[0];
+    ctx.builder.ins().return_(&[status]);
+}
+
+/// Body of the shared exit-to-interpreter block (`BlockSkeleton::exit_block`),
+/// emitted once by `build_block_skeleton`: materialize `core.pc = vbase |
+/// (word_offset * 4)` (the exiting instruction's own address) and return
+/// `EXEC_COMPLETE`, so the interpreter's `step()` re-enters at the top
+/// and re-runs whatever check triggered the bail as the authoritative
+/// implementation. `core_ptr`/`word_offset` here are the block's own params
+/// (runtime `Value`s), not compile-time constants — every bail site feeds its
+/// own `word_offset` in via [`emit_bail`]. `vbase` is derived from the live
+/// `core.pc & !0xFFF` rather than threaded as a separate parameter (§2.2's
+/// vbase and the exiting instruction's own current page base are the same
+/// value by construction, since the whole compiled region is one page).
+fn emit_exit_block_body(builder: &mut FunctionBuilder, core_ptr: Value, word_offset: Value) {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+
+    let pc = builder.ins().load(i64t, mem, core_ptr, pc_off);
+    let vbase = builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
+    let byte_offset = builder.ins().imul_imm_s(word_offset, 4);
+    // iadd, not bor: a Sequential instruction's fallthrough off the page's
+    // last word (0xFFC hazard only special-cases branch/jump/regjump there,
+    // not Sequential) makes word_offset = WORDS_PER_PAGE, so byte_offset is
+    // exactly PAGE_SIZE — bor silently drops that page carry whenever
+    // vbase's own PAGE_SIZE bit happens to already be set, landing back on
+    // this page instead of the next one. iadd carries correctly there and is
+    // equivalent to bor for every in-range word_offset, so this isn't a
+    // behavior change elsewhere. (Found via jitv2_verify against a real
+    // IRIX 5.3 boot trace.)
+    let exit_pc = builder.ins().iadd(vbase, byte_offset);
+    builder.ins().store(mem, exit_pc, core_ptr, pc_off);
+    let status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    builder.ins().return_(&[status]);
+}
+
+fn core_offset_of_pc() -> i32 { std::mem::offset_of!(MipsCore, pc) as i32 }
+fn core_offset_of_jit_trigger() -> i32 { std::mem::offset_of!(MipsCore, jit_trigger) as i32 }
+
+/// Mark `core.jit_trigger` so the interpreter's `exec_decoded` dispatch gate
+/// probes this exit's target PC as a fresh compile-worthy arrival — the
+/// JIT-compiled-code counterpart to the interpreter's own
+/// `handle_exec_complete`/`exec_complete_pc_set` (see `MipsCore::jit_trigger`'s
+/// doc comment). Called from every jump/branch exit stub
+/// (`emit_absolute_pc_exit`, `emit_runtime_pc_exit`) right before the exit
+/// stores `core.pc` and returns — *not* from `emit_exit_block_body` (the
+/// plain sequential-fallthrough exit path), which mirrors the interpreter's
+/// own asymmetry: a straight-line `pc += 4` fallthrough never sets the
+/// trigger either, only an actual taken transfer does.
+fn emit_set_jit_trigger(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_jit_trigger());
+    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+    ctx.builder.ins().store(mem, one, ctx.core_ptr, off);
+}
+fn core_offset_of_cp0_count() -> i32 { std::mem::offset_of!(MipsCore, cp0_count) as i32 }
+fn core_offset_of_cp0_compare() -> i32 { std::mem::offset_of!(MipsCore, cp0_compare) as i32 }
+fn core_offset_of_count_step() -> i32 { std::mem::offset_of!(MipsCore, count_step) as i32 }
+fn core_offset_of_cycles() -> i32 {
+    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, cycles)) as i32
+}
+
+/// Increment `core.hot.cycles` by one — the JIT-compiled-code counterpart to
+/// the interpreter's `step()` incrementing it once per `step()` call
+/// (`src/mips_exec.rs`: a real, direct, per-instruction write — see
+/// `Hot::cycles`'s own doc comment for why this must never be a batched
+/// local shadow). A compiled unit never calls the interpreter's `step()` for
+/// the instructions it covers, so without this, `cycles` — and everything
+/// that depends on it being visibly live while a hot guest loop runs
+/// entirely inside JIT-compiled code (e.g. `Wd33c93a`'s BSD SCSI
+/// deferred-interrupt spin-wait, on a completely different thread) — would
+/// silently stop advancing for however many instructions ran under real JIT
+/// dispatch. Called once per head instruction (the per-instruction emission
+/// loop in `compile_region`) and once per inlined delay slot
+/// (`emit_slot_semantics`) — a branch/jump's delay slot is a second,
+/// separate architectural instruction retiring, even though it has no
+/// head-instruction loop iteration of its own (it's always inlined into its
+/// branch's compiled body, §6.1.4).
+///
+/// Plain load/store here, not `ptr::read_volatile`/`write_volatile` the way
+/// the interpreter's own increment site does it in Rust: Cranelift's
+/// `MemFlagsData::trusted()` load/store already genuinely touches memory on
+/// every call (there's no equivalent "the compiler proves this loop's writes
+/// are dead and elides them" risk inside a single compiled unit the way
+/// there theoretically is for a pure-Rust unbounded loop) — the volatile
+/// requirement is specific to the interpreter's own increment, not this one.
+fn emit_increment_cycles(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_cycles());
+    let prev = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+    let next = ctx.builder.ins().iadd_imm_s(prev, 1);
+    ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
+}
+fn core_offset_of_interrupts() -> i32 {
+    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, interrupts)) as i32
+}
+fn core_offset_of_hi() -> i32 { std::mem::offset_of!(MipsCore, hi) as i32 }
+fn core_offset_of_lo() -> i32 { std::mem::offset_of!(MipsCore, lo) as i32 }
+fn core_offset_of_cp0_status() -> i32 { std::mem::offset_of!(MipsCore, cp0_status) as i32 }
+fn core_offset_of_cp0_cause() -> i32 { std::mem::offset_of!(MipsCore, cp0_cause) as i32 }
+fn core_offset_of_fpu_fcsr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fcsr) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_get_status_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_get_status_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_clear_status_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_clear_status_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_set_mode_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_set_mode_fn) as i32 }
+fn core_offset_of_fpu_fir() -> i32 { std::mem::offset_of!(MipsCore, fpu_fir) as i32 }
+fn core_offset_of_fpu_fexr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fexr) as i32 }
+fn core_offset_of_fpu_fenr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fenr) as i32 }
+fn core_offset_of_fpu_fccr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fccr) as i32 }
+
+/// Byte offset of `core.fpr[reg]`. `fpr` is `[u64; 32]` (`MipsCore::fpr`) —
+/// same shape as `core_offset_of_gpr`.
+fn core_offset_of_fpr(reg: u32) -> i32 {
+    std::mem::offset_of!(MipsCore, fpr) as i32 + (reg as i32) * 8
+}
+
+/// Load `core.hi`/`core.lo` as I64 (plain, non-atomic — same access pattern
+/// as `emit_read_gpr`).
+fn emit_read_hi(ctx: &mut EmitCtx) -> Value {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_hi());
+    ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
+}
+fn emit_read_lo(ctx: &mut EmitCtx) -> Value {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_lo());
+    ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
+}
+fn emit_write_hi(ctx: &mut EmitCtx, value: Value) {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_hi());
+    ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+}
+fn emit_write_lo(ctx: &mut EmitCtx, value: Value) {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_lo());
+    ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+}
+
+/// Byte offset of `core.gpr[reg]`. `gpr` is `[u64; 32]` (`MipsCore::gpr`) —
+/// index arithmetic on the base offset rather than a second `offset_of!`
+/// call per register.
+fn core_offset_of_gpr(reg: u32) -> i32 {
+    std::mem::offset_of!(MipsCore, gpr) as i32 + (reg as i32) * 8
+}
+
+#[cfg(feature = "jitv2")]
+fn core_offset_of_jit_ctx() -> i32 { std::mem::offset_of!(MipsCore, jit_ctx) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read8_fn() -> i32 { std::mem::offset_of!(MipsCore, read8_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read16_fn() -> i32 { std::mem::offset_of!(MipsCore, read16_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read32_fn() -> i32 { std::mem::offset_of!(MipsCore, read32_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read64_fn() -> i32 { std::mem::offset_of!(MipsCore, read64_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_write8_fn() -> i32 { std::mem::offset_of!(MipsCore, write8_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_write16_fn() -> i32 { std::mem::offset_of!(MipsCore, write16_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_write32_fn() -> i32 { std::mem::offset_of!(MipsCore, write32_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_write64_fn() -> i32 { std::mem::offset_of!(MipsCore, write64_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_write64_masked_fn() -> i32 { std::mem::offset_of!(MipsCore, write64_masked_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_handle_exception_fn() -> i32 { std::mem::offset_of!(MipsCore, handle_exception_fn) as i32 }
+fn core_offset_of_interp_fallback_fn() -> i32 { std::mem::offset_of!(MipsCore, interp_fallback_fn) as i32 }
+fn core_offset_of_kill_entry_fn() -> i32 { std::mem::offset_of!(MipsCore, kill_entry_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_jit_mem_exc() -> i32 { std::mem::offset_of!(MipsCore, jit_mem_exc) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_in_delay_slot() -> i32 { std::mem::offset_of!(MipsCore, in_delay_slot) as i32 }
+fn core_offset_of_delay_slot_target() -> i32 { std::mem::offset_of!(MipsCore, delay_slot_target) as i32 }
+
+/// Memory access width, mirroring `MipsExecutor::read_data::<SIZE>`/
+/// `write_data::<SIZE>`'s const-generic `SIZE` parameter (bytes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemSize { B1, B2, B4, B8 }
+
+impl MemSize {
+    fn read_fn_offset(self) -> i32 {
+        match self {
+            MemSize::B1 => core_offset_of_read8_fn(),
+            MemSize::B2 => core_offset_of_read16_fn(),
+            MemSize::B4 => core_offset_of_read32_fn(),
+            MemSize::B8 => core_offset_of_read64_fn(),
+        }
+    }
+    fn write_fn_offset(self) -> i32 {
+        match self {
+            MemSize::B1 => core_offset_of_write8_fn(),
+            MemSize::B2 => core_offset_of_write16_fn(),
+            MemSize::B4 => core_offset_of_write32_fn(),
+            MemSize::B8 => core_offset_of_write64_fn(),
+        }
+    }
+    /// Cranelift type of the *stored/loaded* value at this width, before any
+    /// zero/sign-extension the caller applies afterward — `read*_fn` always
+    /// returns the full u64 (already zero-extended by the wrapper on the Rust
+    /// side, see `MipsCore`'s field doc comment), so this is only used for
+    /// `write*_fn`'s narrower value parameter.
+    fn ir_type(self) -> ir::Type {
+        match self {
+            MemSize::B1 => ir::types::I8,
+            MemSize::B2 => ir::types::I16,
+            MemSize::B4 => ir::types::I32,
+            MemSize::B8 => ir::types::I64,
+        }
+    }
+    /// Access width in bytes — used by the unaligned load/store family
+    /// (LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR) to compute the alignment mask
+    /// (`width_bytes() - 1`) and total bit width (`width_bytes() * 8`) for
+    /// their runtime-variable shift/mask arithmetic.
+    fn width_bytes(self) -> u32 {
+        match self {
+            MemSize::B1 => 1,
+            MemSize::B2 => 2,
+            MemSize::B4 => 4,
+            MemSize::B8 => 8,
+        }
+    }
+}
+
+/// Emit a call through `core.read{8,16,32,64}_fn(core.jit_ctx, vaddr)`
+/// (§3.3 "memory access = the interpreter's own access routine"). Returns
+/// the loaded value as I64 (already zero-extended by the wrapper — see
+/// `MipsCore::read32_fn`'s doc comment) — callers needing sign extension
+/// (LB/LH/LW) must `sextend` from the narrower width themselves, same as the
+/// interpreter's own handlers do after calling `read_data`.
+///
+/// Does not itself check the exception result — call [`emit_check_mem_exc`]
+/// immediately after with the same `word_offset`/`exit_block` to bail out on
+/// a fault before trusting the returned value, exactly like every
+/// interpreter load handler's `match self.read_data(...) { Ok(v) => ...,
+/// Err(status) => ... }`.
+fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(size.read_fn_offset());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
+    sig.returns.push(AbiParam::new(ir::types::I64)); // value
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, vaddr]);
+    ctx.builder.inst_results(call)[0]
+}
+
+/// Emit a call through `core.write{8,16,32,64}_fn(core.jit_ctx, vaddr, value)`.
+/// `value` is always passed as I64, regardless of `size` — never narrowed to
+/// `size.ir_type()` here or by the caller. This is deliberate, not a
+/// simplification: the x86-64 SysV C ABI doesn't guarantee a sub-word
+/// integer argument's upper register bits are zeroed by the caller (nor does
+/// this hand-built `call_indirect` signature impose that on itself), so a
+/// narrower `AbiParam`/`Value` here previously let whatever garbage sat in
+/// the unused high bits of the argument register leak into the callee's own
+/// `val as u64` widening on the Rust side (observed live: SB writes coming
+/// through with garbage-prefixed values like `0xffffff00` where only the low
+/// byte, `0x00`, was architecturally meaningful). `MipsCore::write8_fn`
+/// (etc.)'s signature was changed to match — always `u64`, with the Rust
+/// wrapper (`jit_write8` in `mips_exec.rs`) masking to the real width
+/// itself, exactly like `emit_mem_read`'s callers already mask/extend a
+/// full-width return value down to what they need. Returns the `ExecStatus`
+/// result (I32) — 0 on success, an exception status otherwise; also
+/// mirrored into `core.jit_mem_exc` by the wrapper (see
+/// [`emit_check_mem_exc`]), so callers can use the same check helper
+/// uniformly for both loads and stores rather than branching on this return
+/// value directly.
+fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(size.write_fn_offset());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
+    sig.params.push(AbiParam::new(ir::types::I64)); // value — always I64, see doc comment
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, vaddr, value]);
+    // Return value intentionally unused here — emit_check_mem_exc reads
+    // core.jit_mem_exc instead, so loads and stores share one check path.
+}
+
+/// Emit a call through `core.write64_masked_fn(core.jit_ctx, aligned_addr,
+/// val, mask)` — the SWL/SWR/SDL/SDR counterpart to [`emit_mem_write`].
+/// `aligned_addr` must already be doubleword-aligned (callers compute this
+/// themselves, same contract as `MipsExecutor::write_data64_masked`); `val`
+/// and `mask` are both full 64-bit values already positioned in
+/// doubleword-space by the caller (`emit_swl`/etc.'s own dword-shift
+/// promotion), not narrowed/widened here.
+fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mask: Value) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_write64_masked_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I64)); // aligned_addr
+    sig.params.push(AbiParam::new(ir::types::I64)); // val
+    sig.params.push(AbiParam::new(ir::types::I64)); // mask
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, aligned_addr, val, mask]);
+    // Return value intentionally unused — emit_check_mem_exc reads
+    // core.jit_mem_exc instead, same convention as emit_mem_write.
+}
+
+/// After [`emit_mem_read`]/[`emit_mem_write`]: load `core.jit_mem_exc` and
+/// route it exactly like the interpreter's own `finish_status` does for a
+/// status straight out of `read_data`/`write_data` — retry/breakpoint-only
+/// possible here, since loads/stores are the only emitters that ever call
+/// this (§the interpreter's `finish_status` doc comment: "dispatches to
+/// handle_exception if EXEC_IS_EXCEPTION is set, otherwise passes
+/// EXEC_BREAKPOINT/EXEC_RETRY straight through unchanged"):
+///
+/// - `0` (`EXEC_COMPLETE`): no fault, fall through — the common case.
+/// - `EXEC_IS_EXCEPTION` bit set (a real MIPS exception — ADEL/ADES/DBE/…):
+///   deliver via [`emit_exception_exit`] (BD/entry-word-aware `core.pc`
+///   synthesis, then `handle_exception_fn`).
+/// - nonzero but `EXEC_IS_EXCEPTION` clear (`EXEC_RETRY`/`EXEC_BREAKPOINT`):
+///   **not** an exception — the bus was busy, or a memory breakpoint fired
+///   mid-access — nothing architectural happened and nothing should retire.
+///   Bail to the interpreter at `ctx.word` via [`emit_bail`]/`exit_block`
+///   instead of `emit_exception_exit`: a bail only writes `core.pc` (never
+///   touches `in_delay_slot`, never calls `deliver_exception`), so the
+///   interpreter's very next `step()` simply re-dispatches this exact
+///   instruction from scratch and gets a fresh status — identical
+///   observable effect to what the interpreter's own retry does, and
+///   correct even for the entry-word-as-foreign-slot case (an already-armed
+///   `in_delay_slot` survives untouched, same reasoning as `emit_bail`'s own
+///   doc comment). (Found live via `jitcheck`'s new `step_status` digest
+///   field: `EXEC_RETRY` from a transient bus-busy read was being routed
+///   into `emit_exception_exit` and vectored as a real exception — the
+///   interpreter, given the identical read, simply retried and moved on.)
+///
+/// Leaves `builder` positioned in a new, sealed continuation block (the
+/// "no fault" path) if status was `0` — callers continue emitting there.
+/// Must be called with `builder` positioned in the block holding the memory
+/// op just emitted.
+fn emit_check_mem_exc(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let exc_off = ir::immediates::Offset32::new(core_offset_of_jit_mem_exc());
+    let exc = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, exc_off);
+    let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
+    let has_status = ctx.builder.ins().icmp(IntCC::NotEqual, exc, zero);
+
+    let status_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(has_status, status_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(status_block);
+    // Cold: the common case for any memory access is a plain success status
+    // (0) — see this function's other `set_cold_block` calls for the full
+    // rationale, repeated at every block on this rare-status path.
+    ctx.builder.set_cold_block(status_block);
+    ctx.builder.seal_block(status_block);
+    let is_exception = ctx.builder.ins().band_imm_s(exc, EXEC_IS_EXCEPTION as i64);
+    let is_exception = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, is_exception, 0);
+
+    let exception_block = ctx.builder.create_block();
+    let retry_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_exception, exception_block, &[], retry_block, &[]);
+
+    ctx.builder.switch_to_block(exception_block);
+    // Cold: a real fault (TLB miss, address error, bus error) is the rare
+    // path for every memory access this emits into — Cranelift moves cold
+    // blocks out of the hot straight-line path, so the branch-not-taken case
+    // (no fault) stays branch-predictor- and icache-friendly. Every other
+    // exception/trap-exit block this module creates gets the same
+    // treatment, for the same reason — see this comment's siblings at each
+    // other `create_block()` site feeding into `emit_exception_exit`.
+    ctx.builder.set_cold_block(exception_block);
+    ctx.builder.seal_block(exception_block);
+    emit_exception_exit(ctx, exc);
+
+    ctx.builder.switch_to_block(retry_block);
+    // Cold: a transient bus-busy retry (not a hard fault, but still the rare
+    // case relative to plain success).
+    ctx.builder.set_cold_block(retry_block);
+    ctx.builder.seal_block(retry_block);
+    emit_bail(ctx, ctx.exit_block, ctx.word);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Call `core.fpu_clear_status_fn(core.jit_ctx)` — mirrors the interpreter's
+/// `platform::clear_fpu_status()` call at the top of every FP arithmetic/
+/// conversion handler, before the op runs, so the host's sticky exception
+/// flags only reflect this one operation.
+fn emit_fpu_clear_status(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_clear_status_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    let sig_ref = ctx.builder.import_signature(sig);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+}
+
+/// Call `core.fpu_set_mode_fn(core.jit_ctx, rm)` — mirrors
+/// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on an
+/// FCSR (reg 31) write. `rm` is a runtime `Value` (the low 2 bits of the
+/// newly-written FCSR), not a compile-time constant.
+///
+/// `AbiParam::new(I32)` here is narrower than `emit_mem_write`'s value
+/// parameter (always I64 — see that function's doc comment for why: the
+/// SysV C ABI doesn't guarantee a caller zero-extends a sub-word integer
+/// argument, and a live bug from exactly that gap was found and fixed for
+/// I8/I16 write values). This one's been left I32 rather than widened
+/// defensively too: unlike I8/I16, a 32-bit x86-64 ALU/mov destination
+/// register is architecturally zero-extended to 64 bits as a side effect,
+/// which is almost certainly why this specific width never showed the same
+/// corruption in practice (`jit_fpu_set_mode`'s `rm as u8` truncation would
+/// have surfaced it identically if it existed here). Worth revisiting if
+/// `rm` is ever seen wrong — the fix would be the same widen-to-I64 pattern.
+fn emit_fpu_set_mode(ctx: &mut EmitCtx, rm: Value) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_set_mode_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I32)); // rm
+    let sig_ref = ctx.builder.import_signature(sig);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, rm]);
+}
+
+/// MFC1 rt, fs: rt = sign_extend32(fpr_w[fs]). Mirrors `exec_mfc1`.
+fn emit_mfc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let sext = ctx.builder.ins().sextend(ir::types::I64, bits);
+    emit_write_gpr(ctx, rt, sext);
+}
+
+/// DMFC1 rt, fs: rt = fpr_l[fs] (full 64 bits). Mirrors `exec_dmfc1`.
+fn emit_dmfc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let value = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_write_gpr(ctx, rt, value);
+}
+
+/// MTC1 rt, fs: fpr_w[fs] = rt[31:0]. Mirrors `exec_mtc1`.
+fn emit_mtc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let rt_val = emit_read_gpr(ctx, rt);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    emit_write_fpr_w(ctx, fs, rt_32, fr_mode);
+}
+
+/// DMTC1 rt, fs: fpr_l[fs] = rt (full 64 bits). Mirrors `exec_dmtc1`.
+fn emit_dmtc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let rt_val = emit_read_gpr(ctx, rt);
+    emit_write_fpr_l(ctx, fs, rt_val, fr_mode);
+}
+
+/// CFC1 rt, fs: rt = sign_extend32(read_fpu_control(fs)). Mirrors
+/// `exec_cfc1`/`MipsCore::read_fpu_control` — reg 0=FIR, 25=FCCR (packed
+/// from FCSR's condition-code bits), 26=FEXR, 28=FENR, 31=FCSR; anything
+/// else reads 0. `fs` is a compile-time constant (part of the fixed
+/// instruction encoding), so this compiles to a single load of whichever
+/// field `fs` selects — no runtime branch needed.
+fn emit_cfc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let mem = MemFlagsData::trusted();
+
+    let value = match fs {
+        0 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fir())),
+        25 => {
+            // fccr_from_fcsr: cc0 = fcsr[23], cc1..7 = fcsr[25:31] -> packed as cc0 | (cc1_7 << 1)
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+            let cc0 = ctx.builder.ins().ushr_imm_s(fcsr, 23);
+            let cc0 = ctx.builder.ins().band_imm_s(cc0, 1);
+            let cc1_7 = ctx.builder.ins().ushr_imm_s(fcsr, 25);
+            let cc1_7 = ctx.builder.ins().band_imm_s(cc1_7, 0x7F);
+            let cc1_7_shifted = ctx.builder.ins().ishl_imm_s(cc1_7, 1);
+            ctx.builder.ins().bor(cc0, cc1_7_shifted)
+        }
+        26 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fexr())),
+        28 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fenr())),
+        31 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr())),
+        _ => ctx.builder.ins().iconst(ir::types::I32, 0),
+    };
+    let sext = ctx.builder.ins().sextend(ir::types::I64, value);
+    emit_write_gpr(ctx, rt, sext);
+}
+
+/// CTC1 rt, fs: write_fpu_control(fs, rt[31:0]), mirroring
+/// `exec_ctc1`/`MipsCore::write_fpu_control` exactly: reg 0 (FIR) is
+/// read-only (no-op); reg 25 (FCCR) scatters into FCSR's condition-code
+/// bits; reg 26/28 (FEXR/FENR) are plain stores; reg 31 (FCSR) stores the
+/// whole value, re-derives FCCR from it, reprograms the host rounding mode
+/// (`emit_fpu_set_mode`), and — the one path with control flow — re-checks
+/// pending cause bits against enables and raises `EXC_FPE` immediately if
+/// warranted (`(fcsr & FCSR_CE) != 0 || ((fcsr & FCSR_CM) >> 5) & (fcsr &
+/// FCSR_EM) != 0`). `fs` is compile-time constant, so which case applies is
+/// resolved at compile time — no runtime branch on `fs` itself, only
+/// (for reg 31) on the pending-exception check.
+fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let rt = field_rt(ctx.raw);
+    let mem = MemFlagsData::trusted();
+
+    let rt_val = emit_read_gpr(ctx, rt);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+
+    match fs {
+        0 => {} // FIR read-only, write ignored
+        25 => {
+            let fccr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fccr());
+            let value_masked = ctx.builder.ins().band_imm_s(rt_32, 0xFF);
+            ctx.builder.ins().store(mem, value_masked, ctx.core_ptr, fccr_off);
+            // fcsr_with_fccr: scatter cc0/cc1..7 back into FCSR's cc bits.
+            let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
+            let cleared = ctx.builder.ins().band_imm_s(fcsr, !((1i64 << 23) | (0x7Fi64 << 25)));
+            let cc0 = ctx.builder.ins().band_imm_s(value_masked, 1);
+            let cc0_shifted = ctx.builder.ins().ishl_imm_s(cc0, 23);
+            let cc1_7 = ctx.builder.ins().ushr_imm_s(value_masked, 1);
+            let cc1_7 = ctx.builder.ins().band_imm_s(cc1_7, 0x7F);
+            let cc1_7_shifted = ctx.builder.ins().ishl_imm_s(cc1_7, 25);
+            let with_cc0 = ctx.builder.ins().bor(cleared, cc0_shifted);
+            let new_fcsr = ctx.builder.ins().bor(with_cc0, cc1_7_shifted);
+            ctx.builder.ins().store(mem, new_fcsr, ctx.core_ptr, fcsr_off);
+        }
+        26 => {
+            let off = ir::immediates::Offset32::new(core_offset_of_fpu_fexr());
+            ctx.builder.ins().store(mem, rt_32, ctx.core_ptr, off);
+        }
+        28 => {
+            let off = ir::immediates::Offset32::new(core_offset_of_fpu_fenr());
+            ctx.builder.ins().store(mem, rt_32, ctx.core_ptr, off);
+        }
+        31 => {
+            let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+            ctx.builder.ins().store(mem, rt_32, ctx.core_ptr, fcsr_off);
+            // fccr_from_fcsr(value) -> fpu_fccr
+            let cc0 = ctx.builder.ins().ushr_imm_s(rt_32, 23);
+            let cc0 = ctx.builder.ins().band_imm_s(cc0, 1);
+            let cc1_7 = ctx.builder.ins().ushr_imm_s(rt_32, 25);
+            let cc1_7 = ctx.builder.ins().band_imm_s(cc1_7, 0x7F);
+            let cc1_7_shifted = ctx.builder.ins().ishl_imm_s(cc1_7, 1);
+            let fccr = ctx.builder.ins().bor(cc0, cc1_7_shifted);
+            let fccr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fccr());
+            ctx.builder.ins().store(mem, fccr, ctx.core_ptr, fccr_off);
+
+            let rm = ctx.builder.ins().band_imm_s(rt_32, 0x3);
+            emit_fpu_set_mode(ctx, rm);
+
+            // Pending-cause-vs-enabled recheck (mirrors exec_ctc1 exactly).
+            const FCSR_CE: i64 = 0x0002_0000;
+            const FCSR_CM: i64 = 0x0001_f000;
+            const FCSR_EM: i64 = 0x0000_0f80;
+            let ce_set = ctx.builder.ins().band_imm_s(rt_32, FCSR_CE);
+            let ce_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ce_set, 0);
+            let cm = ctx.builder.ins().band_imm_s(rt_32, FCSR_CM);
+            let cm_shifted = ctx.builder.ins().ushr_imm_s(cm, 5);
+            let em = ctx.builder.ins().band_imm_s(rt_32, FCSR_EM);
+            let cause_and_enable = ctx.builder.ins().band(cm_shifted, em);
+            let cause_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause_and_enable, 0);
+            let should_raise = ctx.builder.ins().bor(ce_nonzero, cause_nonzero);
+
+            let raise_block = ctx.builder.create_block();
+            let continue_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(should_raise, raise_block, &[], continue_block, &[]);
+
+            // Cold: an FCSR write that immediately re-triggers a pending
+            // unmasked exception is a rare, deliberate case.
+            ctx.builder.switch_to_block(raise_block);
+            ctx.builder.set_cold_block(raise_block);
+            ctx.builder.seal_block(raise_block);
+            let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+            let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+            emit_exception_exit(ctx, status_val);
+
+            ctx.builder.switch_to_block(continue_block);
+            ctx.builder.seal_block(continue_block);
+        }
+        _ => {} // undefined registers ignored
+    }
+}
+
+/// After an FP arithmetic/conversion op: read host exception flags (already
+/// translated to MIPS FCSR bit positions [6:2] by `fpu_get_status_fn`),
+/// clear them again for the next op, fold them into `core.fpu_fcsr`'s
+/// Cause/Flag bits, and raise `EXC_FPE` if warranted — mirrors
+/// `MipsExecutor::fpu_update_fcsr` exactly (same bit math, same underflow-
+/// trap-punts-to-CE special case, same enabled-cause check). Must be called
+/// with `builder` positioned in the block holding the FP op just emitted,
+/// after its result has been written (matches the interpreter calling this
+/// only as the handler's terminal action). Leaves `builder` positioned in a
+/// new, sealed continuation block if no exception fired — callers continue
+/// emitting there (their block's fallthrough/exit wiring happens exactly
+/// like a plain `Sequential` instruction's, from the caller's perspective).
+fn emit_fpu_update_fcsr(ctx: &mut EmitCtx) {
+    emit_fpu_update_fcsr_with_inexact_override(ctx, None);
+}
+
+/// `inexact_override`: when `Some(bool_val)` (an `I8` SSA value, 0 or 1),
+/// replaces whatever the host FPU's own Inexact sticky bit (bit 2 of the
+/// [6:2] V,Z,O,U,I encoding `fpu_get_status_fn` returns) says with this
+/// value instead of trusting it — mirrors `mips_exec.rs`'s
+/// `fpu_update_fcsr_with_inexact_override` exactly (see
+/// `exec_fround_l_s`'s doc comment for the full reasoning: host hardware
+/// state can't answer "was this MIPS conversion inexact" for
+/// ROUND/TRUNC/CEIL/FLOOR/CVT.W/CVT.L — Cranelift's `round`/`trunc`/`ceil`/
+/// `floor` lower to real SSE `ROUNDSS`/`ROUNDSD` instructions whose
+/// Precision flag reflects the *intermediate* rounding step, not the
+/// overall MIPS conversion's own inexactness — `emit_round_and_convert`
+/// computes the real answer by comparing the converted-back-to-float result
+/// against the original source value and passes it in here).
+fn emit_fpu_update_fcsr_with_inexact_override(ctx: &mut EmitCtx, inexact_override: Option<Value>) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i32t = ir::types::I32;
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+
+    let get_fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_get_status_fn());
+    let get_callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, get_fn_off);
+    let mut get_sig = ctx.module.make_signature();
+    get_sig.params.push(AbiParam::new(ptr_ty));
+    get_sig.returns.push(AbiParam::new(i32t));
+    let get_sig_ref = ctx.builder.import_signature(get_sig);
+    let get_call = ctx.builder.ins().call_indirect(get_sig_ref, get_callee, &[jit_ctx]);
+    let flags_raw = ctx.builder.inst_results(get_call)[0];
+
+    emit_fpu_clear_status(ctx);
+
+    let flags = match inexact_override {
+        None => flags_raw,
+        Some(inexact_bool) => {
+            // flags = (flags_raw & !(1<<2)) | (inexact_bool << 2)
+            let cleared = ctx.builder.ins().band_imm_s(flags_raw, !(1i64 << 2));
+            let inexact_i32 = ctx.builder.ins().uextend(i32t, inexact_bool);
+            let inexact_bit = ctx.builder.ins().ishl_imm_s(inexact_i32, 2);
+            ctx.builder.ins().bor(cleared, inexact_bit)
+        }
+    };
+
+    let zero = ctx.builder.ins().iconst(i32t, 0);
+    let has_flags = ctx.builder.ins().icmp(IntCC::NotEqual, flags, zero);
+
+    let update_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(has_flags, update_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(update_block);
+    ctx.builder.seal_block(update_block);
+
+    const FCSR_CU: i64 = 0x0000_2000;
+    const FCSR_CE: i64 = 0x0002_0000;
+    const FCSR_EM: i64 = 0x0000_0f80;
+    const FCSR_FM: i64 = 0x0000_007c;
+
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+
+    // causes = (flags & FCSR_FM) << 10
+    let flags_fm = ctx.builder.ins().band_imm_s(flags, FCSR_FM);
+    let causes = ctx.builder.ins().ishl_imm_s(flags_fm, 10);
+
+    // fcsr |= causes; fcsr |= flags & FCSR_FM
+    let fcsr1 = ctx.builder.ins().bor(fcsr, causes);
+    let fcsr2 = ctx.builder.ins().bor(fcsr1, flags_fm);
+    ctx.builder.ins().store(mem, fcsr2, ctx.core_ptr, fcsr_off);
+
+    // Underflow-trap-punts-to-CE: (causes & FCSR_CU) != 0 && (fcsr2 & 0x100) != 0
+    let causes_cu = ctx.builder.ins().band_imm_s(causes, FCSR_CU);
+    let cu_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, causes_cu, 0);
+    let fcsr2_underflow_trap_bit = ctx.builder.ins().band_imm_s(fcsr2, 0x100);
+    let underflow_trap_enabled = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fcsr2_underflow_trap_bit, 0);
+    let underflow_punt = ctx.builder.ins().band(cu_set, underflow_trap_enabled);
+
+    let underflow_block = ctx.builder.create_block();
+    let check_enabled_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(underflow_punt, underflow_block, &[], check_enabled_block, &[]);
+
+    // Cold: this underflow-trap-punts-to-CE case is rare — most FP ops
+    // don't underflow at all, and of those that do, most don't have the
+    // underflow trap enabled.
+    ctx.builder.switch_to_block(underflow_block);
+    ctx.builder.set_cold_block(underflow_block);
+    ctx.builder.seal_block(underflow_block);
+    let fcsr3 = ctx.builder.ins().bor_imm_s(fcsr2, FCSR_CE);
+    ctx.builder.ins().store(mem, fcsr3, ctx.core_ptr, fcsr_off);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(check_enabled_block);
+    ctx.builder.seal_block(check_enabled_block);
+    // (causes >> 5) & (fcsr2 & FCSR_EM) != 0
+    let causes_shifted = ctx.builder.ins().ushr_imm_s(causes, 5);
+    let fcsr2_em = ctx.builder.ins().band_imm_s(fcsr2, FCSR_EM);
+    let enabled_cause = ctx.builder.ins().band(causes_shifted, fcsr2_em);
+    let has_enabled_cause = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, enabled_cause, 0);
+
+    let raise_block = ctx.builder.create_block();
+    let no_raise_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(has_enabled_cause, raise_block, &[], no_raise_block, &[]);
+
+    // Cold: most FP ops don't raise an enabled exception cause.
+    ctx.builder.switch_to_block(raise_block);
+    ctx.builder.set_cold_block(raise_block);
+    ctx.builder.seal_block(raise_block);
+    let status_val2 = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val2);
+
+    ctx.builder.switch_to_block(no_raise_block);
+    ctx.builder.seal_block(no_raise_block);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Deliver `status` via `core.handle_exception_fn(core.jit_ctx, status)`
+/// (§4.2 — the interpreter's own `handle_exception`, the only implementation
+/// of EPC/Cause/BD/vectoring) and return `EXEC_COMPLETE`. Terminates the
+/// current block; call as the block's terminator (like `emit_bail`). Not
+/// itself sealing/switching anything afterward — there is nothing after a
+/// return.
+///
+/// `deliver_exception` (called via `handle_exception_fn`) computes EPC
+/// directly from live `core.pc` (`core.pc`, or `core.pc - 4` when
+/// `core.in_delay_slot`). A plain sequential head instruction's own body
+/// never writes `core.pc` per-instruction — only exit points do, to keep a
+/// straight-line compiled run cheap, which is the entire point of compiling
+/// it — so without correcting it here, a head instruction's fault would
+/// report EPC from wherever `core.pc` was last left (the compiled unit's
+/// entry, or a prior unit's exit), not the actual faulting instruction.
+/// `ctx.word` always names the instruction whose body is currently being
+/// emitted (kept accurate by `compile_region`'s per-head-instruction loop
+/// and updated to the slot's own word by `emit_slot_semantics` while
+/// compiling a delay slot's body — see that function's own `core.pc`
+/// pre-write, which this mirrors: for a slot, `core.pc` is already exactly
+/// `vbase | (ctx.word * 4)`, so this store is a same-value no-op; for a head
+/// instruction, it's the actual fix), so `core.pc` is resynchronized to
+/// `vbase | (ctx.word * 4)` before the handler runs, exactly like
+/// `emit_exit_block_body`'s vbase derivation. (Found live: an ADEL fault
+/// inside a compiled `lw` reported EPC pointing at an unrelated, later PROM
+/// routine — whatever `core.pc` was stale with — instead of the real
+/// faulting instruction.)
+///
+/// Exception: at `entry_word` (only there — see `EmitCtx::entry_word`'s doc
+/// comment for why every other word is unambiguous), the synthesis above is
+/// skipped if live `core.in_delay_slot` is true at the fault site: a
+/// physical word compiled once as an ordinary entry can, on a later
+/// dispatch, be entered because the interpreter's own dispatch loop landed
+/// on it as some *other* branch's delay slot — `core.in_delay_slot`/
+/// `core.pc` are already correct in that case (set by the interpreter via
+/// `branch_delay`/`handle_exec_complete` before this compiled function was
+/// even called), and overwriting `core.pc` here would discard that and make
+/// `deliver_exception` compute EPC/BD as if this were an ordinary
+/// (non-delay-slot) fault — wrong `Cause.BD` (should be set, would read
+/// clear) and wrong EPC (should be `core.pc - 4`, i.e. the real branch's
+/// address, would read this word's own address instead).
+///
+/// Two-stage split (see `BlockSkeleton`'s own doc comment for the full
+/// rationale): `word == entry_word` is always known at compile time for any
+/// given call site, so `emit_exception_exit` below picks the right outer
+/// stage directly — no call site ever pays a runtime check for a fact that
+/// was already fixed when it was emitted. This is the inner stage, shared
+/// by every call site regardless of which word it's at: assumes
+/// `core.pc`/`core.in_delay_slot` are already correct (both outer stages
+/// below guarantee this before jumping here) and just delivers the
+/// exception.
+fn emit_exception_call_block_body(
+    module: &mut dyn cranelift_module::Module,
+    builder: &mut FunctionBuilder,
+    core_ptr: Value,
+    status: Value,
+) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = builder.ins().load(ptr_ty, mem, core_ptr, jit_ctx_off);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_handle_exception_fn());
+    let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
+
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I32)); // status
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus (== status, unused)
+    let sig_ref = builder.import_signature(sig);
+
+    builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, status]);
+    let ret_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    builder.ins().return_(&[ret_status]);
+}
+
+/// Outer stage for every non-entry-word `emit_exception_exit` call site,
+/// shared across all of them (`word`/`bd` are genuine runtime params here,
+/// unlike the entry-word stage — this one block really does serve many
+/// different words, both delay-slot and non-delay-slot alike). Unconditionally
+/// writes `core.pc = vbase | (word * 4)` and `core.in_delay_slot = bd` from
+/// its own params — never trusts either field's live value on entry, so no
+/// call site needs to rely on any upstream code having left them correct
+/// (see `emit_exception_exit`'s doc comment for why leaving `in_delay_slot`
+/// to inheritance was fragile) — then falls into the inner stage. Every call
+/// site's `bd` is a compile-time-known literal (`emit_exception_exit` reads
+/// `ctx.bd`): `true` only while inlined inside a delay slot's own semantics
+/// (`emit_slot_semantics` sets `ctx.bd = true` before calling in), `false`
+/// for every ordinary, non-slot head — including one that's independently
+/// reachable as this same region's own branch/jump target (§6.1.4 dual
+/// semantics), which is always a *different*, freshly-constructed `ctx` with
+/// its own default `bd = false`.
+fn emit_exception_other_word_block_body(
+    builder: &mut FunctionBuilder,
+    core_ptr: Value,
+    word: Value,
+    bd: Value,
+    status: Value,
+    call_block: Block,
+) {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+
+    let pc = builder.ins().load(i64t, mem, core_ptr, pc_off);
+    let vbase = builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
+    let byte_offset = builder.ins().imul_imm_s(word, 4);
+    let fault_pc = builder.ins().iadd(vbase, byte_offset);
+    builder.ins().store(mem, fault_pc, core_ptr, pc_off);
+    builder.ins().store(mem, bd, core_ptr, flag_off);
+    builder.ins().jump(call_block, &[ir::BlockArg::Value(core_ptr), ir::BlockArg::Value(status)]);
+}
+
+/// Outer stage for entry-word `emit_exception_exit` call sites — see
+/// `BlockSkeleton::exception_entry_word_block`'s doc comment for why
+/// `entry_word` is baked in as a compile-time constant here rather than
+/// threaded as a block param (there's only ever one per region).
+///
+/// Unconditional, same shape as `emit_exception_other_word_block_body` — no
+/// runtime check. A runtime check *here* cannot work: by the time control
+/// reaches this block, `core.in_delay_slot`'s live value no longer
+/// distinguishes "external interpreter dispatch landed on entry_word"
+/// (state already correct) from "an internal in-region branch landed on
+/// entry_word" (state stale) — both are just some bit pattern in `core`,
+/// with no third signal available here to tell them apart. The
+/// disambiguation has to happen at the branch site instead: entry_word_block
+/// (the target of every *internal* edge into entry_word, per its own doc
+/// comment in `compile_region_uncommitted`) unconditionally forces
+/// `core.in_delay_slot = false` and `core.pc = vbase | entry_word*4` before
+/// falling into entry_word_body_block — internal edges into entry_word are
+/// always ordinary fallthrough/taken-branch edges (`emit_target_edge`'s
+/// `None` arm), never a delay-slot transfer, so `in_delay_slot` is always
+/// `false` on that path. That leaves this block free to just assume state is
+/// already correct unconditionally, exactly like the non-entry-word stage.
+fn emit_exception_entry_word_block_body(
+    builder: &mut FunctionBuilder,
+    core_ptr: Value,
+    status: Value,
+    call_block: Block,
+) {
+    builder.ins().jump(call_block, &[ir::BlockArg::Value(core_ptr), ir::BlockArg::Value(status)]);
+}
+
+/// Jump to the region's shared exception-raise machinery instead of emitting
+/// a fresh copy of the whole delay-slot-check-and-raise sequence at every
+/// call site — the exception-exit counterpart of `emit_bail`. Picks
+/// `ctx.exception_entry_word_block` or `ctx.exception_other_word_block` at
+/// *compile* time based on `ctx.word == ctx.entry_word` (always known when
+/// emitting a given call site — see `BlockSkeleton`'s doc comment for why
+/// this avoids the runtime check a single fully-shared block would need).
+fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
+    if ctx.word == ctx.entry_word {
+        // entry_word is always this region's own head — never itself
+        // inlined as some other instruction's delay slot within the same
+        // region — so ctx.bd is always false here; exception_entry_word_block
+        // correctly never looks at it (see its own doc comment).
+        ctx.builder.ins().jump(ctx.exception_entry_word_block, &[
+            ir::BlockArg::Value(ctx.core_ptr),
+            ir::BlockArg::Value(status),
+        ]);
+    } else {
+        let word_val = ctx.builder.ins().iconst(ir::types::I64, ctx.word as i64);
+        let bd_val = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
+        ctx.builder.ins().jump(ctx.exception_other_word_block, &[
+            ir::BlockArg::Value(ctx.core_ptr),
+            ir::BlockArg::Value(word_val),
+            ir::BlockArg::Value(bd_val),
+            ir::BlockArg::Value(status),
+        ]);
+    }
+}
+
+/// Exit stub for a runtime-computed target address (JR/JALR — §2.3, the
+/// target is a register value, not a compile-time word offset, so this
+/// can't go through the shared `exit_block`/`emit_bail`, which only knows
+/// how to materialize `vbase | word_offset*4` from a compile-time constant).
+/// Writes `core.pc = target_addr` directly (already a full virtual address
+/// — no vbase math needed) and returns `EXEC_COMPLETE`, exactly like
+/// `emit_exception_exit`'s "state is already correct, just return" shape.
+/// Terminates the current block; call as the block's terminator.
+fn emit_runtime_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, pc_off);
+    emit_set_jit_trigger(ctx);
+    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().return_(&[status]);
+}
+
+/// Emit a JR/JALR unit: read the target register first (before the delay
+/// slot might overwrite it — mirrors the interpreter's `exec_jr`/
+/// `exec_jalr`, which reads `rs` before dispatching the delay slot via
+/// `branch_delay`), write the link register if JALR, then the delay slot
+/// inline (§6.1.4, always executes — RegJump is never annulling), then exit
+/// via [`emit_runtime_pc_exit`] with the register value read at the start.
+/// Terminates the current block.
+fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], regjump: RegJump, fr_mode: FrMode) {
+    let word = ctx.word;
+    let raw = ctx.raw;
+    let target_addr = emit_read_gpr(ctx, field_rs(raw));
+
+    if regjump.link {
+        // JALR writes its own `rd` field, NOT always r31 (unlike J/JAL/
+        // BLTZAL/BGEZAL, which are architecturally hardcoded to r31) —
+        // mirrors exec_jalr's `self.core.write_gpr(rd_reg, ...)` exactly.
+        let this_pc_word = word as i64 + 2; // this instruction's address + 8 bytes = +2 words
+        emit_write_link_register(ctx, this_pc_word, field_rd(raw));
+    }
+
+    let slot_word = word + 1;
+    // `ForeignPageSlot` (word == 1023, analyzer's `is_0xffc_branch`): no
+    // `instrs[slot_word]` to inline at all (`slot_word == WORDS_PER_PAGE`,
+    // one past the array) — arm the pending transfer instead of executing a
+    // slot that isn't on this page, exactly like emit_branch_or_jump's own
+    // `foreign_page_slot` handling.
+    if slot_word as usize >= ENTRIES_PER_PAGE {
+        emit_foreign_page_slot_exit(ctx, word, target_addr);
+        return;
+    }
+
+    let slot_raw = instrs[slot_word as usize].raw;
+    // Recurse into the slot's own emission with ctx.raw/ctx.word switched to
+    // the slot's — restored after, mirroring emit_slot_semantics' own
+    // core.pc save/restore around the same call.
+    ctx.raw = slot_raw;
+    ctx.word = slot_word;
+    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+    ctx.raw = raw;
+    ctx.word = word;
+    if slot_terminated {
+        // A nested branch/regjump in this slot already exited (wrote its
+        // own final core.pc and returned) — this RegJump's own target
+        // (read from a register *before* the slot ran, per exec_jr/
+        // exec_jalr's ordering) never takes effect; the nested transfer
+        // superseded it, exactly like real hardware's "innermost dispatched
+        // branch_delay wins" nested-delay-slot semantics.
+        return;
+    }
+
+    emit_runtime_pc_exit(ctx, target_addr);
+}
+
+/// Load `core.gpr[reg]` as I64. Matches `MipsCore::read_gpr` (a plain,
+/// non-atomic load — GPRs are only ever touched by the owning exec thread).
+fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
+    ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
+}
+
+/// Store `value` to `core.gpr[reg]`, matching `MipsCore::write_gpr`'s
+/// architectural effect. The interpreter's version always stores then
+/// unconditionally re-zeros `gpr[0]` to avoid a runtime branch on `reg`; here
+/// `reg` is a compile-time constant (baked into each fixed-shape
+/// instruction's emitter), so the equivalent is simpler: skip the store
+/// entirely when `reg == 0` (gpr[0] already reads as 0 and is never written
+/// by any other emitter either, so it stays 0).
+fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
+    if reg == 0 {
+        return;
+    }
+    let mem = MemFlagsData::trusted();
+    let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
+    ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+}
+
+/// Compile-time FPU register-file addressing mode, resolved once per
+/// compiled region from the live `STATUS_FR` bit (`compile_region` reads it
+/// when it decides to compile a region containing CP1 instructions at all;
+/// see the entry-block guard preamble, which re-checks the same bit at
+/// runtime and bails if it no longer matches). Mirrors
+/// `MipsExecutor::update_fpr_mode`'s fn-pointer swap — baked into which
+/// emitter runs, not a runtime branch per FPR access, since FR mode cannot
+/// change within a single region (any instruction that could change it,
+/// MTC0, is `Excluded` and ends the region).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrMode { Fr0, Fr1 }
+
+/// Read `reg` as a 32-bit single/word FPR value (bits, not interpreted as
+/// float yet — callers do `f32::from_bits`-equivalent via `bitcast` as
+/// needed). Mirrors `read_fpr_w_fr0`/`_fr1` (`mips_core.rs`): FR=0 packs two
+/// registers per 64-bit slot (odd reg = upper 32 bits of the even slot);
+/// FR=1 is a flat 64-bit-per-register array, low 32 bits.
+fn emit_read_fpr_w(ctx: &mut EmitCtx, reg: u32, fr_mode: FrMode) -> Value {
+    let mem = MemFlagsData::trusted();
+    match fr_mode {
+        FrMode::Fr0 => {
+            let slot_off = ir::immediates::Offset32::new(core_offset_of_fpr(reg & !1));
+            let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, slot_off);
+            let shifted = if reg & 1 != 0 { ctx.builder.ins().ushr_imm_s(slot, 32) } else { slot };
+            ctx.builder.ins().ireduce(ir::types::I32, shifted)
+        }
+        FrMode::Fr1 => {
+            let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
+            ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, off)
+        }
+    }
+}
+
+/// Write `value` (32-bit single/word bits) to `reg`. Mirrors
+/// `write_fpr_w_fr0`/`_fr1`: FR=0 must preserve the other half of the
+/// 64-bit slot (read-modify-write with a shift+mask); FR=1 stores the low
+/// 32 bits directly, leaving the slot's upper 32 bits untouched (matches
+/// `MipsCore::write_fpr_w`'s `(self.fpr[reg] & 0xFFFFFFFF_00000000) | value`).
+fn emit_write_fpr_w(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) {
+    let mem = MemFlagsData::trusted();
+    match fr_mode {
+        FrMode::Fr0 => {
+            let slot_off = ir::immediates::Offset32::new(core_offset_of_fpr(reg & !1));
+            let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, slot_off);
+            let value_64 = ctx.builder.ins().uextend(ir::types::I64, value);
+            let result = if reg & 1 != 0 {
+                let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF);
+                let shifted = ctx.builder.ins().ishl_imm_s(value_64, 32);
+                ctx.builder.ins().bor(masked, shifted)
+            } else {
+                let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
+                ctx.builder.ins().bor(masked, value_64)
+            };
+            ctx.builder.ins().store(mem, result, ctx.core_ptr, slot_off);
+        }
+        FrMode::Fr1 => {
+            let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
+            let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+            let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
+            let value_64 = ctx.builder.ins().uextend(ir::types::I64, value);
+            let result = ctx.builder.ins().bor(masked, value_64);
+            ctx.builder.ins().store(mem, result, ctx.core_ptr, off);
+        }
+    }
+}
+
+/// Read `reg` as a full 64-bit double/long FPR value. Mirrors
+/// `read_fpr_d_fr0`/`_l_fr0` (force even register, full slot) vs the FR=1
+/// direct `read_fpr_l` (flat per-register slot, `reg` used as-is).
+fn emit_read_fpr_l(ctx: &mut EmitCtx, reg: u32, fr_mode: FrMode) -> Value {
+    let mem = MemFlagsData::trusted();
+    let reg = if fr_mode == FrMode::Fr0 { reg & !1 } else { reg };
+    let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
+    ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
+}
+
+/// Write a full 64-bit double/long value to `reg`. Mirrors
+/// `write_fpr_d_fr0`/`_l_fr0` (forces even) vs FR=1's direct `write_fpr_l`.
+fn emit_write_fpr_l(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) {
+    let mem = MemFlagsData::trusted();
+    let reg = if fr_mode == FrMode::Fr0 { reg & !1 } else { reg };
+    let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
+    ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+}
+
+/// MIPS instruction field extraction — mirrors `mips_isa.rs`'s decode
+/// shapes, narrowed to just what codegen needs (register numbers). Free
+/// functions on the raw `u32`, not tied to `DecodedInstr` — codegen works
+/// directly from `CompiledInstr::raw` (`analyzer.rs`), the same way
+/// `analyzer::classify` does, rather than dragging in the interpreter's
+/// decode/dispatch machinery.
+fn field_rs(raw: u32) -> u32 { (raw >> 21) & 0x1F }
+fn field_rt(raw: u32) -> u32 { (raw >> 16) & 0x1F }
+fn field_rd(raw: u32) -> u32 { (raw >> 11) & 0x1F }
+fn field_sa(raw: u32) -> u32 { (raw >> 6) & 0x1F }
+
+// ---- Branches and jumps ------
+//
+// Distinct from `SemanticsEmitter`: a branch/jump terminates its own block
+// (condition test + brif/jump to the resolved target block or an exit
+// bail) rather than committing data and letting the caller wire a plain
+// fallthrough. `compile_region` dispatches to this path via
+// `lookup_branch_or_jump` before falling back to `lookup_semantics`.
+
+/// How a branch's condition is evaluated, or `Always` for an unconditional
+/// jump (J/JAL). Mirrors the interpreter's `exec_beq`/`exec_bne`/`exec_blez`/
+/// `exec_bgtz`/`exec_bltz`/`exec_bgez` predicates exactly — see `emit_cond`.
+#[derive(Clone, Copy)]
+enum BranchCond {
+    Always,
+    Eq,     // BEQ:  rs == rt
+    Ne,     // BNE:  rs != rt
+    LeZero, // BLEZ: rs as i64 <= 0
+    GtZero, // BGTZ: rs as i64 > 0
+    LtZero, // BLTZ (REGIMM rt=0): rs as i64 < 0
+    GeZero, // BGEZ (REGIMM rt=1): rs as i64 >= 0
+}
+
+/// A branch or jump instruction's shape, as far as codegen cares: how the
+/// condition is evaluated, whether it writes a link register, and whether
+/// its delay slot is annulled on the not-taken path ("Likely" branches —
+/// §4.3 "annul semantics compiled explicitly": the slot's effects must
+/// never be committed when not taken, unlike a plain branch's slot which
+/// always executes regardless of the outcome). Batch scope so far: plain
+/// and link-writing conditional branches, their annulling Likely
+/// counterparts, and J/JAL. RegJump (JR/JALR) is not produced by
+/// `lookup_branch_or_jump` yet.
+#[derive(Clone, Copy)]
+struct BranchOrJump {
+    cond: BranchCond,
+    link: bool,
+    annul: bool,
+}
+
+/// Look up a branch/jump's shape, or `None` if `raw` isn't one of the kinds
+/// this pass supports yet (RegJump — see `compile_region`'s doc comment for
+/// the full batch plan). Deliberately narrower than `analyzer::classify`'s
+/// `Branch`/`Jump` cases: this only recognizes the specific opcodes each
+/// batch has actually wired an emitter for, so an as-yet-unimplemented
+/// shape correctly falls through to `compile_region`'s `None` rejection
+/// instead of being silently mis-emitted.
+fn lookup_branch_or_jump(raw: u32) -> Option<BranchOrJump> {
+    use crate::mips_isa::*;
+    let op = (raw >> 26) & 0x3F;
+    let rt = (raw >> 16) & 0x1F;
+    match op {
+        OP_BEQ => Some(BranchOrJump { cond: BranchCond::Eq, link: false, annul: false }),
+        OP_BNE => Some(BranchOrJump { cond: BranchCond::Ne, link: false, annul: false }),
+        OP_BLEZ => Some(BranchOrJump { cond: BranchCond::LeZero, link: false, annul: false }),
+        OP_BGTZ => Some(BranchOrJump { cond: BranchCond::GtZero, link: false, annul: false }),
+        OP_BEQL => Some(BranchOrJump { cond: BranchCond::Eq, link: false, annul: true }),
+        OP_BNEL => Some(BranchOrJump { cond: BranchCond::Ne, link: false, annul: true }),
+        OP_BLEZL => Some(BranchOrJump { cond: BranchCond::LeZero, link: false, annul: true }),
+        OP_BGTZL => Some(BranchOrJump { cond: BranchCond::GtZero, link: false, annul: true }),
+        OP_REGIMM => match rt {
+            RT_BLTZ => Some(BranchOrJump { cond: BranchCond::LtZero, link: false, annul: false }),
+            RT_BGEZ => Some(BranchOrJump { cond: BranchCond::GeZero, link: false, annul: false }),
+            RT_BLTZAL => Some(BranchOrJump { cond: BranchCond::LtZero, link: true, annul: false }),
+            RT_BGEZAL => Some(BranchOrJump { cond: BranchCond::GeZero, link: true, annul: false }),
+            RT_BLTZL => Some(BranchOrJump { cond: BranchCond::LtZero, link: false, annul: true }),
+            RT_BGEZL => Some(BranchOrJump { cond: BranchCond::GeZero, link: false, annul: true }),
+            RT_BLTZALL => Some(BranchOrJump { cond: BranchCond::LtZero, link: true, annul: true }),
+            RT_BGEZALL => Some(BranchOrJump { cond: BranchCond::GeZero, link: true, annul: true }),
+            _ => None,
+        },
+        OP_J => Some(BranchOrJump { cond: BranchCond::Always, link: false, annul: false }),
+        OP_JAL => Some(BranchOrJump { cond: BranchCond::Always, link: true, annul: false }),
+        _ => None,
+    }
+}
+
+/// JR/JALR's shape: whether the link register (always r31... no — whatever
+/// `rd` decodes to, per `exec_jalr`) is written. Unlike `BranchOrJump`, a
+/// RegJump's target is a runtime register value (§2.3 "always page-leaving/
+/// region-end") — there is no on-page/off-page distinction to make at
+/// compile time, `taken_exit` is unconditionally `Some(StopReason::RegJump)`
+/// for every visited RegJump (the analyzer's contract), so
+/// `emit_regjump` never consults `block_for_word`/`taken_exit` at all —
+/// every RegJump exits via [`emit_runtime_pc_exit`].
+#[derive(Clone, Copy)]
+struct RegJump {
+    link: bool,
+}
+
+fn lookup_regjump(raw: u32) -> Option<RegJump> {
+    use crate::mips_isa::*;
+    let op = (raw >> 26) & 0x3F;
+    if op != OP_SPECIAL {
+        return None;
+    }
+    match raw & 0x3F {
+        FUNCT_JR => Some(RegJump { link: false }),
+        FUNCT_JALR => Some(RegJump { link: true }),
+        _ => None,
+    }
+}
+
+/// Recompute a branch's on-page target word offset, matching
+/// `analyzer::branch_target`'s math exactly (word + 1 + sign-extended
+/// imm16 — target is relative to the delay slot's own address, one word
+/// past the branch, not two) — the analyzer doesn't persist the resolved
+/// target in `CompiledInstr` (only whether the edge exits, via
+/// `taken_exit`), so codegen re-derives it from the same inputs. Only
+/// meaningful when `taken_exit` is `None` (i.e. the analyzer already
+/// confirmed this target is on-page and was walked) — callers must check
+/// that first.
+fn branch_target_word(raw: u32, word: WordOffset) -> WordOffset {
+    let imm16 = (raw & 0xFFFF) as i16 as i32;
+    (word as i32 + 1 + imm16) as u16
+}
+
+/// Recompute J/JAL's on-page target word offset, matching
+/// `analyzer::jump_target`'s math exactly. Only meaningful when `taken_exit`
+/// is `None` — see `branch_target_word`. No `page_base` parameter: the
+/// result only depends on `word` and `raw`'s target26 bits — the final `&
+/// (PAGE_SIZE-1)` mask discards whatever page_base would have contributed,
+/// so threading a (possibly wrong — see `emit_jump_target_addr`'s doc
+/// comment) page base through here just to have it cancel out would invite
+/// exactly the physical/virtual confusion that function exists to avoid.
+fn jump_target_word(raw: u32, word: WordOffset) -> WordOffset {
+    let target26 = raw & 0x03FF_FFFF;
+    let imm28 = target26 << 2;
+    let pc = (word as u32) * 4;
+    let addr = (pc.wrapping_add(4) & 0xF000_0000) | imm28;
+    ((addr & (PAGE_SIZE - 1)) / 4) as u16
+}
+
+/// Load live `core.pc` and mask to its containing page (`vbase = pc &
+/// !(PAGE_SIZE-1)`) — the one runtime-derived quantity every position-
+/// independent address materialization in this module is built from
+/// (§2.2: the compiled function must work correctly no matter which virtual
+/// alias it's re-entered from, so nothing here may bake in a compile-time
+/// absolute address). Matches `emit_exit_block_body`/`emit_write_link_register`'s
+/// existing derivation exactly — this is that same three-instruction
+/// sequence, pulled out as a shared helper.
+fn emit_vbase(ctx: &mut EmitCtx) -> Value {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+    ctx.builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1))
+}
+
+/// `vbase | (word * 4)` as a runtime `Value` — the in-page address of
+/// `word`, derived from live `core.pc` rather than the compile-time
+/// `page_base` parameter `compile_region` is handed (which is a *physical*
+/// address, `comp.rs`'s `phys_base` — conflating it with the virtual address
+/// this gets stored into `core.pc` was a real bug this session: harmless
+/// for kseg0/kseg1 where physical and virtual-low-32-bits coincide, wrong in
+/// general, and a violation of §2.2's position-independence contract either
+/// way, since it would bake a compile-time constant into what must stay a
+/// runtime-computed value).
+fn emit_word_addr(ctx: &mut EmitCtx, word: WordOffset) -> Value {
+    let vbase = emit_vbase(ctx);
+    ctx.builder.ins().iadd_imm_s(vbase, (word as i64) * 4)
+}
+
+/// J/JAL's real target as a full virtual address (not the in-page-only word
+/// offset `jump_target_word` computes) — used for the `PageLeaving` case,
+/// where the target is off-page and therefore has no meaningful in-page
+/// word offset at all. Mirrors `MipsExecutor::exec_j`'s own math exactly:
+/// `(pc+4) & 0xFFFFFFFF_F0000000 | imm28` — a **64-bit** mask. Using the
+/// 32-bit-only `0xF000_0000` here (as `analyzer::jump_target`'s
+/// physical-address-only classify() correctly does — it's deciding on-page
+/// membership, not building a value for `core.pc`) would zero the upper 32
+/// bits of `pc+4` instead of preserving them, destroying the
+/// `0xFFFFFFFF` prefix every kseg0/kseg1 virtual address needs — the same
+/// sign-extension mistake this session already hit twice, wearing a new
+/// disguise (a 32-bit-shaped mask constant instead of a 32-bit-shaped
+/// page_base value).
+fn emit_jump_target_addr(ctx: &mut EmitCtx, word: WordOffset, raw: u32) -> Value {
+    let this_word_pc = emit_word_addr(ctx, word);
+    let pc_plus_4 = ctx.builder.ins().iadd_imm_s(this_word_pc, 4);
+    let region_base = ctx.builder.ins().band_imm_s(pc_plus_4, 0xFFFFFFFF_F0000000u64 as i64);
+    let target26 = raw & 0x03FF_FFFF;
+    let imm28 = (target26 << 2) as i64;
+    ctx.builder.ins().iadd_imm_s(region_base, imm28)
+}
+
+/// A conditional branch's real taken-arm target as a full virtual address —
+/// the `PageLeaving`/`ForeignPageSlot`-case counterpart to
+/// `branch_target_word`, same rationale as `emit_jump_target_addr`. Matches
+/// `analyzer::branch_target`'s address math (target relative to the delay
+/// slot's own address, i.e. `word + 1`, not `word`). `word + 1` can exceed
+/// `WORDS_PER_PAGE` here (`ForeignPageSlot`, `word == 1023`) — safe because
+/// `emit_word_addr` is `iadd`-based, not `bor`-based, so it carries into the
+/// next page's bits correctly regardless.
+fn emit_branch_target_addr(ctx: &mut EmitCtx, word: WordOffset, raw: u32) -> Value {
+    let imm16 = (raw & 0xFFFF) as i16 as i64;
+    let slot_pc = emit_word_addr(ctx, word + 1);
+    ctx.builder.ins().iadd_imm_s(slot_pc, imm16 * 4)
+}
+
+/// Materialize an absolute (already fully computed, runtime `Value`) target
+/// address directly into `core.pc` and exit — the `PageLeaving` counterpart
+/// to `emit_bail`. Unlike `emit_bail` (which re-enters the interpreter at
+/// some *word in this region* for it to re-dispatch, including re-running a
+/// delay slot that may not have run yet), the branch/jump's delay slot has
+/// *already* executed by the time this is called (§6.1.4 inlines it
+/// unconditionally, before the condition/target logic) — so re-dispatching
+/// from the branch/jump's own PC would run that slot a second time. Writing
+/// the real target directly, like `emit_runtime_pc_exit` does for RegJump,
+/// sidesteps re-dispatching anything: the interpreter's next step starts
+/// fresh at the true destination, matching a from-scratch interpreter run
+/// exactly.
+fn emit_absolute_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, pc_off);
+    emit_set_jit_trigger(ctx);
+    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().return_(&[status]);
+}
+
+/// Exit stub for a branch/jump/regjump at 0xFFC whose delay slot lives on
+/// the next physical page (`analyzer::StopReason::ForeignPageSlot`) — the
+/// codegen-time counterpart to the interpreter's `branch_delay`/
+/// `handle_branch_not_taken`. There is no `instrs[word+1]` to inline (that
+/// index is one past `ENTRIES_PER_PAGE`), so instead of executing the slot
+/// now, this arms `core.in_delay_slot`/`core.delay_slot_target` exactly as
+/// those two interpreter helpers do and advances `core.pc` by one word (into
+/// the slot, which the *next* dispatch — on the next page — will actually
+/// execute). `target_addr` is the branch/jump's real destination (already a
+/// full virtual address, same shape `emit_branch_target_addr`/
+/// `emit_jump_target_addr`/a RegJump's register read produce) — always the
+/// next page's word 0 in address terms (`this_word_addr + 4`), but computed
+/// from the caller's already-resolved value rather than re-deriving it here,
+/// since a RegJump's target isn't expressible as a compile-time offset at
+/// all. The entry side (`exec_decoded`'s `entry_offset == 0` always-probe,
+/// `codegen.rs`'s `word == entry_word` foreign-slot check) is what actually
+/// consumes this state on the next dispatch — this function's only job is to
+/// arm it correctly before handing off. Deliberately does *not* call
+/// `emit_set_jit_trigger` — unlike `emit_absolute_pc_exit`/
+/// `emit_runtime_pc_exit` (which land on a transfer's real, already-executed
+/// destination, matching `handle_exec_complete`'s slot-retirement path),
+/// this lands on the delay slot itself, one word into the *next* page, with
+/// the real transfer still pending — exactly `branch_delay`'s own contract,
+/// which likewise never sets `jit_trigger`. Terminates the current block.
+fn emit_foreign_page_slot_exit(ctx: &mut EmitCtx, word: WordOffset, target_addr: Value) {
+    let mem = MemFlagsData::trusted();
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+
+    ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, target_off);
+    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+    ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    let next_pc = emit_word_addr(ctx, word + 1);
+    ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
+
+    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().return_(&[status]);
+}
+
+/// The annulling-Likely not-taken arm at 0xFFC: the slot never executes at
+/// all (mirrors `handle_branch_likely_skip`'s direct `pc += 8`, no
+/// delay-slot dispatch), so there's nothing to arm — just advance two words
+/// past this instruction (`this_word_addr + 8`, landing on the next page's
+/// word 4) and exit. No `emit_set_jit_trigger` either, matching
+/// `handle_branch_likely_skip` itself, which doesn't set it. Terminates the
+/// current block.
+fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset) {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let next_pc = emit_word_addr(ctx, word + 2);
+    ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
+    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().return_(&[status]);
+}
+
+/// Emit a branch/jump's full unit: the delay slot's semantics inlined
+/// unconditionally first (§6.1.4 — the slot always executes exactly once,
+/// regardless of whether the branch is taken; never a CFG edge, never
+/// independently chained), then the condition test and the taken/
+/// not-taken edges, each resolved to either another head instruction's
+/// block (`block_for_word`) or an exit bail using the analyzer's recorded
+/// `taken_exit`/`fallthrough_exit` reason. Terminates the current block —
+/// call as the last thing emitted for this instruction; `compile_region`'s
+/// pass 2 does not emit anything else for it afterward.
+///
+/// Link-writing (JAL, and eventually BLTZAL/BGEZAL) commits `core.gpr[31] =
+/// (this instruction's own word + 2) * 4 + vbase`-equivalent — mirrors
+/// `exec_jal`'s `self.core.pc + 8` (this instruction's address + 8 bytes,
+/// i.e. two words past it, skipping the delay slot) — computed the same way
+/// the exit block derives an exit PC (`vbase | offset*4`), since the link
+/// value is architecturally a full virtual address, not just a word index.
+fn emit_branch_or_jump(
+    ctx: &mut EmitCtx,
+    exit_block: Block,
+    block_for_word: &std::collections::HashMap<WordOffset, Block>,
+    instrs: &[CompiledInstr; ENTRIES_PER_PAGE],
+    branch: BranchOrJump,
+    fr_mode: FrMode,
+) {
+    let word = ctx.word;
+    let raw = ctx.raw;
+    // The delay slot's raw bytes — always inlined via emit_slot_semantics
+    // below, never dispatched as an independent head by compile_region's
+    // main loop (pass 1 skips any word still `is_slot_only` at that point).
+    // Guaranteed non-Excluded and present by the
+    // analyzer's walk (visit_slot only marks it visited if compilable) and
+    // to have a semantics emitter (compile_region's upfront rejection loop
+    // already checked every visited instruction, slot or not) — true
+    // whether or not this branch ends up annulling it; the analyzer treats
+    // "is this slot compilable" as independent of annul semantics, which is
+    // a codegen-only concern (§4.3).
+    //
+    // Non-annulling branches (plain + link-writing conditional, J/JAL):
+    // the slot always executes exactly once, taken or not (§6.1.4) — emit
+    // it inline, unconditionally, before the condition/target. Annulling
+    // "Likely" branches (§4.3): the slot executes ONLY on the taken path;
+    // the not-taken path skips it entirely (`handle_branch_likely_skip`'s
+    // `pc += 8`, no delay-slot dispatch at all) — its effects must never be
+    // committed, so it can only be emitted inside the taken arm.
+    let slot_word = word + 1;
+    // `ForeignPageSlot` (analyzer's `is_0xffc_branch`, word == 1023): the
+    // slot is on the next page, there's nothing at `instrs[slot_word]` to
+    // inline — `slot_word == WORDS_PER_PAGE` here, one past the array.
+    // `emit_slot`/`emit_branch_taken_edge`/`emit_target_edge` below are all
+    // skipped or redirected accordingly; see the taken/not-taken arms.
+    let foreign_page_slot = slot_word as usize >= ENTRIES_PER_PAGE;
+    let slot_raw = if foreign_page_slot { 0 } else { instrs[slot_word as usize].raw };
+
+    if branch.link {
+        // J/JAL/BLTZAL/BGEZAL (and their Likely counterparts) are all
+        // architecturally hardcoded to r31 — unlike JALR's `rd` field.
+        let this_pc_word = word as i64 + 2; // this instruction's address + 8 bytes = +2 words
+        emit_write_link_register(ctx, this_pc_word, 31);
+    }
+
+    // Recurse into the slot's own emission with ctx.raw/ctx.word switched to
+    // the slot's — restored after each use, mirroring emit_slot_semantics'
+    // own core.pc save/restore around the same call. Never called at all
+    // when `foreign_page_slot` — every call site below checks that first.
+    let emit_slot = |ctx: &mut EmitCtx| -> bool {
+        ctx.raw = slot_raw;
+        ctx.word = slot_word;
+        let terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+        ctx.raw = raw;
+        ctx.word = word;
+        terminated
+    };
+
+    match branch.cond {
+        BranchCond::Always => {
+            // J/JAL are never annulling (Always has no not-taken arm at all).
+            // If the slot is itself a nested branch/regjump, it already
+            // exited with its own final core.pc — this J/JAL's own taken
+            // target never takes effect (nested-delay-slot semantics: the
+            // innermost dispatched transfer wins), so nothing more to emit.
+            // `foreign_page_slot`: no slot to inline at all — the taken edge
+            // (always `ForeignPageSlot` in that case, per
+            // `finish_visit_foreign_page_slot`) arms the pending transfer
+            // instead, exactly like `emit_jump_taken_edge`'s `ForeignPageSlot`
+            // arm.
+            if !foreign_page_slot && emit_slot(ctx) {
+                return;
+            }
+            emit_jump_taken_edge(ctx, exit_block, block_for_word, instrs[word as usize].taken_exit, word, raw);
+        }
+        _ if !branch.annul => {
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+            // Same nested-supersedes-outer rule as the Always case above:
+            // if the slot terminated, this branch's own condition result
+            // (already computed, but never consumed) never matters — the
+            // nested transfer already won. Skipped entirely when
+            // `foreign_page_slot` (no slot to inline).
+            if !foreign_page_slot && emit_slot(ctx) {
+                return;
+            }
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            // Both branch-internal blocks have exactly one predecessor (this
+            // instruction's own block, via the brif above) — sealable as
+            // soon as their own single terminator is emitted, same as a
+            // preamble's fired/continue sub-blocks. Not part of
+            // compile_region's instr_blocks (they're not a head instruction
+            // for any other edge to target), so pass 3 never touches them.
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            emit_branch_taken_edge(ctx, exit_block, block_for_word, instrs[word as usize].taken_exit, word, raw);
+
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            if foreign_page_slot {
+                // Not-taken still executes the slot exactly once (§6.1.4 —
+                // the delay slot always runs, taken or not), but it's on the
+                // next page: arm it with target = this_word_addr + 8,
+                // mirroring `handle_branch_not_taken`'s `branch_delay(pc+8)`
+                // exactly (not landing directly on `core.pc` — that would
+                // skip the slot instead of deferring it, wrong for the
+                // non-annulling case; only the annulling not-taken arm below
+                // does that).
+                let target_addr = emit_word_addr(ctx, word + 2);
+                emit_foreign_page_slot_exit(ctx, word, target_addr);
+            } else {
+                let fallthrough_word = word + 2; // past the slot
+                emit_target_edge(ctx, exit_block, block_for_word, instrs[word as usize].fallthrough_exit, fallthrough_word);
+            }
+        }
+        _ => {
+            // Annulling Likely branch: slot only emitted on the taken arm.
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            // If the slot is a nested branch/regjump, it already exited
+            // (own final core.pc) — this branch's own taken target never
+            // takes effect, same nested-supersedes-outer rule as above.
+            if foreign_page_slot || !emit_slot(ctx) {
+                emit_branch_taken_edge(ctx, exit_block, block_for_word, instrs[word as usize].taken_exit, word, raw);
+            }
+
+            // Not taken: annulled — the slot's effects are never committed,
+            // and its instruction is never "executed" at all, matching
+            // handle_branch_likely_skip's direct pc+=8 (no delay-slot
+            // dispatch, no slot-word landing in between). Exit target is
+            // word+2 (past the slot), same numeric destination as the
+            // non-annulling case's not-taken arm — the difference is
+            // entirely about whether the slot's semantics were committed on
+            // the way there, not about where execution resumes. Independent
+            // of the taken arm's own block, so always safe to emit
+            // regardless of whether emit_slot_semantics terminated it.
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            if foreign_page_slot {
+                // Nothing to arm — the annulled slot never executes, so
+                // there's no pending transfer to defer onto the next page's
+                // dispatch, matching handle_branch_likely_skip exactly
+                // (direct pc+=8, no in_delay_slot involvement at all).
+                emit_foreign_page_annulled_not_taken_exit(ctx, word);
+            } else {
+                let fallthrough_word = word + 2;
+                emit_target_edge(ctx, exit_block, block_for_word, instrs[word as usize].fallthrough_exit, fallthrough_word);
+            }
+        }
+    }
+}
+
+/// J/JAL's taken edge: on-page continues via `emit_target_edge` as usual;
+/// `PageLeaving` needs `emit_jump_target_addr`'s runtime-computed address
+/// instead of `emit_target_edge`'s word-offset bail (see `emit_target_edge`'s
+/// doc comment on why that case can't be handled generically there).
+fn emit_jump_taken_edge(
+    ctx: &mut EmitCtx,
+    exit_block: Block,
+    block_for_word: &std::collections::HashMap<WordOffset, Block>,
+    taken_exit: Option<crate::jitv2::analyzer::StopReason>,
+    word: WordOffset,
+    raw: u32,
+) {
+    if taken_exit == Some(crate::jitv2::analyzer::StopReason::PageLeaving) {
+        let target_addr = emit_jump_target_addr(ctx, word, raw);
+        emit_absolute_pc_exit(ctx, target_addr);
+    } else if taken_exit == Some(crate::jitv2::analyzer::StopReason::ForeignPageSlot) {
+        let target_addr = emit_jump_target_addr(ctx, word, raw);
+        emit_foreign_page_slot_exit(ctx, word, target_addr);
+    } else {
+        let target_word = jump_target_word(raw, word);
+        emit_target_edge(ctx, exit_block, block_for_word, taken_exit, target_word);
+    }
+}
+
+/// A conditional branch's taken edge — same shape as `emit_jump_taken_edge`,
+/// using `emit_branch_target_addr` for the `PageLeaving`/`ForeignPageSlot`
+/// cases.
+fn emit_branch_taken_edge(
+    ctx: &mut EmitCtx,
+    exit_block: Block,
+    block_for_word: &std::collections::HashMap<WordOffset, Block>,
+    taken_exit: Option<crate::jitv2::analyzer::StopReason>,
+    word: WordOffset,
+    raw: u32,
+) {
+    if taken_exit == Some(crate::jitv2::analyzer::StopReason::PageLeaving) {
+        let target_addr = emit_branch_target_addr(ctx, word, raw);
+        emit_absolute_pc_exit(ctx, target_addr);
+    } else if taken_exit == Some(crate::jitv2::analyzer::StopReason::ForeignPageSlot) {
+        let target_addr = emit_branch_target_addr(ctx, word, raw);
+        emit_foreign_page_slot_exit(ctx, word, target_addr);
+    } else {
+        emit_target_edge(ctx, exit_block, block_for_word, taken_exit, branch_target_word(raw, word));
+    }
+}
+
+/// Resolve one outgoing edge to either the target word's head block (if
+/// `exit_reason` is `None`, meaning the analyzer confirmed this edge
+/// continues into compiled code) or a bail to the shared exit block (if
+/// `Some`, using the analyzer's recorded reason). Terminates the current
+/// block.
+///
+/// `target_word` is the branch/jump's *computed* on-page target — valid to
+/// bail to directly for every exit reason except `PageLeaving`: the
+/// analyzer's `classify` only classifies a branch/jump as page-leaving when
+/// the target address genuinely isn't on this page, so `branch_target_word`/
+/// `jump_target_word`'s page-relative masking produces a meaningless (wrong
+/// page) word offset in that one case.
+///
+/// `PageLeaving` additionally can't reuse a plain word-offset bail
+/// (`emit_bail`) at all, even with the *right* word: by the time this is
+/// called, the branch/jump's mandatory delay slot has already executed
+/// inline (§6.1.4 — unconditional, taken or not, emitted before this edge).
+/// A bail re-enters the interpreter at some word *in this region* for it to
+/// re-dispatch — which for the branch/jump's own word would re-run that
+/// already-committed slot a second time. Instead, `target_addr` (the real,
+/// fully-computed absolute target — `jump_target_addr`/`branch_target_addr`)
+/// is written directly into `core.pc` via `emit_absolute_pc_exit`, the same
+/// technique `emit_runtime_pc_exit` uses for RegJump's register-derived
+/// target: no re-dispatch of anything, the interpreter's next step starts
+/// fresh at the true destination. (Observed live before this fix: a JIT'd
+/// off-page J landing thousands of words away from its real target on an
+/// IRIX 5.3 boot trace, from bailing to the page-masked word offset; fixing
+/// that alone would have reintroduced a silent double-execution of the delay
+/// slot, which is why this uses a direct absolute-address exit instead of
+/// just correcting the bail's target word.)
+fn emit_target_edge(
+    ctx: &mut EmitCtx,
+    exit_block: Block,
+    block_for_word: &std::collections::HashMap<WordOffset, Block>,
+    exit_reason: Option<crate::jitv2::analyzer::StopReason>,
+    target_word: WordOffset,
+) {
+    match exit_reason {
+        Some(crate::jitv2::analyzer::StopReason::PageLeaving) => unreachable!(
+            "PageLeaving must be handled by the caller via emit_target_edge_page_leaving \
+             (needs a runtime-computed target address, which only the caller — knowing \
+             whether this is a J/JAL or a conditional branch — can compute correctly)"
+        ),
+        Some(_) => emit_bail(ctx, exit_block, target_word),
+        None => {
+            let target_block = *block_for_word.get(&target_word)
+                .expect("exit_reason is None -> analyzer guarantees target_word continues into the region");
+            ctx.builder.ins().jump(target_block, &[]);
+        }
+    }
+}
+
+/// Emit a delay slot's semantics inline (§6.1.4) — same dispatch as a plain
+/// `Sequential` instruction (`lookup_semantics`) for the common case, but
+/// without any of the caller-side fallthrough/exit wiring `compile_region`'s
+/// main loop does for head instructions, since a slot is never itself a
+/// region-exit point *when it's Sequential* — control always continues on to
+/// the branch's own condition/target logic immediately after. `module` is
+/// threaded through unchanged — a slot can be any `Sequential`-classified
+/// instruction, including a load/store, which needs the real module for its
+/// `call_indirect` (`emit_mem_read`/`emit_mem_write`).
+///
+/// **Nested delay slot** (the slot's own raw bits are themselves a
+/// branch/jump/regjump — "unusual but legal" on real hardware, already
+/// supported by the interpreter's nested `branch_delay`, and walked
+/// recursively by `analyzer::visit_slot`): recurses into
+/// `emit_nested_branch_slot`, which *is* a region-exit point (every one of
+/// its own edges — taken, not-taken, or a further-nested slot's eventual
+/// edges — always exits this compiled unit directly, since the minimal
+/// region here never contains any other word's block to jump into). See
+/// that function's doc comment for the full recursive shape. `instrs` is
+/// only needed for this nested case (to fetch the next slot's raw bytes);
+/// threaded through unconditionally for a uniform signature.
+///
+/// Brackets the slot's semantics with `core.in_delay_slot = true` / `= false`
+/// — the same field the interpreter's `branch_delay`/`handle_exec_complete`
+/// set on the plain dispatch path, no separate JIT-only copy — and writes
+/// `core.pc = slot_addr` before running them: if the slot itself raises an
+/// exception (a store fault, integer overflow, an FCSR-enabled trap),
+/// `emit_exception_exit`'s `handle_exception_fn` call (`deliver_exception`,
+/// shared with the interpreter — §4.2 single-implementation delivery)
+/// computes EPC as `core.pc - 4` when `in_delay_slot` is set, mirroring the
+/// interpreter's own model where `core.pc` already points at the slot's own
+/// address by the time it's dispatched (the branch already advanced past
+/// itself via `branch_delay`). The JIT has no equivalent per-instruction PC
+/// advance — without writing `core.pc` here first, `deliver_exception`'s
+/// formula would subtract 4 from the *branch's* address instead, landing EPC
+/// one word too early. Setting `in_delay_slot` without also correcting
+/// `core.pc` doesn't fully fix this by itself — both are needed together.
+///
+/// Neither write threads an `in_delay_slot`/`slot_addr` parameter through
+/// `lookup_semantics`/`lookup_cp1_semantics`'s ~60 emitters — a plain head
+/// instruction never calls this function, so its own `core.pc` write (via
+/// the shared exit block / absolute-address exits) is unaffected; only a
+/// slot's *own* possible exception exit ever observes this early write.
+///
+/// `in_delay_slot`/`core.pc` are reset/restored after the slot completes
+/// without trapping and without exiting the function — only the Sequential
+/// base case can reach that point; every nested-branch path (taken,
+/// not-taken, or a still-deeper nested slot's eventual edges) is a
+/// terminator and returns before ever reaching the restore, since those
+/// paths write their own final `core.pc` and that must not be clobbered by
+/// this function's own restore-and-continue tail.
+///
+/// Returns `true` if this call **terminated the current Cranelift block**
+/// (the nested branch/regjump cases — every arm of those exits via
+/// `emit_absolute_pc_exit`/`emit_runtime_pc_exit`, both terminators) or
+/// `false` if control falls through normally (the Sequential base case).
+/// Callers **must** check this and stop emitting further IR into the
+/// current block when `true` — Cranelift's verifier rejects any instruction
+/// after a block's terminator (`"a terminator instruction was encountered
+/// before the end of block"`), which a caller unconditionally continuing to
+/// emit its own condition-test/exit-wiring after this call would trigger
+/// whenever the slot itself branches, since nothing in this module used to
+/// need a slot to ever end the block early.
+fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], fr_mode: FrMode) -> bool {
+    let slot_raw = ctx.raw;
+    let slot_word = ctx.word;
+    // From here until this function returns, ctx.word/raw are the slot's
+    // own — so any emit_exception_exit reached from within the slot's own
+    // semantics emitter (called below) must report Cause.BD = true. Never
+    // restored back to false afterward: ctx is not reused for anything else
+    // once this returns (the pass-2 loop constructs a fresh ctx per head).
+    ctx.bd = true;
+    let mem = MemFlagsData::trusted();
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+    ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    // Save the region's real entry pc before overwriting it — every later
+    // exit in this same compiled unit (emit_exit_block_body's `vbase = pc &
+    // !(PAGE_SIZE-1)`, emit_bail's retry word, an outer branch/jump's own
+    // link-register write) needs core.pc to still reflect the entry
+    // instruction's real page once the slot completes normally, not
+    // whatever the slot's own address was. Restored below on the
+    // slot-completed-without-trapping path only — if the slot itself raises
+    // an exception, control never returns here (emit_exception_exit is a
+    // block terminator), so there's nothing to restore on that path: the
+    // slot's `core.pc` write is exactly what deliver_exception needs to see
+    // in that case. The slot's address itself is derived from this same
+    // live pc load (emit_word_addr's vbase, §2.2 position independence) —
+    // never from compile-time page_base, which is a physical address in
+    // production (`comp.rs`'s `phys_base`) and would be wrong to bake into
+    // a value written into core.pc (a virtual address).
+    let saved_pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+    let slot_addr_val = emit_word_addr(ctx, slot_word);
+    ctx.builder.ins().store(mem, slot_addr_val, ctx.core_ptr, pc_off);
+    // The delay slot always executes exactly once here (§6.1.4 — never
+    // conditional, never skippable), so this is unconditional too, unlike
+    // the head-instruction loop's post-preamble placement — a slot has no
+    // IP7/interrupt preamble of its own to bail out of first. Covers the
+    // nested-branch-in-delay-slot case too (this call's own slot instruction
+    // still retires before `emit_nested_branch_slot` recurses into whatever
+    // *that* slot's own delay slot is, which gets its own separate
+    // `emit_slot_semantics` call and its own increment).
+    emit_increment_cycles(ctx);
+
+    if let Some(branch) = lookup_branch_or_jump(slot_raw) {
+        emit_nested_branch_slot(ctx, instrs, slot_word, slot_raw, branch, fr_mode);
+        return true; // every arm is a terminator; the restore below is unreachable from here
+    }
+    if let Some(regjump) = lookup_regjump(slot_raw) {
+        emit_nested_regjump_slot(ctx, instrs, slot_word, slot_raw, regjump, fr_mode);
+        return true; // emit_runtime_pc_exit is a terminator
+    }
+
+    if let Some(emit) = lookup_semantics(slot_raw) {
+        emit(ctx);
+    } else {
+        let emit = lookup_cp1_semantics(slot_raw)
+            .expect("slot instruction must have a semantics emitter (checked in compile_region)");
+        emit(ctx, fr_mode);
+    }
+
+    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+    ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+    ctx.builder.ins().store(mem, saved_pc, ctx.core_ptr, pc_off);
+    false
+}
+
+/// A nested delay slot whose own raw bits are a branch/jump (`emit_cond`'s
+/// `raw`/`slot_word` here refer to *this* nested instruction, one level
+/// deeper than whatever called `emit_slot_semantics`). Every edge exits the
+/// compiled unit directly — there is no "continue into compiled code" case
+/// at any nesting level below the outermost head instruction, since the
+/// minimal region this JIT compiles (`comp.rs`'s `MAX_INSTRS_PER_COMPILE`)
+/// only ever contains the head plus its slot-chain, never another word's
+/// block to jump into. This mirrors the outermost branch's own
+/// `PageLeaving` handling (`emit_absolute_pc_exit`) rather than
+/// `emit_branch_or_jump`'s in-region `block_for_word` wiring.
+///
+/// `core.pc` must already equal this nested instruction's own address
+/// (`emit_slot_semantics` wrote it before calling in) — `emit_cond`,
+/// `emit_write_link_register`, and the target-address helpers all read it
+/// live, matching every other position-independent address computation in
+/// this module (§2.2).
+fn emit_nested_branch_slot(
+    ctx: &mut EmitCtx,
+    instrs: &[CompiledInstr; ENTRIES_PER_PAGE],
+    word: WordOffset,
+    raw: u32,
+    branch: BranchOrJump,
+    fr_mode: FrMode,
+) {
+    let inner_slot_word = word + 1;
+    let inner_slot_raw = instrs[inner_slot_word as usize].raw;
+
+    if branch.link {
+        let this_pc_word = word as i64 + 2;
+        emit_write_link_register(ctx, this_pc_word, 31);
+    }
+
+    // Recurse into the inner slot's own emission with ctx.raw/ctx.word
+    // switched to its — restored after, same pattern as emit_branch_or_jump's
+    // own emit_slot closure.
+    let emit_inner_slot = |ctx: &mut EmitCtx| -> bool {
+        ctx.raw = inner_slot_raw;
+        ctx.word = inner_slot_word;
+        let terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+        ctx.raw = raw;
+        ctx.word = word;
+        terminated
+    };
+
+    match branch.cond {
+        BranchCond::Always => {
+            // A still-deeper nested branch/regjump in this slot already
+            // exited with its own final core.pc — same nested-supersedes-
+            // outer rule as emit_branch_or_jump's Always arm.
+            if emit_inner_slot(ctx) {
+                return;
+            }
+            let target_addr = emit_jump_target_addr(ctx, word, raw);
+            emit_absolute_pc_exit(ctx, target_addr);
+        }
+        _ if !branch.annul => {
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+            if emit_inner_slot(ctx) {
+                return;
+            }
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            let target_addr = emit_branch_target_addr(ctx, word, raw);
+            emit_absolute_pc_exit(ctx, target_addr);
+
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            let fallthrough_addr = emit_word_addr(ctx, word + 2);
+            emit_absolute_pc_exit(ctx, fallthrough_addr);
+        }
+        _ => {
+            // Annulling Likely: nested slot only on the taken arm, matching
+            // the outermost branch's own annul handling exactly.
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            if !emit_inner_slot(ctx) {
+                let target_addr = emit_branch_target_addr(ctx, word, raw);
+                emit_absolute_pc_exit(ctx, target_addr);
+            }
+
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            let fallthrough_addr = emit_word_addr(ctx, word + 2);
+            emit_absolute_pc_exit(ctx, fallthrough_addr);
+        }
+    }
+}
+
+/// A nested delay slot whose own raw bits are JR/JALR — always exits via the
+/// register-derived target, exactly like the outermost `emit_regjump`, just
+/// without that function's own `taken_exit`/edge bookkeeping (never
+/// meaningful here — see `emit_nested_branch_slot`'s doc comment).
+fn emit_nested_regjump_slot(
+    ctx: &mut EmitCtx,
+    instrs: &[CompiledInstr; ENTRIES_PER_PAGE],
+    word: WordOffset,
+    raw: u32,
+    regjump: RegJump,
+    fr_mode: FrMode,
+) {
+    let target_addr = emit_read_gpr(ctx, field_rs(raw));
+
+    if regjump.link {
+        let this_pc_word = word as i64 + 2;
+        emit_write_link_register(ctx, this_pc_word, field_rd(raw));
+    }
+
+    let inner_slot_word = word + 1;
+    let inner_slot_raw = instrs[inner_slot_word as usize].raw;
+    ctx.raw = inner_slot_raw;
+    ctx.word = inner_slot_word;
+    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+    ctx.raw = raw;
+    ctx.word = word;
+    if slot_terminated {
+        // A still-deeper nested branch/regjump already exited — this
+        // RegJump's own register-derived target (read before the slot ran)
+        // never takes effect, same nested-supersedes-outer rule as
+        // emit_regjump's own top-level version.
+        return;
+    }
+
+    emit_runtime_pc_exit(ctx, target_addr);
+}
+
+/// Evaluate a conditional branch's predicate as an I8 boolean Cranelift
+/// value (nonzero = taken), mirroring the interpreter's `exec_be*`/`exec_bl*`
+/// comparisons exactly (all against a signed 64-bit `rs`, except Eq/Ne which
+/// compare `rs`/`rt` directly with no sign interpretation needed since
+/// equality doesn't care).
+fn emit_cond(ctx: &mut EmitCtx, raw: u32, cond: BranchCond) -> Value {
+    let rs_val = emit_read_gpr(ctx, field_rs(raw));
+    match cond {
+        BranchCond::Always => unreachable!("Always has no condition to evaluate"),
+        BranchCond::Eq => {
+            let rt_val = emit_read_gpr(ctx, field_rt(raw));
+            ctx.builder.ins().icmp(IntCC::Equal, rs_val, rt_val)
+        }
+        BranchCond::Ne => {
+            let rt_val = emit_read_gpr(ctx, field_rt(raw));
+            ctx.builder.ins().icmp(IntCC::NotEqual, rs_val, rt_val)
+        }
+        BranchCond::LeZero => {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            ctx.builder.ins().icmp(IntCC::SignedLessThanOrEqual, rs_val, zero)
+        }
+        BranchCond::GtZero => {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            ctx.builder.ins().icmp(IntCC::SignedGreaterThan, rs_val, zero)
+        }
+        BranchCond::LtZero => {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            ctx.builder.ins().icmp(IntCC::SignedLessThan, rs_val, zero)
+        }
+        BranchCond::GeZero => {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            ctx.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, rs_val, zero)
+        }
+    }
+}
+
+/// Write the link register (r31) for JAL/JALR-shaped instructions: `core.pc
+/// = vbase + (link_word * 4)`, matching `exec_jal`'s `self.core.pc + 8`
+/// (this instruction's own address plus two words, skipping the delay slot
+/// — the return address is the instruction *after* the delay slot). `vbase`
+/// is derived from the live `core.pc & !0xFFF`. Must be an add, not an or:
+/// unlike every other `vbase | word*4` site in this file, `link_word` here
+/// is `entry_word + 2` and can legitimately reach exactly `ENTRIES_PER_PAGE`
+/// (0x400) when the branch/jump sits at the page's second-to-last word — the
+/// return address then falls on the *next* page. OR silently drops that
+/// carry whenever `vbase`'s own bit 12 happens to already be set (observed
+/// live: a JAL at word 0x3fe on page ...173000 linked to ...173000 instead
+/// of the correct ...174000 — bit 12 of 0x173000 is already 1, so ORing in
+/// 0x1000 changed nothing). `vbase` and the link word are still guaranteed
+/// within 32 bits of each other (one page apart at most), so a plain add
+/// can't spuriously touch the kseg0/kseg1 `0xFFFFFFFF` upper-32 prefix.
+fn emit_write_link_register(ctx: &mut EmitCtx, link_word: i64, link_reg: u32) {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+    let vbase = ctx.builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
+    let link_addr = ctx.builder.ins().iadd_imm_s(vbase, link_word * 4);
+    emit_write_gpr(ctx, link_reg, link_addr);
+}
+
+/// Emit one instruction's semantics (§3.1's "unit semantics... committed as
+/// one"). Called with `builder` positioned in the instruction's own block
+/// (preambles already emitted); must leave `builder` positioned to continue
+/// — either still in the same block (falls through to whatever the caller
+/// wires next) or already terminated (a branch/jump/regjump emitted its own
+/// terminator and jumped/branched away). Returns nothing: control-flow
+/// wiring between instructions is the caller's job (`compile_region`), not
+/// this function's — this only commits the one unit's data effects, exactly
+/// like an interpreter `exec_*` handler's body minus the `ExecStatus` return
+/// and PC advance (both handled uniformly by the caller for every
+/// instruction shape, not per-emitter).
+/// Takes `&mut EmitCtx` — `ctx.raw`/`ctx.word` are this instruction's own
+/// encoding and compile-time word offset within the page. Most emitters
+/// only touch `ctx.raw`; `emit_load`/`emit_store` (via `emit_exception_exit`)
+/// also use `ctx.word`, to synthesize the correct exception PC on a fault
+/// instead of leaving `core.pc` stale (see `emit_exception_exit`'s doc
+/// comment).
+type SemanticsEmitter = fn(&mut EmitCtx);
+
+// ---- CP1 (FPU) ------
+//
+// Distinct emitter type from `SemanticsEmitter`: every CP1 register access
+// needs `fr_mode` (STATUS_FR is resolved once per region at compile time —
+// see `FrMode`'s doc comment), which plain integer ops never touch. CP1
+// field reuse mirrors the interpreter's `DecodedInstr` layout exactly (see
+// mips_exec.rs's decode): fs = rd-position bits[15:11], ft = rt-position
+// bits[20:16], fd = sa-position bits[10:6], fr = rs-position bits[25:21] —
+// the same `field_rd`/`field_rt`/`field_sa`/`field_rs` helpers already used
+// for integer decode, just relabeled at each call site via local `let`
+// bindings for readability.
+type Cp1Emitter = fn(&mut EmitCtx, fr_mode: FrMode);
+
+/// Binary FP arithmetic op shape shared by ADD/SUB/MUL/DIV, S or D format:
+/// read fs/ft, apply `op`, write fd, then `emit_fpu_update_fcsr`. Mirrors
+/// `exec_fadd_s`/`exec_fsub_d`/etc.'s common structure exactly — CU1 is
+/// already handled by the region-wide entry guard, not repeated per
+/// instruction.
+fn emit_fbinop_s(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) {
+    let raw = ctx.raw;
+    let fs = field_rd(raw);
+    let ft = field_rt(raw);
+    let fd = field_sa(raw);
+
+    emit_fpu_clear_status(ctx);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
+    let result = op(ctx.builder, fs_val, ft_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+fn emit_fbinop_d(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) {
+    let raw = ctx.raw;
+    let fs = field_rd(raw);
+    let ft = field_rt(raw);
+    let fd = field_sa(raw);
+
+    emit_fpu_clear_status(ctx);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
+    let result = op(ctx.builder, fs_val, ft_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+
+fn fop_add(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fadd(a, b) }
+fn fop_sub(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fsub(a, b) }
+fn fop_mul(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fmul(a, b) }
+fn fop_div(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fdiv(a, b) }
+
+fn emit_fadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_add); }
+fn emit_fadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_add); }
+fn emit_fsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_sub); }
+fn emit_fsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_sub); }
+fn emit_fmul_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_mul); }
+fn emit_fmul_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_mul); }
+fn emit_fdiv_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_div); }
+fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_div); }
+
+/// SQRT.S/D fd, fs: fd = sqrt(fs). Unlike the binary ops, only one operand
+/// (`fs`; `ft`/`d.rt` is unused/ignored, matching the interpreter). Still
+/// goes through `emit_fpu_update_fcsr` (sqrt of a negative raises Invalid).
+fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().sqrt(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().sqrt(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+
+/// ABS.S/D, NEG.S/D, MOV.S/D fd, fs: unlike ADD/SUB/MUL/DIV/SQRT, these
+/// never touch FCSR — mirrors `exec_fabs_s`/`exec_fneg_s`/`exec_fmov_s`
+/// (and their `_d` counterparts) exactly: no `clear_fpu_status` call, no
+/// `fpu_update_fcsr` tail call, just the raw bit/value operation and a
+/// plain write. MOV additionally moves the full 64-bit register value via
+/// `fpr_read_l`/`fpr_write_l` even in S format (matches
+/// `exec_fmov_s`'s use of the `_l` accessors, not `_w`) — a straight
+/// register-to-register copy needs no width truncation either way.
+fn emit_fabs_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fabs(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+}
+fn emit_fabs_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fabs(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+}
+fn emit_fneg_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fneg(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+}
+fn emit_fneg_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fneg(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+}
+fn emit_fmov_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let value = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_write_fpr_l(ctx, fd, value, fr_mode);
+}
+fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    emit_fmov_s(ctx, fr_mode);
+}
+
+// ---- CP1 conversions ------
+//
+// Two families, both funneled through emit_fpu_clear_status/emit_fpu_update_fcsr
+// (all conversions touch FCSR, unlike ABS/NEG/MOV):
+//   float<->float (CVT.D.S, CVT.S.D): plain widen/narrow, no rounding choice.
+//   int<->float (CVT.S/D.W/L, CVT.W/L.S/D, ROUND/TRUNC/CEIL/FLOOR.W/L.S/D):
+//     int->float is a plain signed conversion; float->int applies a
+//     rounding function first, matching the interpreter's fixed-function
+//     choice (`.round()`/`.trunc()`/`.ceil()`/`.floor()` — CVT.W/L itself
+//     always uses `.round()`, i.e. the same operation as the ROUND
+//     variant; MIPS's dynamic-FCSR-rounding-mode CVT semantics are NOT
+//     replicated by this interpreter either, so nothing to diverge from).
+
+/// MIPS FCSR.RM encoding — mirrors `mips_exec.rs`'s `RM_*` constants exactly
+/// (kept as a separate copy rather than shared across the crate boundary
+/// since this file only needs the raw `u8` values as IR immediates).
+const RM_NEAREST_EVEN: i64 = 0;
+const RM_TOWARD_ZERO: i64 = 1;
+const RM_TOWARD_POS_INF: i64 = 2;
+const RM_TOWARD_NEG_INF: i64 = 3;
+
+/// Round `x` (an F32 or F64 SSA value) to the nearest integer *value* (still
+/// a float, not yet cast to an integer type) per `rm` (an I8 SSA value
+/// carrying the MIPS FCSR.RM encoding above) — pure bit manipulation on the
+/// mantissa/exponent, no `ceil`/`floor`/`trunc`/`nearest` IR op anywhere,
+/// so it can't lower to a hardware rounding instruction whose result
+/// secretly depends on ambient host FPU control-register state.
+///
+/// This mirrors `mips_exec.rs`'s `round_f32_to_int_mode`/
+/// `round_f64_to_int_mode` bit-for-bit (see that function's doc comment for
+/// why: `f32`/`f64::round()`/`.trunc()`/`.ceil()`/`.floor()` — and by
+/// extension Cranelift's `nearest`/`trunc`/`ceil`/`floor` IR ops, which
+/// lower to the same SSE `ROUNDSS`/`ROUNDSD` family — were empirically
+/// found to produce a different, wrong answer depending on the host's live
+/// MXCSR rounding-control bits on this build, even for MIPS operations that
+/// are supposed to always round the same way regardless of FCSR.RM). Kept
+/// branchless (`select` instead of control flow) since this runs inside a
+/// single Cranelift basic block alongside the rest of the CP1 handler body.
+///
+/// `rm` is always in `0..=3` at every call site (either an `iconst` for the
+/// four fixed ROUND/TRUNC/CEIL/FLOOR modes, or FCSR's live low 2 bits for
+/// the two dynamic-RM plain CVT.W/CVT.L instructions), so the branch
+/// dispatch only needs 2-bit comparisons, not a full 0..=255 range check.
+fn emit_round_to_int_mode(builder: &mut FunctionBuilder, x: Value, rm: Value) -> Value {
+    let float_ty = builder.func.dfg.value_type(x);
+    let (int_ty, mantissa_bits, exp_bias): (ir::Type, i64, i64) = if float_ty == ir::types::F32 {
+        (ir::types::I32, 23, 127)
+    } else {
+        (ir::types::I64, 52, 1023)
+    };
+
+    let bits = builder.ins().bitcast(int_ty, MemFlagsData::new(), x);
+    let sign_shift = if int_ty == ir::types::I32 { 31 } else { 63 };
+    let sign_bit = builder.ins().ushr_imm_s(bits, sign_shift);
+    let is_negative = builder.ins().icmp_imm_s(IntCC::NotEqual, sign_bit, 0);
+
+    let exp_mask: i64 = if int_ty == ir::types::I32 { 0xFF } else { 0x7FF };
+    let biased_exp = builder.ins().ushr_imm_s(bits, mantissa_bits);
+    let biased_exp = builder.ins().band_imm_s(biased_exp, exp_mask);
+    let exp = builder.ins().iadd_imm_s(biased_exp, -exp_bias);
+
+    let rm_tz = builder.ins().iconst(ir::types::I8, RM_TOWARD_ZERO);
+    let rm_pi = builder.ins().iconst(ir::types::I8, RM_TOWARD_POS_INF);
+    let rm_ni = builder.ins().iconst(ir::types::I8, RM_TOWARD_NEG_INF);
+    let is_rm_tz = builder.ins().icmp(IntCC::Equal, rm, rm_tz);
+    let is_rm_pi = builder.ins().icmp(IntCC::Equal, rm, rm_pi);
+    let is_rm_ni = builder.ins().icmp(IntCC::Equal, rm, rm_ni);
+    // Rounds away from zero for this sign under this mode; RM_NEAREST_EVEN
+    // is handled by its own tie-break logic per regime below, not here.
+    let away_from_zero_for_dir = {
+        let is_positive = builder.ins().icmp_imm_s(IntCC::Equal, is_negative, 0);
+        let pos_away = builder.ins().band(is_rm_pi, is_positive);
+        let neg_away = builder.ins().band(is_rm_ni, is_negative);
+        builder.ins().bor(pos_away, neg_away)
+    };
+
+    // ---- Regime 1: exp >= mantissa_bits — already integer-valued (or the
+    // magnitude is large enough that every mantissa bit is an integer bit),
+    // nothing to round.
+    let no_frac_bits = builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, exp, mantissa_bits);
+
+    // ---- Regime 2: exp < 0 — |x| < 1.0, result is 0 or +-1.
+    let is_exp_negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, exp, 0);
+    let mantissa_field_mask: i64 = (1i64 << mantissa_bits) - 1;
+    let mantissa_field = builder.ins().band_imm_s(bits, mantissa_field_mask);
+    let mantissa_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, mantissa_field, 0);
+    let biased_exp_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, biased_exp, 0);
+    let is_zero_mantissa_and_exp = builder.ins().band(mantissa_is_zero, biased_exp_is_zero); // x == +-0.0
+    let is_exp_minus_one = builder.ins().icmp_imm_s(IntCC::Equal, exp, -1); // |x| in [0.5, 1.0)
+    let is_lt_half = builder.ins().icmp_imm_s(IntCC::Equal, is_exp_minus_one, 0); // exp < -1 (or the zero case above)
+    // |x| < 0.5 (and not exactly zero): rounds to 0 for TZ/Nearest; for
+    // PI/NI, rounds away from zero to +-1 per `away_from_zero_for_dir`.
+    let one_f = if float_ty == ir::types::F32 { builder.ins().f32const(1.0) } else { builder.ins().f64const(1.0) };
+    let signed_one = builder.ins().fcopysign(one_f, x);
+    let zero_f = if float_ty == ir::types::F32 { builder.ins().f32const(0.0) } else { builder.ins().f64const(0.0) };
+    let signed_zero = builder.ins().fcopysign(zero_f, x);
+    let lt_half_nonzero_result = builder.ins().select(away_from_zero_for_dir, signed_one, signed_zero);
+    let lt_half_result = builder.ins().select(is_zero_mantissa_and_exp, x, lt_half_nonzero_result);
+    // |x| in [0.5, 1.0) exactly: nearest-even ties round to 0 (the even
+    // integer); TZ always 0; PI/NI still governed by `away_from_zero_for_dir`.
+    let mantissa_all_zero_at_half = mantissa_is_zero; // reused: |x|==0.5 exactly iff mantissa field is all-zero
+    let nearest_rounds_away_at_half = builder.ins().icmp_imm_s(IntCC::Equal, mantissa_all_zero_at_half, 0); // non-exact-half nearest-mode values in [0.5,1) always round away (up to 1)
+    let is_rm_nearest = {
+        let rm_ne = builder.ins().iconst(ir::types::I8, RM_NEAREST_EVEN);
+        builder.ins().icmp(IntCC::Equal, rm, rm_ne)
+    };
+    let half_regime_away = builder.ins().select(is_rm_nearest, nearest_rounds_away_at_half, away_from_zero_for_dir);
+    let half_regime_result = builder.ins().select(half_regime_away, signed_one, signed_zero);
+    let exp_negative_result = builder.ins().select(is_lt_half, lt_half_result, half_regime_result);
+
+    // ---- Regime 3 (the common case): 0 <= exp < mantissa_bits — split the
+    // mantissa into an integer part and a fractional remainder at bit
+    // position (mantissa_bits - exp).
+    let mantissa_bits_val = builder.ins().iconst(int_ty, mantissa_bits);
+    let frac_bits = builder.ins().isub(mantissa_bits_val, exp); // mantissa_bits - exp, as int_ty
+    let one_i = builder.ins().iconst(int_ty, 1);
+    let one_shl_frac = builder.ins().ishl(one_i, frac_bits);
+    let frac_mask = builder.ins().iadd_imm_s(one_shl_frac, -1);
+    let implicit_leading_bit = builder.ins().ishl_imm_s(one_i, mantissa_bits);
+    let mantissa_mask = builder.ins().iadd_imm_s(implicit_leading_bit, -1);
+    let full_mantissa = builder.ins().band(bits, mantissa_mask);
+    let full_mantissa = builder.ins().bor(full_mantissa, implicit_leading_bit);
+    let frac = builder.ins().band(full_mantissa, frac_mask);
+    let frac_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, frac, 0);
+
+    let not_frac_mask = builder.ins().bnot(frac_mask);
+    let truncated_bits = builder.ins().band(bits, not_frac_mask);
+
+    let half = builder.ins().ushr_imm_s(one_shl_frac, 1);
+    let frac_gt_half = builder.ins().icmp(IntCC::UnsignedGreaterThan, frac, half);
+    let frac_eq_half = builder.ins().icmp(IntCC::Equal, frac, half);
+    let truncated_lsb = builder.ins().ushr(full_mantissa, frac_bits);
+    let truncated_is_odd = builder.ins().band_imm_s(truncated_lsb, 1);
+    let truncated_is_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, truncated_is_odd, 0);
+    let tie_rounds_up = builder.ins().band(frac_eq_half, truncated_is_odd);
+    let nearest_rounds_up = builder.ins().bor(frac_gt_half, tie_rounds_up);
+
+    let round_up_normal = builder.ins().select(is_rm_nearest, nearest_rounds_up, away_from_zero_for_dir);
+    let not_rm_tz = builder.ins().icmp_imm_s(IntCC::Equal, is_rm_tz, 0);
+    let round_up_normal = builder.ins().band(round_up_normal, not_rm_tz);
+
+    let incremented_bits = builder.ins().iadd(truncated_bits, one_shl_frac);
+    let rounded_bits = builder.ins().select(round_up_normal, incremented_bits, truncated_bits);
+    let rounded_bits = builder.ins().select(frac_is_zero, bits, rounded_bits);
+    let normal_regime_result = builder.ins().bitcast(float_ty, MemFlagsData::new(), rounded_bits);
+
+    let result = builder.ins().select(is_exp_negative, exp_negative_result, normal_regime_result);
+    builder.ins().select(no_frac_bits, x, result)
+}
+
+/// ROUND/TRUNC/CEIL/FLOOR pass a fixed MIPS FCSR.RM value regardless of
+/// FCSR's live contents (`Fixed`); the two unprefixed CVT.W/CVT.L
+/// instructions honor FCSR.RM dynamically instead (`Dynamic`) — see
+/// `exec_fcvt_w_s`'s interpreter-side counterpart.
+#[derive(Clone, Copy)]
+enum RoundMode { Fixed(i64), Dynamic }
+
+/// Shared body for every float-source rounding conversion (ROUND/TRUNC/
+/// CEIL/FLOOR/CVT.W/CVT.L, source format S or D, dest width W(i32) or
+/// L(i64)). Mirrors `exec_fround_l_s` et al.'s common shape, including its
+/// value-based Inexact computation: convert `result` back to the source's
+/// float type and compare against the original `src_val` — this is what
+/// MIPS (and MAME's SoftFloat reference, `f32_to_i32`'s own
+/// `softfloat_flag_inexact`) actually specifies as Inexact for this
+/// instruction family, and is the only way to get it right without a full
+/// SoftFloat port (host MXCSR state, even read carefully, answers a
+/// different question — see `emit_round_to_int_mode`'s doc comment).
+fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: bool, mode: RoundMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+
+    let float_ty = if src_f64 { ir::types::F64 } else { ir::types::F32 };
+    let src_val = if src_f64 {
+        let bits = emit_read_fpr_l(ctx, fs, fr_mode);
+        ctx.builder.ins().bitcast(float_ty, MemFlagsData::new(), bits)
+    } else {
+        let bits = emit_read_fpr_w(ctx, fs, fr_mode);
+        ctx.builder.ins().bitcast(float_ty, MemFlagsData::new(), bits)
+    };
+
+    let rm = match mode {
+        RoundMode::Fixed(rm) => ctx.builder.ins().iconst(ir::types::I8, rm),
+        RoundMode::Dynamic => {
+            let mem = MemFlagsData::trusted();
+            let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
+            let rm32 = ctx.builder.ins().band_imm_s(fcsr, 0x3);
+            ctx.builder.ins().ireduce(ir::types::I8, rm32)
+        }
+    };
+    let rounded = emit_round_to_int_mode(ctx.builder, src_val, rm);
+
+    // Cranelift's floor/ceil/trunc/nearest (used by the old, replaced
+    // implementation of `emit_round_to_int_mode`) lower to real SSE
+    // ROUNDSS/ROUNDSD-family instructions on x86_64, which set MXCSR's
+    // Precision (Inexact) flag as a side effect whenever *that intermediate
+    // rounding step* wasn't a no-op — not whenever the overall MIPS
+    // conversion was inexact. `emit_round_to_int_mode` no longer uses any
+    // hardware rounding instruction (pure bit manipulation), so this is now
+    // moot for that specific concern — but the `fcvt_to_sint_sat` below is
+    // still a real hardware instruction that could set its own flags, so
+    // status is still cleared here and Inexact is still computed by value
+    // (comparing the result back to the source) rather than trusted from
+    // hardware — matching `mips_exec.rs`'s interpreter-side approach exactly.
+    emit_fpu_clear_status(ctx);
+    let int_ty = if dst_i64 { ir::types::I64 } else { ir::types::I32 };
+    let result = ctx.builder.ins().fcvt_to_sint_sat(int_ty, rounded);
+
+    // Inexact iff converting `result` back to the source's float type
+    // doesn't reproduce `src_val` exactly — see this function's own doc
+    // comment.
+    use cranelift_codegen::ir::condcodes::FloatCC;
+    let result_as_float = ctx.builder.ins().fcvt_from_sint(float_ty, result);
+    let inexact = ctx.builder.ins().fcmp(FloatCC::NotEqual, result_as_float, src_val);
+
+    if dst_i64 {
+        emit_write_fpr_l(ctx, fd, result, fr_mode);
+    } else {
+        emit_write_fpr_w(ctx, fd, result, fr_mode);
+    }
+    emit_fpu_update_fcsr_with_inexact_override(ctx, Some(inexact));
+}
+
+/// Shared body for int-source-to-float conversions (CVT.S.W/D.W/S.L/D.L):
+/// plain signed int->float, no rounding choice. Mirrors `exec_fcvt_s_w` et al.
+fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64: bool) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+
+    let src_int = if src_i64 {
+        emit_read_fpr_l(ctx, fs, fr_mode)
+    } else {
+        emit_read_fpr_w(ctx, fs, fr_mode)
+    };
+
+    let float_ty = if dst_f64 { ir::types::F64 } else { ir::types::F32 };
+    let result = ctx.builder.ins().fcvt_from_sint(float_ty, src_int);
+
+    if dst_f64 {
+        let bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+        emit_write_fpr_l(ctx, fd, bits, fr_mode);
+    } else {
+        let bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+        emit_write_fpr_w(ctx, fd, bits, fr_mode);
+    }
+    emit_fpu_update_fcsr(ctx);
+}
+
+/// CVT.D.S / CVT.S.D: plain float<->float widen/narrow, no rounding choice
+/// for the widen (D.S); the narrow (S.D) uses Cranelift's `fdemote`, which
+/// rounds to nearest-even on precision loss — matches Rust's `as f32` cast
+/// (also round-to-nearest-even, the IEEE-754-mandated narrowing behavior,
+/// unlike the away-from-zero integer rounding case above).
+fn emit_fcvt_d_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+    let bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), bits);
+    let result = ctx.builder.ins().fpromote(ir::types::F64, val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    emit_fpu_clear_status(ctx);
+    let bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), bits);
+    let result = ctx.builder.ins().fdemote(ir::types::F32, val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+    emit_fpu_update_fcsr(ctx);
+}
+
+fn emit_fcvt_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Dynamic); }
+fn emit_fcvt_l_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, true, RoundMode::Dynamic); }
+fn emit_fcvt_w_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, false, RoundMode::Dynamic); }
+fn emit_fcvt_l_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, true, RoundMode::Dynamic); }
+
+fn emit_fround_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Fixed(RM_NEAREST_EVEN)); }
+fn emit_ftrunc_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Fixed(RM_TOWARD_ZERO)); }
+fn emit_fceil_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Fixed(RM_TOWARD_POS_INF)); }
+fn emit_ffloor_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Fixed(RM_TOWARD_NEG_INF)); }
+fn emit_fround_l_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, true, RoundMode::Fixed(RM_NEAREST_EVEN)); }
+fn emit_ftrunc_l_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, true, RoundMode::Fixed(RM_TOWARD_ZERO)); }
+fn emit_fceil_l_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, true, RoundMode::Fixed(RM_TOWARD_POS_INF)); }
+fn emit_ffloor_l_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, true, RoundMode::Fixed(RM_TOWARD_NEG_INF)); }
+
+fn emit_fround_w_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, false, RoundMode::Fixed(RM_NEAREST_EVEN)); }
+fn emit_ftrunc_w_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, false, RoundMode::Fixed(RM_TOWARD_ZERO)); }
+fn emit_fceil_w_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, false, RoundMode::Fixed(RM_TOWARD_POS_INF)); }
+fn emit_ffloor_w_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, false, RoundMode::Fixed(RM_TOWARD_NEG_INF)); }
+fn emit_fround_l_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, true, RoundMode::Fixed(RM_NEAREST_EVEN)); }
+fn emit_ftrunc_l_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, true, RoundMode::Fixed(RM_TOWARD_ZERO)); }
+fn emit_fceil_l_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, true, RoundMode::Fixed(RM_TOWARD_POS_INF)); }
+fn emit_ffloor_l_d(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, true, true, RoundMode::Fixed(RM_TOWARD_NEG_INF)); }
+
+fn emit_fcvt_s_w(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, false, false); }
+fn emit_fcvt_d_w(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, false, true); }
+fn emit_fcvt_s_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true, false); }
+fn emit_fcvt_d_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true, true); }
+
+// ---- CP1 compares: C.cond.fmt ------
+
+/// Evaluate one of the 16 MIPS FP compare conditions against Cranelift's
+/// `fcmp`, matching `fpu_compare_s`/`fpu_compare_d`'s match table exactly.
+/// `cond` (`funct & 0xF`) is a compile-time constant (part of the fixed
+/// instruction encoding), so this resolves to one `fcmp` (or a constant
+/// `false`, for F/SF) — no runtime branch on which condition it is.
+/// Cranelift's `fcmp` with `IntCC`-style codes doesn't exist for floats;
+/// Cranelift has its own `FloatCC` enum whose `Equal`/`LessThan`/
+/// `LessThanOrEqual`/`Unordered`/`NotEqual`... — MIPS's condition set maps
+/// directly onto small ORs of `FloatCC::{LessThan,Equal,Unordered}`-shaped
+/// primitives the same way `fpu_compare_s` builds `less`/`equal`/`unordered`
+/// from three separate host comparisons and ORs them — so this mirrors that
+/// exact structure (three `fcmp`s + boolean logic) rather than searching
+/// for a single closer `FloatCC` variant, to keep the correspondence to the
+/// interpreter's own formula obvious.
+fn emit_fpu_compare(builder: &mut FunctionBuilder, a: Value, b: Value, cond: u32) -> Value {
+    use cranelift_codegen::ir::condcodes::FloatCC;
+    let less = builder.ins().fcmp(FloatCC::LessThan, a, b);
+    let equal = builder.ins().fcmp(FloatCC::Equal, a, b);
+    let unordered = builder.ins().fcmp(FloatCC::Unordered, a, b);
+    let less_or_equal = builder.ins().bor(less, equal);
+    let unordered_or_less = builder.ins().bor(unordered, less);
+    let unordered_or_equal = builder.ins().bor(unordered, equal);
+    let unordered_or_less_or_equal = builder.ins().bor(unordered, less_or_equal);
+    let always_false = builder.ins().iconst(ir::types::I8, 0);
+    match cond & 0xF {
+        0x0 => always_false,        // F
+        0x1 => unordered,           // UN
+        0x2 => equal,               // EQ
+        0x3 => unordered_or_equal,  // UEQ
+        0x4 => less,                // OLT
+        0x5 => unordered_or_less,   // ULT
+        0x6 => less_or_equal,       // OLE
+        0x7 => unordered_or_less_or_equal, // ULE
+        0x8 => always_false,        // SF
+        0x9 => unordered,           // NGLE
+        0xA => equal,               // SEQ
+        0xB => unordered_or_equal,  // NGL
+        0xC => less,                // LT
+        0xD => unordered_or_less,   // NGE
+        0xE => less_or_equal,       // LE
+        0xF => unordered_or_less_or_equal, // NGT
+        _ => unreachable!("cond is masked to 4 bits"),
+    }
+}
+
+/// Shared body for C.cond.S/C.cond.D. Mirrors `exec_fcc_s`/`exec_fcc_d`:
+/// CU1 already handled by the region-wide entry guard; signaling
+/// comparisons (cond bit 3 set) raise FCSR.V (Cause+Flag) and — if EV
+/// (Enable.V) is set — `EXC_FPE` immediately when either operand is NaN;
+/// otherwise evaluate the condition and write the selected condition-code
+/// bit via the same FCSR bit-math as `MipsCore::set_fpu_cc`.
+fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
+    let raw = ctx.raw;
+    let fs = field_rd(raw);
+    let ft = field_rt(raw);
+    let fd = field_sa(raw);
+    let funct = raw & 0x3F;
+    let mem = MemFlagsData::trusted();
+
+    let (a, b) = if is_d {
+        let a_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+        let b_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+        (ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), a_bits),
+         ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), b_bits))
+    } else {
+        let a_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+        let b_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+        (ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), a_bits),
+         ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), b_bits))
+    };
+
+    // Signaling-compare NaN check (funct bit 3): compile-time-known whether
+    // this instruction is signaling at all, but the NaN-ness of the
+    // operands is runtime — so the check itself is only emitted for
+    // signaling condition codes, matching the interpreter's `funct_val &
+    // 0x8 != 0` guard exactly (a non-signaling compare never touches
+    // FCSR.V here, same as the interpreter never entering that `if`).
+    if funct & 0x8 != 0 {
+        use cranelift_codegen::ir::condcodes::FloatCC;
+        let a_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, a, a);
+        let b_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, b, b);
+        let either_nan = ctx.builder.ins().bor(a_nan, b_nan);
+
+        let raise_v_block = ctx.builder.create_block();
+        let after_v_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(either_nan, raise_v_block, &[], after_v_block, &[]);
+
+        // Cold: a signaling-NaN operand on a compare is a rare edge case.
+        ctx.builder.switch_to_block(raise_v_block);
+        ctx.builder.set_cold_block(raise_v_block);
+        ctx.builder.seal_block(raise_v_block);
+        let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+        let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
+        const FCSR_CV: i64 = 0x0001_0000;
+        let fcsr_with_v = ctx.builder.ins().bor_imm_s(fcsr, FCSR_CV | 0x40);
+        ctx.builder.ins().store(mem, fcsr_with_v, ctx.core_ptr, fcsr_off);
+
+        let ev_set = ctx.builder.ins().band_imm_s(fcsr_with_v, 0x800);
+        let ev_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ev_set, 0);
+        let raise_fpe_block = ctx.builder.create_block();
+        let no_raise_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(ev_nonzero, raise_fpe_block, &[], no_raise_block, &[]);
+
+        // Cold: reached only after the already-rare signaling-NaN case above.
+        ctx.builder.switch_to_block(raise_fpe_block);
+        ctx.builder.set_cold_block(raise_fpe_block);
+        ctx.builder.seal_block(raise_fpe_block);
+        let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+        let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+        emit_exception_exit(ctx, status_val);
+
+        ctx.builder.switch_to_block(no_raise_block);
+        ctx.builder.seal_block(no_raise_block);
+        ctx.builder.ins().jump(after_v_block, &[]);
+
+        ctx.builder.switch_to_block(after_v_block);
+        ctx.builder.seal_block(after_v_block);
+    }
+
+    let cond_result = emit_fpu_compare(ctx.builder, a, b, funct);
+    let cond_i32 = ctx.builder.ins().uextend(ir::types::I32, cond_result);
+
+    // set_fpu_cc: cc = fd & 0x7; bit = if cc==0 {23} else {24+cc}.
+    let cc = fd & 0x7;
+    let bit = if cc == 0 { 23 } else { 24 + cc };
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !(1i64 << bit));
+    let bit_val = ctx.builder.ins().ishl_imm_s(cond_i32, bit as i64);
+    let new_fcsr = ctx.builder.ins().bor(cleared, bit_val);
+    ctx.builder.ins().store(mem, new_fcsr, ctx.core_ptr, fcsr_off);
+
+    // set_fpu_cc also refreshes fpu_fccr from the new FCSR (fccr_from_fcsr).
+    let cc0 = ctx.builder.ins().ushr_imm_s(new_fcsr, 23);
+    let cc0 = ctx.builder.ins().band_imm_s(cc0, 1);
+    let cc1_7 = ctx.builder.ins().ushr_imm_s(new_fcsr, 25);
+    let cc1_7 = ctx.builder.ins().band_imm_s(cc1_7, 0x7F);
+    let cc1_7_shifted = ctx.builder.ins().ishl_imm_s(cc1_7, 1);
+    let fccr = ctx.builder.ins().bor(cc0, cc1_7_shifted);
+    let fccr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fccr());
+    ctx.builder.ins().store(mem, fccr, ctx.core_ptr, fccr_off);
+}
+
+fn emit_fcc_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    emit_fcc(ctx, fr_mode, false);
+}
+fn emit_fcc_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    emit_fcc(ctx, fr_mode, true);
+}
+
+/// Look up the CP1 semantics emitter for a decoded instruction word, or
+/// `None` if unimplemented. Only recognizes `Sequential`-shaped CP1 ops
+/// (arithmetic/convert/compare/move) — `RS_BC1` is `Excluded` by the
+/// analyzer and never reaches codegen at all (§4.4).
+fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
+    use crate::mips_isa::*;
+    let op = (raw >> 26) & 0x3F;
+    // LWC1/LDC1/SWC1/SDC1 are architecturally plain memory ops (separate
+    // top-level opcodes, not OP_COP1-encoded), but they read/write an FPR —
+    // routed through this table anyway, not lookup_semantics, so
+    // has_fpu_instruction's single check keeps being the one true trigger
+    // for emit_fpu_entry_guard's region-wide CU1/FR check (see that
+    // function's doc comment): a region containing only e.g. LWC1 must
+    // still get the guard, and putting these in the integer table would
+    // silently skip it.
+    match op {
+        OP_LWC1 => return Some(emit_lwc1),
+        OP_LDC1 => return Some(emit_ldc1),
+        OP_SWC1 => return Some(emit_swc1),
+        OP_SDC1 => return Some(emit_sdc1),
+        _ => {}
+    }
+    if op != OP_COP1 {
+        return None;
+    }
+    let rs = (raw >> 21) & 0x1F; // fmt selector
+    let funct = raw & 0x3F;
+    match rs {
+        RS_S => match funct {
+            FUNCT_FADD => Some(emit_fadd_s),
+            FUNCT_FSUB => Some(emit_fsub_s),
+            FUNCT_FMUL => Some(emit_fmul_s),
+            FUNCT_FDIV => Some(emit_fdiv_s),
+            FUNCT_FSQRT => Some(emit_fsqrt_s),
+            FUNCT_FABS => Some(emit_fabs_s),
+            FUNCT_FNEG => Some(emit_fneg_s),
+            FUNCT_FMOV => Some(emit_fmov_s),
+            FUNCT_FCVT_D => Some(emit_fcvt_d_s),
+            FUNCT_FCVT_W => Some(emit_fcvt_w_s),
+            FUNCT_FCVT_L => Some(emit_fcvt_l_s),
+            FUNCT_FROUND_W => Some(emit_fround_w_s),
+            FUNCT_FTRUNC_W => Some(emit_ftrunc_w_s),
+            FUNCT_FCEIL_W => Some(emit_fceil_w_s),
+            FUNCT_FFLOOR_W => Some(emit_ffloor_w_s),
+            FUNCT_FROUND_L => Some(emit_fround_l_s),
+            FUNCT_FTRUNC_L => Some(emit_ftrunc_l_s),
+            FUNCT_FCEIL_L => Some(emit_fceil_l_s),
+            FUNCT_FFLOOR_L => Some(emit_ffloor_l_s),
+            FUNCT_FC_F..=FUNCT_FC_NGT => Some(emit_fcc_s),
+            _ => None,
+        },
+        RS_D => match funct {
+            FUNCT_FADD => Some(emit_fadd_d),
+            FUNCT_FSUB => Some(emit_fsub_d),
+            FUNCT_FMUL => Some(emit_fmul_d),
+            FUNCT_FDIV => Some(emit_fdiv_d),
+            FUNCT_FSQRT => Some(emit_fsqrt_d),
+            FUNCT_FABS => Some(emit_fabs_d),
+            FUNCT_FNEG => Some(emit_fneg_d),
+            FUNCT_FMOV => Some(emit_fmov_d),
+            FUNCT_FCVT_S => Some(emit_fcvt_s_d),
+            FUNCT_FCVT_W => Some(emit_fcvt_w_d),
+            FUNCT_FCVT_L => Some(emit_fcvt_l_d),
+            FUNCT_FROUND_W => Some(emit_fround_w_d),
+            FUNCT_FTRUNC_W => Some(emit_ftrunc_w_d),
+            FUNCT_FCEIL_W => Some(emit_fceil_w_d),
+            FUNCT_FFLOOR_W => Some(emit_ffloor_w_d),
+            FUNCT_FROUND_L => Some(emit_fround_l_d),
+            FUNCT_FTRUNC_L => Some(emit_ftrunc_l_d),
+            FUNCT_FCEIL_L => Some(emit_fceil_l_d),
+            FUNCT_FFLOOR_L => Some(emit_ffloor_l_d),
+            FUNCT_FC_F..=FUNCT_FC_NGT => Some(emit_fcc_d),
+            _ => None,
+        },
+        RS_W => match funct {
+            FUNCT_FCVT_S => Some(emit_fcvt_s_w),
+            FUNCT_FCVT_D => Some(emit_fcvt_d_w),
+            _ => None,
+        },
+        RS_L => match funct {
+            FUNCT_FCVT_S => Some(emit_fcvt_s_l),
+            FUNCT_FCVT_D => Some(emit_fcvt_d_l),
+            _ => None,
+        },
+        RS_MFC1 => Some(emit_mfc1),
+        RS_DMFC1 => Some(emit_dmfc1),
+        RS_CFC1 => Some(emit_cfc1),
+        RS_MTC1 => Some(emit_mtc1),
+        RS_DMTC1 => Some(emit_dmtc1),
+        RS_CTC1 => Some(emit_ctc1),
+        _ => None,
+    }
+}
+
+fn emit_addu(ctx: &mut EmitCtx) {
+    // ADDU rd, rs, rt: rd = sign_extend32(rs[31:0] + rt[31:0]), no overflow trap.
+    // Mirrors MipsExecutor::exec_addu exactly: truncate both operands to
+    // u32, wrapping_add, then sign-extend the 32-bit result back to 64 bits.
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let sum_32 = ctx.builder.ins().iadd(rs_32, rt_32);
+    let sum_64 = ctx.builder.ins().sextend(ir::types::I64, sum_32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), sum_64);
+}
+
+/// ADD rd, rs, rt: rd = rs[31:0] + rt[31:0] (signed), trapping on 32-bit
+/// signed overflow — mirrors `MipsExecutor::exec_add`'s `i32::checked_add`.
+/// Uses Cranelift's overflow-detecting add (`iadd_ifcout` — I32 result plus
+/// an overflow flag in one instruction) rather than a separate compare
+/// against min/max bounds.
+fn emit_add(ctx: &mut EmitCtx) {
+    emit_add_sub_trapping(ctx, false);
+}
+/// SUB rd, rs, rt: rd = rs[31:0] - rt[31:0] (signed), trapping on 32-bit
+/// signed overflow — mirrors `MipsExecutor::exec_sub`'s `i32::checked_sub`.
+fn emit_sub(ctx: &mut EmitCtx) {
+    emit_add_sub_trapping(ctx, true);
+}
+
+fn emit_add_sub_trapping(ctx: &mut EmitCtx, is_sub: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+
+    let (result_32, overflow) = if is_sub {
+        ctx.builder.ins().ssub_overflow(rs_32, rt_32)
+    } else {
+        ctx.builder.ins().sadd_overflow(rs_32, rt_32)
+    };
+
+    let ok_block = ctx.builder.create_block();
+    let trap_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(overflow, trap_block, &[], ok_block, &[]);
+
+    // Cold: signed overflow is the rare case for ADD/SUB.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+    let result_64 = ctx.builder.ins().sextend(ir::types::I64, result_32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result_64);
+}
+
+fn emit_subu(ctx: &mut EmitCtx) {
+    // SUBU rd, rs, rt: rd = sign_extend32(rs[31:0] - rt[31:0]), no overflow trap.
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let diff_32 = ctx.builder.ins().isub(rs_32, rt_32);
+    let diff_64 = ctx.builder.ins().sextend(ir::types::I64, diff_32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), diff_64);
+}
+
+fn emit_and(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().band(rs_val, rt_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_or(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().bor(rs_val, rt_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_xor(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().bxor(rs_val, rt_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_nor(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let or_val = ctx.builder.ins().bor(rs_val, rt_val);
+    let result = ctx.builder.ins().bnot(or_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_slt(ctx: &mut EmitCtx) {
+    // SLT rd, rs, rt: rd = (rs <s rt) ? 1 : 0 (signed 64-bit compare).
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let lt = ctx.builder.ins().icmp(IntCC::SignedLessThan, rs_val, rt_val);
+    let result = ctx.builder.ins().uextend(ir::types::I64, lt);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_sltu(ctx: &mut EmitCtx) {
+    // SLTU rd, rs, rt: rd = (rs <u rt) ? 1 : 0 (unsigned 64-bit compare).
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let lt = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, rs_val, rt_val);
+    let result = ctx.builder.ins().uextend(ir::types::I64, lt);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_sll(ctx: &mut EmitCtx) {
+    // SLL rd, rt, sa: rd = sign_extend32(rt[31:0] << sa).
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let shifted = ctx.builder.ins().ishl_imm_s(rt_32, field_sa(ctx.raw) as i64);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_srl(ctx: &mut EmitCtx) {
+    // SRL rd, rt, sa: rd = sign_extend32((u32)rt[31:0] >> sa) — logical shift.
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let shifted = ctx.builder.ins().ushr_imm_s(rt_32, field_sa(ctx.raw) as i64);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_sra(ctx: &mut EmitCtx) {
+    // SRA rd, rt, sa: rd = sign_extend32((i32)rt[31:0] >> sa) — arithmetic shift.
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let shifted = ctx.builder.ins().sshr_imm_s(rt_32, field_sa(ctx.raw) as i64);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_sllv(ctx: &mut EmitCtx) {
+    // SLLV rd, rt, rs: rd = sign_extend32(rt[31:0] << (rs & 0x1F)).
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x1F);
+    let sa_32 = ctx.builder.ins().ireduce(ir::types::I32, sa);
+    let shifted = ctx.builder.ins().ishl(rt_32, sa_32);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_srlv(ctx: &mut EmitCtx) {
+    // SRLV rd, rt, rs: rd = sign_extend32((u32)rt[31:0] >> (rs & 0x1F)).
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x1F);
+    let sa_32 = ctx.builder.ins().ireduce(ir::types::I32, sa);
+    let shifted = ctx.builder.ins().ushr(rt_32, sa_32);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_srav(ctx: &mut EmitCtx) {
+    // SRAV rd, rt, rs: rd = sign_extend32((i32)rt[31:0] >> (rs & 0x1F)).
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x1F);
+    let sa_32 = ctx.builder.ins().ireduce(ir::types::I32, sa);
+    let shifted = ctx.builder.ins().sshr(rt_32, sa_32);
+    let result = ctx.builder.ins().sextend(ir::types::I64, shifted);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_mfhi(ctx: &mut EmitCtx) {
+    let hi = emit_read_hi(ctx);
+    emit_write_gpr(ctx, field_rd(ctx.raw), hi);
+}
+fn emit_mthi(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    emit_write_hi(ctx, rs_val);
+}
+fn emit_mflo(ctx: &mut EmitCtx) {
+    let lo = emit_read_lo(ctx);
+    emit_write_gpr(ctx, field_rd(ctx.raw), lo);
+}
+fn emit_mtlo(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    emit_write_lo(ctx, rs_val);
+}
+
+/// MULT rs, rt: {hi,lo} = sext32(rs) * sext32(rt) (signed 32x32->64).
+/// Mirrors `MipsExecutor::exec_mult`: both operands narrowed to their low 32
+/// bits and sign-extended to i64 first (so the i64 multiply can't overflow),
+/// then the 64-bit product's low/high 32-bit halves each get independently
+/// sign-extended back to 64 bits for lo/hi — NOT a plain 128-bit split,
+/// which is why this doesn't reuse `smulhi`/widening multiply idioms.
+fn emit_mult(ctx: &mut EmitCtx) {
+    emit_mult_impl(ctx, true);
+}
+fn emit_multu(ctx: &mut EmitCtx) {
+    emit_mult_impl(ctx, false);
+}
+fn emit_mult_impl(ctx: &mut EmitCtx, signed: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+    let (rs_64, rt_64) = if signed {
+        (ctx.builder.ins().sextend(ir::types::I64, rs_32), ctx.builder.ins().sextend(ir::types::I64, rt_32))
+    } else {
+        (ctx.builder.ins().uextend(ir::types::I64, rs_32), ctx.builder.ins().uextend(ir::types::I64, rt_32))
+    };
+    let product = ctx.builder.ins().imul(rs_64, rt_64);
+
+    let lo_32 = ctx.builder.ins().ireduce(ir::types::I32, product);
+    let lo = ctx.builder.ins().sextend(ir::types::I64, lo_32);
+    let hi_shifted = ctx.builder.ins().ushr_imm_s(product, 32);
+    let hi_32 = ctx.builder.ins().ireduce(ir::types::I32, hi_shifted);
+    let hi = ctx.builder.ins().sextend(ir::types::I64, hi_32);
+
+    emit_write_lo(ctx, lo);
+    emit_write_hi(ctx, hi);
+}
+
+/// DIV rs, rt: {lo,hi} = {quotient, remainder} of sext32(rs) / sext32(rt)
+/// (signed, wrapping — `wrapping_div`/`wrapping_rem` so `i32::MIN / -1`
+/// doesn't panic-overflow, matching `exec_div`). Divide-by-zero is a no-op
+/// (hi/lo left unchanged) — MIPS leaves this architecturally undefined and
+/// the interpreter chooses "do nothing" rather than trapping; mirrored
+/// exactly rather than picking a different (also-valid) undefined behavior.
+fn emit_div(ctx: &mut EmitCtx) {
+    emit_div_impl(ctx, true);
+}
+fn emit_divu(ctx: &mut EmitCtx) {
+    emit_div_impl(ctx, false);
+}
+fn emit_div_impl(ctx: &mut EmitCtx, signed: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let rt_32 = ctx.builder.ins().ireduce(ir::types::I32, rt_val);
+
+    let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
+    let is_zero = ctx.builder.ins().icmp(IntCC::Equal, rt_32, zero);
+
+    let divide_block = ctx.builder.create_block();
+    let skip_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_zero, skip_block, &[], divide_block, &[]);
+
+    ctx.builder.switch_to_block(divide_block);
+    ctx.builder.seal_block(divide_block);
+
+    if signed {
+        // i32::MIN / -1 traps (#DE) on Cranelift's plain sdiv/srem (they
+        // lower straight to the host idiv, which faults on this input) —
+        // unlike Rust's wrapping_div/wrapping_rem, which exec_div relies on
+        // to define this case as (i32::MIN, 0) without panicking. Must be
+        // special-cased explicitly; this is not optional/defensive, it's
+        // the only way to reach exec_div's actual defined behavior here.
+        let min = ctx.builder.ins().iconst(ir::types::I32, i32::MIN as i64);
+        let neg1 = ctx.builder.ins().iconst(ir::types::I32, -1);
+        let rs_is_min = ctx.builder.ins().icmp(IntCC::Equal, rs_32, min);
+        let rt_is_neg1 = ctx.builder.ins().icmp(IntCC::Equal, rt_32, neg1);
+        let is_min_over_neg1 = ctx.builder.ins().band(rs_is_min, rt_is_neg1);
+
+        let overflow_block = ctx.builder.create_block();
+        let normal_div_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(is_min_over_neg1, overflow_block, &[], normal_div_block, &[]);
+
+        // Cold: i32::MIN / -1 is a narrow edge case, rare relative to
+        // ordinary division.
+        ctx.builder.switch_to_block(overflow_block);
+        ctx.builder.set_cold_block(overflow_block);
+        ctx.builder.seal_block(overflow_block);
+        let lo = ctx.builder.ins().iconst(ir::types::I64, i32::MIN as i64);
+        let hi = ctx.builder.ins().iconst(ir::types::I64, 0);
+        emit_write_lo(ctx, lo);
+        emit_write_hi(ctx, hi);
+        ctx.builder.ins().jump(skip_block, &[]);
+
+        ctx.builder.switch_to_block(normal_div_block);
+        ctx.builder.seal_block(normal_div_block);
+        let quotient = ctx.builder.ins().sdiv(rs_32, rt_32);
+        let remainder = ctx.builder.ins().srem(rs_32, rt_32);
+        let lo = ctx.builder.ins().sextend(ir::types::I64, quotient);
+        let hi = ctx.builder.ins().sextend(ir::types::I64, remainder);
+        emit_write_lo(ctx, lo);
+        emit_write_hi(ctx, hi);
+        ctx.builder.ins().jump(skip_block, &[]);
+    } else {
+        // Unsigned division has no equivalent overflow case (there is no
+        // -1/MIN in an unsigned range) — udiv/urem are safe with only the
+        // zero-divisor guard already in place above.
+        let quotient = ctx.builder.ins().udiv(rs_32, rt_32);
+        let remainder = ctx.builder.ins().urem(rs_32, rt_32);
+        let lo = ctx.builder.ins().sextend(ir::types::I64, quotient);
+        let hi = ctx.builder.ins().sextend(ir::types::I64, remainder);
+        emit_write_lo(ctx, lo);
+        emit_write_hi(ctx, hi);
+        ctx.builder.ins().jump(skip_block, &[]);
+    }
+
+    ctx.builder.switch_to_block(skip_block);
+    ctx.builder.seal_block(skip_block);
+}
+
+// ---- Batch 5: 64-bit ALU ops ------
+// Full-width equivalents of the 32-bit ALU ops above: no truncate-to-I32 /
+// re-extend dance, since the result is already the architectural 64-bit
+// value. DADD/DSUB trap on 64-bit signed overflow (mirrors exec_dadd/
+// exec_dsub's i64::checked_add/checked_sub); DADDU/DSUBU wrap.
+
+fn emit_daddu(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().iadd(rs_val, rt_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_dsubu(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().isub(rs_val, rt_val);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_dadd(ctx: &mut EmitCtx) {
+    emit_dadd_dsub_trapping(ctx, false);
+}
+fn emit_dsub(ctx: &mut EmitCtx) {
+    emit_dadd_dsub_trapping(ctx, true);
+}
+fn emit_dadd_dsub_trapping(ctx: &mut EmitCtx, is_sub: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let (result, overflow) = if is_sub {
+        ctx.builder.ins().ssub_overflow(rs_val, rt_val)
+    } else {
+        ctx.builder.ins().sadd_overflow(rs_val, rt_val)
+    };
+
+    let ok_block = ctx.builder.create_block();
+    let trap_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(overflow, trap_block, &[], ok_block, &[]);
+
+    // Cold: signed overflow is the rare case for this add/sub-family trap.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_dsll(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().ishl_imm_s(rt_val, field_sa(ctx.raw) as i64);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsrl(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().ushr_imm_s(rt_val, field_sa(ctx.raw) as i64);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsra(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().sshr_imm_s(rt_val, field_sa(ctx.raw) as i64);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+/// DSLL32/DSRL32/DSRA32: shift amount is `sa + 32` — the "32" variants exist
+/// because `sa` is only 5 bits (max 31) but a 64-bit shift needs up to 63;
+/// mirrors exec_dsll32/exec_dsrl32/exec_dsra32 exactly.
+fn emit_dsll32(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().ishl_imm_s(rt_val, field_sa(ctx.raw) as i64 + 32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsrl32(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().ushr_imm_s(rt_val, field_sa(ctx.raw) as i64 + 32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsra32(ctx: &mut EmitCtx) {
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let result = ctx.builder.ins().sshr_imm_s(rt_val, field_sa(ctx.raw) as i64 + 32);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+fn emit_dsllv(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x3F);
+    let result = ctx.builder.ins().ishl(rt_val, sa);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsrlv(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x3F);
+    let result = ctx.builder.ins().ushr(rt_val, sa);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+fn emit_dsrav(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let sa = ctx.builder.ins().band_imm_s(rs_val, 0x3F);
+    let result = ctx.builder.ins().sshr(rt_val, sa);
+    emit_write_gpr(ctx, field_rd(ctx.raw), result);
+}
+
+/// DMULT rs, rt: {hi,lo} = full 128-bit product of rs * rt (signed 64x64).
+/// Mirrors `MipsExecutor::exec_dmult`'s `i128` product exactly — unlike
+/// `MULT`'s "widen 32-bit operands to i64, multiply, split the 64-bit
+/// result" trick (which works because a 32x32 product always fits in 64
+/// bits), a 64x64 product can be a genuine 128-bit value with no native
+/// I128 arithmetic needed: `imul` gives the low 64 bits directly, and
+/// Cranelift's `smulhi`/`umulhi` compute the high 64 bits of a widening
+/// multiply in one instruction (typically a single `mul`/`imul` +
+/// high-half-register host instruction) — together exactly the 128-bit
+/// product's two halves, no I128 type or manual widening required.
+fn emit_dmult(ctx: &mut EmitCtx) {
+    emit_dmult_impl(ctx, true);
+}
+fn emit_dmultu(ctx: &mut EmitCtx) {
+    emit_dmult_impl(ctx, false);
+}
+fn emit_dmult_impl(ctx: &mut EmitCtx, signed: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let lo = ctx.builder.ins().imul(rs_val, rt_val);
+    let hi = if signed {
+        ctx.builder.ins().smulhi(rs_val, rt_val)
+    } else {
+        ctx.builder.ins().umulhi(rs_val, rt_val)
+    };
+    emit_write_lo(ctx, lo);
+    emit_write_hi(ctx, hi);
+}
+
+/// DDIV rs, rt: {lo,hi} = {quotient, remainder} of rs / rt (signed 64-bit).
+/// Mirrors `MipsExecutor::exec_ddiv` exactly, including its own explicit
+/// "do nothing" arms: divide-by-zero AND `i64::MIN / -1` are both no-ops
+/// here (hi/lo left unchanged) — unlike `DIV`'s 32-bit version (which
+/// computes a defined `wrapping_div`/`wrapping_rem` result for the
+/// MIN/-1 case, since 32-bit wrapping division has a well-defined answer),
+/// `exec_ddiv` chose to treat 64-bit MIN/-1 the same as divide-by-zero
+/// rather than compute `i64::MIN.wrapping_div(-1)` — this mirrors that
+/// choice bit-for-bit rather than reusing DIV's MIN/-1 special-case
+/// pattern, which would produce a different (also technically valid, but
+/// not what the interpreter does) result.
+fn emit_ddiv(ctx: &mut EmitCtx) {
+    emit_ddiv_impl(ctx, true);
+}
+fn emit_ddivu(ctx: &mut EmitCtx) {
+    emit_ddiv_impl(ctx, false);
+}
+fn emit_ddiv_impl(ctx: &mut EmitCtx, signed: bool) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+
+    let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+    let is_zero = ctx.builder.ins().icmp(IntCC::Equal, rt_val, zero);
+
+    let divide_block = ctx.builder.create_block();
+    let skip_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_zero, skip_block, &[], divide_block, &[]);
+
+    ctx.builder.switch_to_block(divide_block);
+    ctx.builder.seal_block(divide_block);
+
+    if signed {
+        // i64::MIN / -1 traps (#DE) on Cranelift's plain sdiv/srem (lowers
+        // to the host idiv, which faults on this input) — exec_ddiv treats
+        // this case as a no-op (same as divide-by-zero), so skip the
+        // division entirely rather than computing any result for it, same
+        // rationale as emit_div's MIN/-1 guard but a "do nothing" outcome
+        // instead of a computed one.
+        let min = ctx.builder.ins().iconst(ir::types::I64, i64::MIN);
+        let neg1 = ctx.builder.ins().iconst(ir::types::I64, -1i64);
+        let rs_is_min = ctx.builder.ins().icmp(IntCC::Equal, rs_val, min);
+        let rt_is_neg1 = ctx.builder.ins().icmp(IntCC::Equal, rt_val, neg1);
+        let is_min_over_neg1 = ctx.builder.ins().band(rs_is_min, rt_is_neg1);
+
+        let overflow_block = ctx.builder.create_block();
+        let normal_div_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(is_min_over_neg1, overflow_block, &[], normal_div_block, &[]);
+
+        // Cold: i64::MIN / -1 is a narrow edge case, rare relative to
+        // ordinary division.
+        ctx.builder.switch_to_block(overflow_block);
+        ctx.builder.set_cold_block(overflow_block);
+        ctx.builder.seal_block(overflow_block);
+        ctx.builder.ins().jump(skip_block, &[]);
+
+        ctx.builder.switch_to_block(normal_div_block);
+        ctx.builder.seal_block(normal_div_block);
+        let quotient = ctx.builder.ins().sdiv(rs_val, rt_val);
+        let remainder = ctx.builder.ins().srem(rs_val, rt_val);
+        emit_write_lo(ctx, quotient);
+        emit_write_hi(ctx, remainder);
+        ctx.builder.ins().jump(skip_block, &[]);
+    } else {
+        let quotient = ctx.builder.ins().udiv(rs_val, rt_val);
+        let remainder = ctx.builder.ins().urem(rs_val, rt_val);
+        emit_write_lo(ctx, quotient);
+        emit_write_hi(ctx, remainder);
+        ctx.builder.ins().jump(skip_block, &[]);
+    }
+
+    ctx.builder.switch_to_block(skip_block);
+    ctx.builder.seal_block(skip_block);
+}
+
+/// Sign-extend a 16-bit immediate field to I64, matching
+/// `DecodedInstr::immu64`'s "imm as i16 as i32 as i64 as u64" convention —
+/// used for address-calc immediates (loads/stores/ADDIU/...).
+fn field_imm16_sext(builder: &mut FunctionBuilder, raw: u32) -> Value {
+    let imm16 = (raw & 0xFFFF) as i16 as i64;
+    builder.ins().iconst(ir::types::I64, imm16)
+}
+
+/// Zero-extend a 16-bit immediate field to I64, matching
+/// `DecodedInstr::immi64`'s "imm as u64" convention (imm is already
+/// zero-extended at decode for ANDI/ORI/XORI) — used for bitwise-immediate
+/// ops, which treat imm16 as unsigned.
+fn field_imm16_zext(builder: &mut FunctionBuilder, raw: u32) -> Value {
+    let imm16 = (raw & 0xFFFF) as i64;
+    builder.ins().iconst(ir::types::I64, imm16)
+}
+
+fn emit_addiu(ctx: &mut EmitCtx) {
+    // ADDIU rt, rs, imm: rt = sign_extend32(rs[31:0] + sext(imm16)), no trap.
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let imm_32 = ctx.builder.ins().ireduce(ir::types::I32, imm);
+    let sum_32 = ctx.builder.ins().iadd(rs_32, imm_32);
+    let result = ctx.builder.ins().sextend(ir::types::I64, sum_32);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+/// ADDI rt, rs, imm: rt = rs[31:0] + sext(imm16) (signed), trapping on
+/// 32-bit signed overflow — mirrors `MipsExecutor::exec_addi`'s
+/// `i32::checked_add`.
+fn emit_addi(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
+    let imm_32 = ctx.builder.ins().ireduce(ir::types::I32, imm);
+    let (result_32, overflow) = ctx.builder.ins().sadd_overflow(rs_32, imm_32);
+
+    let ok_block = ctx.builder.create_block();
+    let trap_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(overflow, trap_block, &[], ok_block, &[]);
+
+    // Cold: signed overflow is the rare case for this add/sub-family trap.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+    let result_64 = ctx.builder.ins().sextend(ir::types::I64, result_32);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result_64);
+}
+
+/// DADDI rt, rs, imm: rt = rs + sext(imm16) (signed 64-bit), trapping on
+/// 64-bit signed overflow — mirrors `MipsExecutor::exec_daddi`'s
+/// `i64::checked_add`. Unlike `ADDI`, no 32-bit truncate/sign-extend step:
+/// the whole operation is native 64-bit width.
+fn emit_daddi(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let (result, overflow) = ctx.builder.ins().sadd_overflow(rs_val, imm);
+
+    let ok_block = ctx.builder.create_block();
+    let trap_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(overflow, trap_block, &[], ok_block, &[]);
+
+    // Cold: signed overflow is the rare case for this add/sub-family trap.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_andi(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_zext(ctx.builder, ctx.raw);
+    let result = ctx.builder.ins().band(rs_val, imm);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_ori(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_zext(ctx.builder, ctx.raw);
+    let result = ctx.builder.ins().bor(rs_val, imm);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_xori(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_zext(ctx.builder, ctx.raw);
+    let result = ctx.builder.ins().bxor(rs_val, imm);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_slti(ctx: &mut EmitCtx) {
+    // SLTI rt, rs, imm: rt = (rs <s sext(imm16)) ? 1 : 0.
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let lt = ctx.builder.ins().icmp(IntCC::SignedLessThan, rs_val, imm);
+    let result = ctx.builder.ins().uextend(ir::types::I64, lt);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_sltiu(ctx: &mut EmitCtx) {
+    // SLTIU rt, rs, imm: rt = (rs <u sext(imm16)) ? 1 : 0 — imm is still
+    // sign-extended at decode (immu64), only the comparison is unsigned.
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let lt = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, rs_val, imm);
+    let result = ctx.builder.ins().uextend(ir::types::I64, lt);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_lui(ctx: &mut EmitCtx) {
+    // LUI rt, imm: rt = sign_extend32(imm16 << 16). Mirrors
+    // MipsExecutor::exec_lui / DecodedInstr::set_imm_lui + immu64.
+    let imm32 = ((ctx.raw & 0xFFFF) << 16) as i32 as i64;
+    let result = ctx.builder.ins().iconst(ir::types::I64, imm32);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+/// How a loaded value's width is extended to fill the 64-bit GPR — mirrors
+/// each `exec_l*` handler's own post-load conversion (`value as iN as i64 as
+/// u64` for signed, `value as u64` for zero-extending/full-width loads).
+#[derive(Clone, Copy)]
+enum LoadExtend { Sign, Zero }
+
+/// Shared body for every `rt, imm(rs)` load: address calc, `read*_fn` call,
+/// exception check, extend-and-write-back. `size` selects the hook/access
+/// width; `extend` selects how the loaded value fills the 64-bit GPR.
+/// Mirrors the common shape of `exec_lb`/`exec_lbu`/`exec_lh`/`exec_lhu`/
+/// `exec_lw`/`exec_lwu`/`exec_ld` — they differ only in these two axes.
+fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let loaded = emit_mem_read(ctx, vaddr, size);
+    emit_check_mem_exc(ctx); // leaves ctx.builder in the no-fault continuation
+
+    // read*_fn always returns the value zero-extended to u64 on the Rust
+    // side (MipsCore's read*_fn field doc comments) — narrow back to the
+    // access's true width before re-extending, so a Sign extend actually
+    // sign-extends from the right bit rather than from bit 63.
+    let result = match (size, extend) {
+        (MemSize::B8, _) => loaded, // already the full 64 bits either way
+        (_, LoadExtend::Zero) => loaded, // already zero-extended by read*_fn
+        (_, LoadExtend::Sign) => {
+            let narrow = ctx.builder.ins().ireduce(size.ir_type(), loaded);
+            ctx.builder.ins().sextend(ir::types::I64, narrow)
+        }
+    };
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_lb(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B1, LoadExtend::Sign);
+}
+fn emit_lbu(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B1, LoadExtend::Zero);
+}
+fn emit_lh(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B2, LoadExtend::Sign);
+}
+fn emit_lhu(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B2, LoadExtend::Zero);
+}
+fn emit_lw(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B4, LoadExtend::Sign);
+}
+fn emit_lwu(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B4, LoadExtend::Zero);
+}
+fn emit_ld(ctx: &mut EmitCtx) {
+    emit_load(ctx, MemSize::B8, LoadExtend::Zero);
+}
+
+/// LWL rt, imm(rs) / LDL rt, imm(rs): load the "left" (high-address-end, in
+/// this big-endian machine's byte numbering) portion of a word/doubleword
+/// from an unaligned address, merging into `rt`'s existing low bytes.
+/// Mirrors `MipsExecutor::exec_lwl`/`exec_ldl` exactly: align the address
+/// down to the access width, read the whole aligned unit, then shift by a
+/// **runtime-variable** amount derived from the low alignment bits of the
+/// original (unaligned) address — unlike every other load/store emitter in
+/// this file, the shift/mask here can't be a compile-time constant, so this
+/// uses Cranelift's variable-shift `ishl`/`ushr` (not the `_imm` forms
+/// `emit_load`'s siblings all use).
+///
+/// `width` is 4 (LWL, `MemSize::B4`) or 8 (LDL, `MemSize::B8`); `align_mask`
+/// is `width - 1` (0x3 or 0x7) and `total_bits` is `width * 8` (32 or 64) —
+/// passed explicitly rather than derived from `size.ir_type()` because the
+/// shift-amount arithmetic needs the *bit* width as a runtime constant
+/// operand, and LWL's 32-bit merge still writes a sign-extended 64-bit GPR
+/// result (`exec_lwl`'s `self.core.write_gpr(rt_reg, result as u64 as i32
+/// as i64 as u64)`-equivalent via the final sign-extend), while LDL's is
+/// already the full 64-bit value.
+fn emit_lwl_ldl(ctx: &mut EmitCtx, size: MemSize) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let align_mask: i64 = size.width_bytes() as i64 - 1;
+    let aligned_addr = ctx.builder.ins().band_imm_s(vaddr, !align_mask);
+    let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
+
+    let loaded = emit_mem_read(ctx, aligned_addr, size);
+    emit_check_mem_exc(ctx);
+
+    let ity = size.ir_type();
+    let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_narrow = if size == MemSize::B8 { rt_val } else { ctx.builder.ins().ireduce(ity, rt_val) };
+
+    let byte_offset_narrow = if size == MemSize::B8 { byte_offset } else { ctx.builder.ins().ireduce(ity, byte_offset) };
+    let shift = ctx.builder.ins().imul_imm_s(byte_offset_narrow, 8);
+    let all_ones = ctx.builder.ins().iconst(ity, -1);
+    let mask = ctx.builder.ins().ishl(all_ones, shift);
+    let shifted_mem = ctx.builder.ins().ishl(mem_val, shift);
+    let not_mask = ctx.builder.ins().bnot(mask);
+    let preserved = ctx.builder.ins().band(rt_narrow, not_mask);
+    let result_narrow = ctx.builder.ins().bor(shifted_mem, preserved);
+
+    let result = if size == MemSize::B8 {
+        result_narrow
+    } else {
+        ctx.builder.ins().sextend(ir::types::I64, result_narrow)
+    };
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+/// LWR rt, imm(rs) / LDR rt, imm(rs): load the "right" (low-address-end)
+/// portion — the mirror-image shift direction of [`emit_lwl_ldl`], see that
+/// function's doc comment for the shared shape. Mirrors
+/// `MipsExecutor::exec_lwr`/`exec_ldr` exactly: shift amount is
+/// `(width-1-byte_offset)*8`, the opposite sense from LWL/LDL's plain
+/// `byte_offset*8`.
+fn emit_lwr_ldr(ctx: &mut EmitCtx, size: MemSize) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let align_mask: i64 = size.width_bytes() as i64 - 1;
+    let aligned_addr = ctx.builder.ins().band_imm_s(vaddr, !align_mask);
+    let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
+
+    let loaded = emit_mem_read(ctx, aligned_addr, size);
+    emit_check_mem_exc(ctx);
+
+    let ity = size.ir_type();
+    let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_narrow = if size == MemSize::B8 { rt_val } else { ctx.builder.ins().ireduce(ity, rt_val) };
+
+    let byte_offset_narrow = if size == MemSize::B8 { byte_offset } else { ctx.builder.ins().ireduce(ity, byte_offset) };
+    let inverted_offset = ctx.builder.ins().iadd_imm_s(byte_offset_narrow, -(align_mask));
+    let neg_inverted = ctx.builder.ins().ineg(inverted_offset);
+    let shift = ctx.builder.ins().imul_imm_s(neg_inverted, 8);
+    let all_ones = ctx.builder.ins().iconst(ity, -1);
+    let mask = ctx.builder.ins().ushr(all_ones, shift);
+    let shifted_mem = ctx.builder.ins().ushr(mem_val, shift);
+    let not_mask = ctx.builder.ins().bnot(mask);
+    let preserved = ctx.builder.ins().band(rt_narrow, not_mask);
+    let result_narrow = ctx.builder.ins().bor(shifted_mem, preserved);
+
+    let result = if size == MemSize::B8 {
+        result_narrow
+    } else {
+        ctx.builder.ins().sextend(ir::types::I64, result_narrow)
+    };
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+fn emit_lwl(ctx: &mut EmitCtx) {
+    emit_lwl_ldl(ctx, MemSize::B4);
+}
+fn emit_lwr(ctx: &mut EmitCtx) {
+    emit_lwr_ldr(ctx, MemSize::B4);
+}
+fn emit_ldl(ctx: &mut EmitCtx) {
+    emit_lwl_ldl(ctx, MemSize::B8);
+}
+fn emit_ldr(ctx: &mut EmitCtx) {
+    emit_lwr_ldr(ctx, MemSize::B8);
+}
+
+/// Shared body for every `rt, imm(rs)` store: address calc, truncate `rt` to
+/// `size`, `write*_fn` call, exception check. Mirrors `exec_sb`/`exec_sh`/
+/// `exec_sw`/`exec_sd`'s common shape.
+fn emit_store(ctx: &mut EmitCtx, size: MemSize) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    // Passed to emit_mem_write unnarrowed — see that function's doc comment
+    // on why `write*_fn`'s value parameter is always I64/u64 regardless of
+    // `size`, not `ireduce`d to the store's real width here.
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+
+    emit_mem_write(ctx, vaddr, rt_val, size);
+    emit_check_mem_exc(ctx);
+}
+
+fn emit_sb(ctx: &mut EmitCtx) {
+    emit_store(ctx, MemSize::B1);
+}
+fn emit_sh(ctx: &mut EmitCtx) {
+    emit_store(ctx, MemSize::B2);
+}
+fn emit_sw(ctx: &mut EmitCtx) {
+    emit_store(ctx, MemSize::B4);
+}
+fn emit_sd(ctx: &mut EmitCtx) {
+    emit_store(ctx, MemSize::B8);
+}
+
+/// SWL rt, imm(rs): store the "left" (high-address-end) portion of `rt`'s
+/// low 32 bits to an unaligned address. Mirrors `MipsExecutor::exec_swl`
+/// exactly, including its two-stage shift: first a 32-bit word-space
+/// shift/mask (`word_shift = byte_offset*8`, runtime-variable like every
+/// other emitter in the unaligned load/store family), then promotion of
+/// that 32-bit `(word_val, word_mask)` pair into 64-bit doubleword-aligned
+/// space (`dw_shift`, selecting which half of the doubleword this word
+/// falls in) before the single masked 64-bit write. `is_left` selects SWL
+/// vs SWR's shift direction; the doubleword-promotion math is otherwise
+/// identical between them.
+fn emit_swl_swr(ctx: &mut EmitCtx, is_left: bool) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let byte_offset64 = ctx.builder.ins().band_imm_s(vaddr, 3);
+    let byte_offset = ctx.builder.ins().ireduce(ir::types::I32, byte_offset64);
+
+    let word_shift = if is_left {
+        ctx.builder.ins().imul_imm_s(byte_offset, 8)
+    } else {
+        // (3 - byte_offset) * 8
+        let inverted = ctx.builder.ins().iadd_imm_s(byte_offset, -3);
+        let neg_inverted = ctx.builder.ins().ineg(inverted);
+        ctx.builder.ins().imul_imm_s(neg_inverted, 8)
+    };
+
+    let rt_val64 = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rt_val = ctx.builder.ins().ireduce(ir::types::I32, rt_val64);
+    let all_ones_32 = ctx.builder.ins().iconst(ir::types::I32, -1i64);
+    let (word_mask, word_val) = if is_left {
+        (ctx.builder.ins().ushr(all_ones_32, word_shift), ctx.builder.ins().ushr(rt_val, word_shift))
+    } else {
+        (ctx.builder.ins().ishl(all_ones_32, word_shift), ctx.builder.ins().ishl(rt_val, word_shift))
+    };
+    let word_mask64 = ctx.builder.ins().uextend(ir::types::I64, word_mask);
+    let word_val64 = ctx.builder.ins().uextend(ir::types::I64, word_val);
+
+    // Promote word mask/val into doubleword space at the dword-aligned
+    // address — mirrors exec_swl/exec_swr's own aligned8/half/dw_shift math
+    // exactly (half = 0 selects the upper dword half, i.e. dw_shift = 32).
+    let aligned8 = ctx.builder.ins().band_imm_s(vaddr, !7i64);
+    let half64 = ctx.builder.ins().band_imm_s(vaddr, 4);
+    let half = ctx.builder.ins().ireduce(ir::types::I32, half64);
+    let four = ctx.builder.ins().iconst(ir::types::I32, 4);
+    let four_minus_half = ctx.builder.ins().isub(four, half);
+    let dw_shift = ctx.builder.ins().ishl_imm_s(four_minus_half, 3);
+    let dw_shift64 = ctx.builder.ins().uextend(ir::types::I64, dw_shift);
+
+    let val64 = ctx.builder.ins().ishl(word_val64, dw_shift64);
+    let mask64 = ctx.builder.ins().ishl(word_mask64, dw_shift64);
+
+    emit_mem_write_masked(ctx, aligned8, val64, mask64);
+    emit_check_mem_exc(ctx);
+}
+
+fn emit_swl(ctx: &mut EmitCtx) {
+    emit_swl_swr(ctx, true);
+}
+fn emit_swr(ctx: &mut EmitCtx) {
+    emit_swl_swr(ctx, false);
+}
+
+/// SDL rt, imm(rs): store the "left" portion of `rt`'s full 64 bits to an
+/// unaligned address. Mirrors `MipsExecutor::exec_sdl`/`exec_sdr` exactly —
+/// unlike SWL/SWR, no dword-promotion step is needed (the value is already
+/// doubleword-width and the aligned address is already doubleword-aligned),
+/// just the runtime-variable shift/mask directly in 64-bit space.
+fn emit_sdl_sdr(ctx: &mut EmitCtx, is_left: bool) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let byte_offset = ctx.builder.ins().band_imm_s(vaddr, 7);
+    let shift = if is_left {
+        ctx.builder.ins().imul_imm_s(byte_offset, 8)
+    } else {
+        // (7 - byte_offset) * 8
+        let inverted = ctx.builder.ins().iadd_imm_s(byte_offset, -7);
+        let neg_inverted = ctx.builder.ins().ineg(inverted);
+        ctx.builder.ins().imul_imm_s(neg_inverted, 8)
+    };
+
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let all_ones = ctx.builder.ins().iconst(ir::types::I64, -1i64);
+    let (mask, val) = if is_left {
+        (ctx.builder.ins().ushr(all_ones, shift), ctx.builder.ins().ushr(rt_val, shift))
+    } else {
+        (ctx.builder.ins().ishl(all_ones, shift), ctx.builder.ins().ishl(rt_val, shift))
+    };
+
+    let aligned8 = ctx.builder.ins().band_imm_s(vaddr, !7i64);
+    emit_mem_write_masked(ctx, aligned8, val, mask);
+    emit_check_mem_exc(ctx);
+}
+
+fn emit_sdl(ctx: &mut EmitCtx) {
+    emit_sdl_sdr(ctx, true);
+}
+fn emit_sdr(ctx: &mut EmitCtx) {
+    emit_sdl_sdr(ctx, false);
+}
+
+/// LWC1 ft, imm(rs): load a word from memory into FPR `ft`'s low 32 bits.
+/// Mirrors `MipsExecutor::exec_lwc1`'s `(self.fpr_write_w)(...)` — the CU1
+/// check that handler does first is instead the region-wide
+/// `emit_fpu_entry_guard`, triggered by this being registered in
+/// `lookup_cp1_semantics` (not `lookup_semantics`) despite not being
+/// `OP_COP1`-encoded — see that function's doc comment for why: a region
+/// containing only LWC1/LDC1/SWC1/SDC1 must still get the guard, and
+/// `has_fpu`'s single check (`lookup_cp1_semantics(..).is_some()`) is the
+/// one true trigger for it.
+fn emit_lwc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let loaded = emit_mem_read(ctx, vaddr, MemSize::B4);
+    emit_check_mem_exc(ctx);
+
+    let value_32 = ctx.builder.ins().ireduce(ir::types::I32, loaded);
+    emit_write_fpr_w(ctx, field_rt(ctx.raw), value_32, fr_mode);
+}
+
+/// LDC1 ft, imm(rs): load a doubleword from memory into FPR `ft`. Mirrors
+/// `MipsExecutor::exec_ldc1`'s `(self.fpr_write_l)(...)`.
+fn emit_ldc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let loaded = emit_mem_read(ctx, vaddr, MemSize::B8);
+    emit_check_mem_exc(ctx);
+
+    emit_write_fpr_l(ctx, field_rt(ctx.raw), loaded, fr_mode);
+}
+
+/// SWC1 ft, imm(rs): store FPR `ft`'s low 32 bits to memory. Mirrors
+/// `MipsExecutor::exec_swc1`'s `(self.fpr_read_w)(...)`.
+fn emit_swc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let value_32 = emit_read_fpr_w(ctx, field_rt(ctx.raw), fr_mode);
+    // emit_mem_write always takes I64 regardless of size — see its own doc
+    // comment on why (ABI upper-bits-undefined gotcha, same as emit_store).
+    let value_64 = ctx.builder.ins().uextend(ir::types::I64, value_32);
+    emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
+    emit_check_mem_exc(ctx);
+}
+
+/// SDC1 ft, imm(rs): store FPR `ft`'s full 64 bits to memory. Mirrors
+/// `MipsExecutor::exec_sdc1`'s `(self.fpr_read_l)(...)`.
+fn emit_sdc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    let value_64 = emit_read_fpr_l(ctx, field_rt(ctx.raw), fr_mode);
+    emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
+    emit_check_mem_exc(ctx);
+}
+
+/// MOVZ rd, rs, rt: rd = rs if rt == 0 (no-op otherwise). Mirrors
+/// `MipsExecutor::exec_movz` exactly, including that `rd` isn't touched at
+/// all (not even re-written with its own value) when the condition is
+/// false.
+fn emit_movz(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rd = field_rd(ctx.raw);
+
+    let taken = ctx.builder.ins().icmp_imm_s(ir::condcodes::IntCC::Equal, rt_val, 0);
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    emit_write_gpr(ctx, rd, rs_val);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+/// MOVN rd, rs, rt: rd = rs if rt != 0 (no-op otherwise). Mirrors
+/// `MipsExecutor::exec_movn`; same shape as `emit_movz` with the condition
+/// inverted.
+fn emit_movn(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let rd = field_rd(ctx.raw);
+
+    let taken = ctx.builder.ins().icmp_imm_s(ir::condcodes::IntCC::NotEqual, rt_val, 0);
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    emit_write_gpr(ctx, rd, rs_val);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+/// MOVCI rd, rs, cc, tf: rd = rs if FPU condition code `cc` == `tf`
+/// (no-op otherwise). Mirrors `MipsExecutor::exec_movci`/`MipsCore::get_fpu_cc`
+/// exactly: cc0 lives at FCSR bit 23, cc1..cc7 at FCSR bits 24..30. `cc`/`tf`
+/// are both compile-time constants (part of the fixed instruction encoding,
+/// same as CFC1/CTC1's `fs`), so the bit position is resolved at compile
+/// time — only the FCSR load and the taken/not-taken branch are runtime.
+/// Despite reading FPU state, this is `OP_SPECIAL`-funct-encoded (not
+/// `OP_COP1`), matching `exec_movci`'s dispatch through the integer funct
+/// table — registered in `lookup_semantics`, not `lookup_cp1_semantics`.
+fn emit_movci(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rd = field_rd(ctx.raw);
+    let cc = (ctx.raw >> 18) & 0x7;
+    let tf = ((ctx.raw >> 16) & 0x1) != 0;
+    let bit = if cc == 0 { 23 } else { 24 + cc };
+
+    let mem = MemFlagsData::trusted();
+    let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+    let cc_bit = ctx.builder.ins().ushr_imm_s(fcsr, bit as i64);
+    let cc_value = ctx.builder.ins().band_imm_s(cc_bit, 1);
+    let want = if tf { 1 } else { 0 };
+    let taken = ctx.builder.ins().icmp_imm_s(ir::condcodes::IntCC::Equal, cc_value, want);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    emit_write_gpr(ctx, rd, rs_val);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+/// Shared body for the six register-register trap instructions (TGE/TGEU/
+/// TLT/TLTU/TEQ/TNE): compare rs against rt per `cc` and `signed`, and raise
+/// EXC_TR (via the same `emit_exception_exit` shared-infrastructure path
+/// `emit_daddi`'s overflow trap already uses — deliver_exception's Cause/
+/// EPC/Status.EXL/vector-jump side effects apply uniformly to every
+/// architectural exception, trap included, not something specific to this
+/// instruction class) when the condition holds. Mirrors `exec_tge`/
+/// `exec_tgeu`/`exec_tlt`/`exec_tltu`/`exec_teq`/`exec_tne` exactly,
+/// including that no-trap falls straight through with no other effect
+/// (these never write a register).
+fn emit_trap_rr(ctx: &mut EmitCtx, cc: IntCC) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let taken = ctx.builder.ins().icmp(cc, rs_val, rt_val);
+
+    let trap_block = ctx.builder.create_block();
+    let ok_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, trap_block, &[], ok_block, &[]);
+
+    // Cold: the trap condition holding is the rare case — these are
+    // defensive checks, not control flow real code takes routinely.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_TR);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+}
+
+fn emit_tge(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::SignedGreaterThanOrEqual); }
+fn emit_tgeu(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::UnsignedGreaterThanOrEqual); }
+fn emit_tlt(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::SignedLessThan); }
+fn emit_tltu(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::UnsignedLessThan); }
+fn emit_teq(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::Equal); }
+fn emit_tne(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::NotEqual); }
+
+/// Shared body for the six REGIMM trap-immediate instructions (TGEI/TGEIU/
+/// TLTI/TLTIU/TEQI/TNEI): compare rs against sign-extended imm16 per `cc`,
+/// raise EXC_TR when it holds. Mirrors `exec_tgei`/`exec_tgeiu`/`exec_tlti`/
+/// `exec_tltiu`/`exec_teqi`/`exec_tnei` — note the immediate is always
+/// sign-extended even for the "unsigned" comparisons (`DecodedInstr::immu64`
+/// and `imms64` are identical; only the *comparison* is unsigned for TGEIU/
+/// TLTIU, not the immediate's sign-extension), matching `field_imm16_sext`
+/// here.
+fn emit_trap_ri(ctx: &mut EmitCtx, cc: IntCC) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let taken = ctx.builder.ins().icmp(cc, rs_val, imm);
+
+    let trap_block = ctx.builder.create_block();
+    let ok_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, trap_block, &[], ok_block, &[]);
+
+    // Cold: the trap condition holding is the rare case — see emit_trap_rr's
+    // sibling comment.
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_TR);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+}
+
+fn emit_tgei(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::SignedGreaterThanOrEqual); }
+fn emit_tgeiu(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::UnsignedGreaterThanOrEqual); }
+fn emit_tlti(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::SignedLessThan); }
+fn emit_tltiu(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::UnsignedLessThan); }
+fn emit_teqi(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::Equal); }
+fn emit_tnei(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::NotEqual); }
+
+/// SYNC/PREF/PREFX: no-ops on this emulator (no weak memory model to fence,
+/// no prefetch cache to hint) — mirrors whatever the interpreter does for
+/// these (nothing architecturally observable). Registered purely so
+/// `has_emitter` stops excluding them and they stop being region boundaries.
+fn emit_nop(_ctx: &mut EmitCtx) {}
+
+/// Look up the semantics emitter for a decoded instruction word, or `None`
+/// if this instruction isn't wired up yet. `None` here is a codegen gap, not
+/// an architectural exclusion — those are `analyzer::Classify::Excluded` and
+/// never reach codegen at all (§4.4). Callers (`compile_region`) should
+/// treat `None` as "can't compile this region" (deny/reject), not panic —
+/// the instruction set is being filled in incrementally.
+fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
+    use crate::mips_isa::*;
+    let op = (raw >> 26) & 0x3F;
+    let funct = raw & 0x3F;
+    match op {
+        OP_SPECIAL => match funct {
+            FUNCT_ADD => Some(emit_add),
+            FUNCT_ADDU => Some(emit_addu),
+            FUNCT_SUB => Some(emit_sub),
+            FUNCT_SUBU => Some(emit_subu),
+            FUNCT_AND => Some(emit_and),
+            FUNCT_OR => Some(emit_or),
+            FUNCT_XOR => Some(emit_xor),
+            FUNCT_NOR => Some(emit_nor),
+            FUNCT_SLT => Some(emit_slt),
+            FUNCT_SLTU => Some(emit_sltu),
+            FUNCT_SLL => Some(emit_sll),
+            FUNCT_SRL => Some(emit_srl),
+            FUNCT_SRA => Some(emit_sra),
+            FUNCT_SLLV => Some(emit_sllv),
+            FUNCT_SRLV => Some(emit_srlv),
+            FUNCT_SRAV => Some(emit_srav),
+            FUNCT_MFHI => Some(emit_mfhi),
+            FUNCT_MTHI => Some(emit_mthi),
+            FUNCT_MFLO => Some(emit_mflo),
+            FUNCT_MTLO => Some(emit_mtlo),
+            FUNCT_MULT => Some(emit_mult),
+            FUNCT_MULTU => Some(emit_multu),
+            FUNCT_DIV => Some(emit_div),
+            FUNCT_DIVU => Some(emit_divu),
+            FUNCT_DMULT => Some(emit_dmult),
+            FUNCT_DMULTU => Some(emit_dmultu),
+            FUNCT_DDIV => Some(emit_ddiv),
+            FUNCT_DDIVU => Some(emit_ddivu),
+            FUNCT_DADD => Some(emit_dadd),
+            FUNCT_DADDU => Some(emit_daddu),
+            FUNCT_DSUB => Some(emit_dsub),
+            FUNCT_DSUBU => Some(emit_dsubu),
+            FUNCT_DSLL => Some(emit_dsll),
+            FUNCT_DSRL => Some(emit_dsrl),
+            FUNCT_DSRA => Some(emit_dsra),
+            FUNCT_DSLL32 => Some(emit_dsll32),
+            FUNCT_DSRL32 => Some(emit_dsrl32),
+            FUNCT_DSRA32 => Some(emit_dsra32),
+            FUNCT_DSLLV => Some(emit_dsllv),
+            FUNCT_DSRLV => Some(emit_dsrlv),
+            FUNCT_DSRAV => Some(emit_dsrav),
+            FUNCT_MOVZ => Some(emit_movz),
+            FUNCT_MOVN => Some(emit_movn),
+            FUNCT_MOVCI => Some(emit_movci),
+            FUNCT_TGE => Some(emit_tge),
+            FUNCT_TGEU => Some(emit_tgeu),
+            FUNCT_TLT => Some(emit_tlt),
+            FUNCT_TLTU => Some(emit_tltu),
+            FUNCT_TEQ => Some(emit_teq),
+            FUNCT_TNE => Some(emit_tne),
+            FUNCT_SYNC => Some(emit_nop),
+            _ => None,
+        },
+        OP_REGIMM => match (raw >> 16) & 0x1F {
+            RT_TGEI => Some(emit_tgei),
+            RT_TGEIU => Some(emit_tgeiu),
+            RT_TLTI => Some(emit_tlti),
+            RT_TLTIU => Some(emit_tltiu),
+            RT_TEQI => Some(emit_teqi),
+            RT_TNEI => Some(emit_tnei),
+            _ => None,
+        },
+        OP_PREF => Some(emit_nop),
+        OP_ADDI => Some(emit_addi),
+        OP_ADDIU => Some(emit_addiu),
+        OP_DADDI => Some(emit_daddi),
+        OP_SLTI => Some(emit_slti),
+        OP_SLTIU => Some(emit_sltiu),
+        OP_ANDI => Some(emit_andi),
+        OP_ORI => Some(emit_ori),
+        OP_XORI => Some(emit_xori),
+        OP_LUI => Some(emit_lui),
+        OP_LB => Some(emit_lb),
+        OP_LBU => Some(emit_lbu),
+        OP_LH => Some(emit_lh),
+        OP_LHU => Some(emit_lhu),
+        OP_LW => Some(emit_lw),
+        OP_LWU => Some(emit_lwu),
+        OP_LD => Some(emit_ld),
+        OP_LWL => Some(emit_lwl),
+        OP_LWR => Some(emit_lwr),
+        OP_LDL => Some(emit_ldl),
+        OP_LDR => Some(emit_ldr),
+        OP_SB => Some(emit_sb),
+        OP_SH => Some(emit_sh),
+        OP_SW => Some(emit_sw),
+        OP_SD => Some(emit_sd),
+        OP_SWL => Some(emit_swl),
+        OP_SWR => Some(emit_swr),
+        OP_SDL => Some(emit_sdl),
+        OP_SDR => Some(emit_sdr),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jitv2::analyzer::Analyzer;
+    use crate::mips_isa::*;
+
+    fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
+        (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+
+    #[test]
+    fn skeleton_allocates_one_block_per_visited_instruction() {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop
+        page[1] = 0; // nop
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[3] = 0; // delay slot
+
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+        assert!(non_empty);
+        let visited_count = instrs_linear(instrs).count();
+        assert_eq!(visited_count, 4); // words 0,1,2,3
+
+        let mut instrs_owned = *instrs; // Codegen needs &mut; copy out of the analyzer's borrow
+
+        let mut codegen = Codegen::new();
+        let skeleton = codegen.build_block_skeleton(&mut instrs_owned, 0);
+
+        assert_eq!(skeleton.instr_blocks.len(), visited_count);
+        // Every visited word offset has a corresponding block.
+        for word in [0u16, 1, 2, 3] {
+            assert!(skeleton.instr_blocks.iter().any(|&(w, _)| w == word), "missing block for word {}", word);
+        }
+        // block_id was written back into the buffer for every visited instruction.
+        for instr in instrs_linear(&instrs_owned) {
+            assert!(instr.block_id.is_some(), "word {} missing block_id after skeleton pass", instr.word);
+        }
+    }
+
+    #[test]
+    fn skeleton_entry_block_targets_the_entry_word_block() {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        // Straight-line region starting at word 2 (simulate a non-zero entry).
+        page[2] = 0;
+        page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[4] = 0;
+
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, 2, 0);
+        assert!(non_empty);
+        let mut instrs_owned = *instrs;
+
+        let mut codegen = Codegen::new();
+        let skeleton = codegen.build_block_skeleton(&mut instrs_owned, 2);
+
+        let entry_word_block_id = instrs_owned[2].block_id.expect("entry word must have a block");
+        // The skeleton's instr_blocks entry for word 2 must be the same block
+        // the entry_block jumps to (verified indirectly: both come from the
+        // same allocation, so their raw ids must match).
+        let (_, block_for_word_2) = skeleton.instr_blocks.iter().find(|&&(w, _)| w == 2).unwrap();
+        assert_eq!(block_for_word_2.as_u32(), entry_word_block_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "entry_word must be a visited offset")]
+    fn skeleton_panics_if_entry_word_was_never_visited() {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop
+        page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // region ends here
+        page[2] = 0; // delay slot
+        // word 999 is well past the region and never reached.
+        let mut analyzer = Analyzer::new();
+        let (instrs, _) = analyzer.walk(&page, 0, 0);
+        let mut instrs_owned = *instrs;
+        let mut codegen = Codegen::new();
+        codegen.build_block_skeleton(&mut instrs_owned, 999);
+    }
+
+    /// Compile a standalone function of the form:
+    ///   entry_block: jump to preamble_block
+    ///   preamble_block: emit(word_offset) then `return EXEC_COMPLETE`
+    ///   exit_block: the shared bail target (built the same way
+    ///               build_block_skeleton builds it)
+    /// and return it as a callable `JitFn`. Exercises a preamble emitter
+    /// end-to-end (real generated code including the shared exit block, not
+    /// just IR construction) without needing the rest of the per-instruction
+    /// emission pipeline, which doesn't exist yet.
+    fn compile_preamble_only(
+        name: &str,
+        emit: impl FnOnce(&mut EmitCtx, Block, WordOffset),
+        word_offset: WordOffset,
+    ) -> crate::jitv2::JitFn {
+        use crate::mips_exec::EXEC_COMPLETE;
+
+        let mut codegen = Codegen::new();
+        codegen.ctx.func.signature = codegen.jit_fn_signature();
+        codegen.ctx.func.name = ir::UserFuncName::user(0, 0);
+
+        let func_id = codegen.module
+            .declare_function(name, cranelift_module::Linkage::Local, &codegen.ctx.func.signature)
+            .unwrap();
+
+        {
+            let mut builder = FunctionBuilder::new(&mut codegen.ctx.func, &mut codegen.builder_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            let core_ptr = builder.block_params(entry_block)[0];
+
+            // Shared exit block, built the same way build_block_skeleton does.
+            let exit_block = builder.create_block();
+            let ptr_ty = builder.func.signature.params[0].value_type;
+            let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
+            let exit_word_offset = builder.append_block_param(exit_block, ir::types::I64);
+
+            // Shared exception-exit machinery: constructed for EmitCtx's sake
+            // (both preamble emitters this harness exercises, emit_ip7_preamble
+            // and emit_pending_interrupt_preamble, only ever call emit_bail,
+            // never emit_exception_exit) but never actually jumped to here —
+            // still needs real, sealed blocks with valid bodies or the
+            // verifier rejects the dangling references at finalize() time.
+            let exception_call_block = builder.create_block();
+            let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
+            let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
+
+            let exception_other_word_block = builder.create_block();
+            let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
+            let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
+            let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
+            let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
+
+            let exception_entry_word_block = builder.create_block();
+            let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
+            let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
+
+            {
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+                emit(&mut ctx, exit_block, word_offset);
+            }
+            // Not-fired/not-pending path continues here (the preamble leaves
+            // the builder positioned in its continuation block, already sealed).
+            let status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+            builder.ins().return_(&[status]);
+            builder.seal_block(entry_block);
+
+            builder.switch_to_block(exit_block);
+            emit_exit_block_body(&mut builder, exit_core_ptr, exit_word_offset);
+            builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
+
+            builder.switch_to_block(exception_call_block);
+            emit_exception_call_block_body(&mut codegen.module, &mut builder, call_core_ptr, call_status_param);
+
+            builder.switch_to_block(exception_other_word_block);
+            emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
+
+            builder.switch_to_block(exception_entry_word_block);
+            emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
+
+            // Sealed together, after every predecessor edge into any of the
+            // three (the two outer stages' jumps into exception_call_block,
+            // above) has been emitted — never actually jumped to *into* from
+            // outside this trio in this harness, but exception_call_block's
+            // own in-trio predecessors must still be established first.
+            builder.seal_block(exception_call_block);
+            builder.seal_block(exception_other_word_block);
+            builder.seal_block(exception_entry_word_block);
+
+            builder.finalize(codegen.module.target_config());
+        }
+
+        codegen.module.define_function(func_id, &mut codegen.ctx).unwrap();
+        codegen.module.clear_context(&mut codegen.ctx);
+        codegen.module.finalize_definitions().unwrap();
+        let code_ptr = codegen.module.get_finalized_function(func_id);
+        // Leak the module so the JIT-compiled code stays valid for the
+        // caller — fine for a test, mirrors what a long-lived Codegen would
+        // do (code lives as long as the module, which normally lives for
+        // the compile thread's whole run).
+        std::mem::forget(codegen.module);
+        unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }
+    }
+
+    #[test]
+    fn ip7_preamble_advances_count_when_not_fired() {
+        let jit_fn = compile_preamble_only("test_ip7_not_fired", emit_ip7_preamble, 5);
+        let mut core = MipsCore::new();
+        core.pc = 0xFFFFFFFF_80001000; // vbase = 0x...81000... masked to page
+        core.cp0_count = 1000;
+        core.count_step = 100;
+        core.cp0_compare = 1_000_000; // far away — won't fire
+        let orig_pc = core.pc;
+
+        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+
+        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(core.cp0_count, 1100, "count_step must be committed when the timer doesn't fire");
+        assert_eq!(core.pc, orig_pc, "pc must be untouched on the not-fired path");
+    }
+
+    #[test]
+    fn ip7_preamble_exits_with_retry_pc_when_fired() {
+        let word_offset: WordOffset = 5;
+        let jit_fn = compile_preamble_only("test_ip7_fired", emit_ip7_preamble, word_offset);
+        let mut core = MipsCore::new();
+        core.pc = 0xFFFFFFFF_80001000;
+        core.cp0_count = 1000;
+        core.count_step = 100;
+        core.cp0_compare = 1050; // cp0_compare - prev (50) <= count_step (100) -> fires
+
+        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+
+        assert_eq!(status, EXEC_COMPLETE);
+        assert_eq!(core.cp0_count, 1000, "cp0_count update must be abandoned when the timer fires");
+        let expected_vbase = core.pc & !(PAGE_SIZE as u64 - 1);
+        // core.pc was overwritten by the JIT call; recompute vbase from the
+        // ORIGINAL page (0x80001000's page) since that's what should have
+        // been used — re-derive independently for the assertion.
+        let orig_vbase = 0xFFFFFFFF_80001000u64 & !(PAGE_SIZE as u64 - 1);
+        assert_eq!(expected_vbase, orig_vbase);
+        assert_eq!(core.pc, orig_vbase | ((word_offset as u64) * 4),
+            "pc must be set to this instruction's own address for the interpreter to retry");
+    }
+
+    #[test]
+    fn pending_preamble_continues_when_nothing_pending() {
+        let jit_fn = compile_preamble_only("test_pending_none", emit_pending_interrupt_preamble, 7);
+        let mut core = MipsCore::new();
+        core.pc = 0xFFFFFFFF_80002000;
+        core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        let orig_pc = core.pc;
+
+        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+
+        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(core.pc, orig_pc, "pc must be untouched when nothing is pending");
+    }
+
+    #[test]
+    fn pending_preamble_exits_with_retry_pc_when_pending() {
+        let word_offset: WordOffset = 7;
+        let jit_fn = compile_preamble_only("test_pending_some", emit_pending_interrupt_preamble, word_offset);
+        let mut core = MipsCore::new();
+        core.pc = 0xFFFFFFFF_80002000;
+        core.hot.interrupts.store(1 << 10, std::sync::atomic::Ordering::Relaxed); // some arbitrary nonzero bit
+
+        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+
+        assert_eq!(status, EXEC_COMPLETE);
+        let orig_vbase = 0xFFFFFFFF_80002000u64 & !(PAGE_SIZE as u64 - 1);
+        assert_eq!(core.pc, orig_vbase | ((word_offset as u64) * 4),
+            "pc must be set to this instruction's own address for the interpreter to retry");
+    }
+
+    /// Compile `emit_round_to_int_mode` as a standalone `fn(f64, i8) -> i64`
+    /// (returning the result's raw bits — `extern "C" fn(..) -> f64` return
+    /// values are fine too, but bits make bit-exact comparison in the test
+    /// unambiguous, e.g. for -0.0) bypassing the `*mut MipsCore` calling
+    /// convention entirely, so it can be unit-tested directly against
+    /// `mips_exec.rs`'s `round_f64_to_int_mode` without needing a full
+    /// CVT.W.D instruction dispatch.
+    fn compile_round_to_int_mode_f64() -> extern "C" fn(f64, i8) -> i64 {
+        let mut codegen = Codegen::new();
+        let mut sig = codegen.module.make_signature();
+        sig.params.push(AbiParam::new(ir::types::F64));
+        sig.params.push(AbiParam::new(ir::types::I8));
+        sig.returns.push(AbiParam::new(ir::types::I64));
+        codegen.ctx.func.signature = sig;
+        codegen.ctx.func.name = ir::UserFuncName::user(0, 0);
+
+        let func_id = codegen.module
+            .declare_function("test_round_to_int_mode_f64", cranelift_module::Linkage::Local, &codegen.ctx.func.signature)
+            .unwrap();
+
+        {
+            let mut builder = FunctionBuilder::new(&mut codegen.ctx.func, &mut codegen.builder_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            let x = builder.block_params(entry_block)[0];
+            let rm = builder.block_params(entry_block)[1];
+            let result = emit_round_to_int_mode(&mut builder, x, rm);
+            let bits = builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+            builder.ins().return_(&[bits]);
+            builder.seal_block(entry_block);
+            builder.finalize(codegen.module.target_config());
+        }
+
+        codegen.module.define_function(func_id, &mut codegen.ctx).unwrap();
+        codegen.module.clear_context(&mut codegen.ctx);
+        codegen.module.finalize_definitions().unwrap();
+        let code_ptr = codegen.module.get_finalized_function(func_id);
+        std::mem::forget(codegen.module);
+        unsafe { std::mem::transmute::<*const u8, extern "C" fn(f64, i8) -> i64>(code_ptr) }
+    }
+
+    /// Live-boot regression: `CVT.W.D $f10, $f10` on `-0.9757914543151855`
+    /// under FCSR.RM=0 diverged jit=0 vs interp=-1 (correct: -1, since |x| is
+    /// closer to 1 than 0). Root cause: `emit_round_to_int_mode` used
+    /// `bnot` (bitwise NOT) on several Cranelift `icmp`-produced boolean
+    /// `Value`s expecting logical negation — Cranelift booleans are encoded
+    /// as plain `0`/`1` (not all-ones/all-zeros), so `bnot(1) = 0xFE`, which
+    /// is *truthy* in a later `select`, silently flipping the wrong branch
+    /// for exactly the `exp < 0` (magnitude < 1.0) regime this test's value
+    /// falls into. Fixed by replacing every boolean negation with
+    /// `icmp_imm(Equal, v, 0)` instead of `bnot(v)` (kept `bnot` only for
+    /// its two genuine bitwise-NOT uses: `not_frac_mask`, a real bitmask,
+    /// and `emit_nor`, MIPS's actual NOR instruction). Isolates the
+    /// primitive directly (bypassing full CVT.W.D dispatch) so a future
+    /// regression here doesn't need re-deriving this whole investigation.
+    #[test]
+    fn round_to_int_mode_f64_matches_interpreter_primitive() {
+        let f = compile_round_to_int_mode_f64();
+        let cases: [(f64, i8); 16] = [
+            (-0.9757914543151855, 0),
+            (0.9757914543151855, 0),
+            (-0.6, 0), (0.6, 0),
+            (-0.6, 1), (0.6, 1),
+            (-0.6, 2), (0.6, 2),
+            (-0.6, 3), (0.6, 3),
+            (-0.5, 0), (0.5, 0),
+            (-0.3, 0), (0.3, 0),
+            (-0.3, 2), (0.3, 3),
+        ];
+        for (x, rm) in cases {
+            let jit_result = f64::from_bits(f(x, rm) as u64);
+            let interp_result = crate::mips_exec::round_f64_to_int_mode(x, rm as u8);
+            assert_eq!(jit_result, interp_result, "round_to_int_mode({x}, rm={rm}): jit={jit_result} interp={interp_result}");
+        }
+    }
+}

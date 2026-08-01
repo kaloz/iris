@@ -150,6 +150,17 @@ pub trait BusDevice: Send + Sync {
         }
         BUS_OK
     }
+
+    /// JIT v2 (rules/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
+    /// for the 4KB physical page containing `addr`, or null if this device doesn't
+    /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
+    /// page, bumped on every mutation to that page; ROM devices may point every
+    /// page at a single counter that is never bumped (content is immutable).
+    /// The pointer is valid for the lifetime of the device.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        std::ptr::null()
+    }
 }
 
 pub trait FifoDevice: Send + Sync {

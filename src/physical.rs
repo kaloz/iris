@@ -774,4 +774,11 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         unsafe { (*device_ptr).dma_write64(addr, val) }
     }
+
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).gen_ptr(addr) }
+    }
 }

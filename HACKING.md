@@ -194,7 +194,44 @@ address translation (TLB + segment mapping), alignment checking, and cache simul
 
 ---
 
-## 7. Building & Debugging
+## 7. JIT v2 (`--features jitv2`) — experimental
+
+Not a port of the JIT in §6/README — a new design (`src/jitv2/`) built on
+different principles. The original JIT is speculative and tiered, with
+rollback for when compiled code turns out wrong; v2 deletes that failure
+mode by construction instead: whole physical-page regions (not single basic
+blocks) compiled via Cranelift, memory-resident registers, no speculation —
+unconditionally correct at publish time or not published at all. Full design
+rationale, the analyzer/codegen block-emission model, and the delay-slot/
+exception materialization rules live in `rules/jitv2/jit-v2-design.md` —
+read that before touching `analyzer.rs`/`codegen.rs`.
+`rules/jitv2/codegen-gotchas.md` has accumulated Cranelift-specific footguns
+found the hard way.
+
+Enabled automatically at runtime once compiled in — no env var gate like the
+older `jit`. Tuned via the `j2` monitor console command, not build-time flags:
+
+| Command | Effect | Default (release / `developer`) |
+|---|---|---|
+| `j2 opt [none\|speed]` | Cranelift opt level, takes effect on next flush | `speed` / `none` |
+| `j2 min-instrs [N]` | minimum head instructions in a region before it's compiled | `2` / `1` |
+| `j2 min-calls [N]` | dispatch count before a hot entry is scheduled to compile | `4` / `0` |
+| `j2 batch [on\|off]` | batch multiple compiles per host page before finalizing | `on` / `off` |
+| `j2 inline [on\|off]` | compile synchronously inline vs. on the async compile thread | `off` |
+| `j2 dispatch [on\|off]` | master switch for the jitv2 dispatch gate (off = interpreter-only) | `on` |
+| `j2 lockstep [<alu\|branch\|loadstore\|fpu>] [on\|off]` | shadow-compile-and-compare a class against the interpreter (needs `jitv2_lockstep` feature) | off |
+| `j2 flush` | drop all compiled code and reset the arena (stop the CPU first) | — |
+| `j2 status` (alias `j2 stats`) | arena usage, compile counts, reject reasons | — |
+| `j2 pcp` | physical code page introspection | — |
+
+`developer` builds default every knob toward "compile and see everything"
+(no instruction-count/call-count floor, unoptimized Cranelift output, no
+batching) since that's what you want while chasing a codegen bug; release
+builds default toward throughput.
+
+---
+
+## 8. Building & Debugging
 
 Normal build:
 ```
@@ -216,7 +253,7 @@ Serial ports are on 8880 (port A) and 8881 (port B / IRIX serial terminal).
 
 ---
 
-## 8. GDB Stub
+## 9. GDB Stub
 
 Iris includes a GDB Remote Serial Protocol stub (`src/gdb_stub.rs`) that lets you
 connect GDB to the running emulator and debug IRIX/guest code with a real debugger.
@@ -357,7 +394,7 @@ override, no cache side-effects, no breakpoints triggered).
 
 ---
 
-## 9. Reference
+## 10. Reference
 
 - SGI Indy hardware manuals see docs/
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)

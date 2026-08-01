@@ -1,7 +1,12 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "jitv2")]
+use std::sync::atomic::AtomicU64;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR, Resettable};
+
+#[cfg(feature = "jitv2")]
+const JITV2_PAGE_SIZE: usize = crate::jitv2::jitv2::PAGE_SIZE as usize;
 
 /// Memory Module with direct word access
 ///
@@ -24,6 +29,11 @@ pub struct Memory {
     /// Byte mask applied to addr for indexing. Initialized to mem_size_bytes-1.
     /// Always kept masked to mem_size_bytes-1 so it can never exceed the buffer.
     addr_mask: u32,
+    /// JIT v2: one generation counter per 4KB physical page (rules/jitv2/jit-v2-design.md
+    /// §2.4, §7). Bumped atomically on every write to that page. A compiled artifact for
+    /// a page is valid iff its recorded generation still matches this counter (§4.1, §6.5).
+    #[cfg(feature = "jitv2")]
+    gen: Vec<AtomicU64>,
 }
 
 // Safety: Memory is safe to share across threads because access is controlled
@@ -43,7 +53,31 @@ impl Memory {
             data: UnsafeCell::new(vec![0u32; size_words]),
             size_words,
             addr_mask: (size_bytes - 1) as u32,
+            #[cfg(feature = "jitv2")]
+            gen: (0..size_bytes.div_ceil(JITV2_PAGE_SIZE)).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    /// JIT v2: bump the generation counter for the page containing `addr` (post-mask).
+    /// Must be called on every mutating access so a compiled artifact can detect
+    /// staleness (rules/jitv2/jit-v2-design.md §7 — "gen bumps ride on the RAM write").
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn bump_gen(&self, addr: u32) {
+        let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
+        // Relaxed: the publish-side gen re-check (§6.5) re-reads this counter after its
+        // own release fetch_or on entry_bits, so ordering is provided there, not here.
+        self.gen[page].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// JIT v2: raw pointer to the generation counter for the page containing `addr`.
+    /// Used to populate `PhysicalCodePage::gen` (see src/jitv2/jitv2.rs). The pointer
+    /// is valid for the lifetime of `&self` (the `gen` vec is never resized after `new`).
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    pub fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+        let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
+        &self.gen[page] as *const AtomicU64
     }
 
     /// Set a new address mask. The provided mask is AND-ed with `mem_size_bytes-1`
@@ -99,6 +133,19 @@ impl Memory {
         let data = unsafe { self.data() };
         let n = src.len().min(data.len());
         data[..n].copy_from_slice(&src[..n]);
+        // JIT v2 (§7.1 channel 4, §7.6): snapshot restore/rollback mutates RAM
+        // out from under any compiled artifact regardless of content equality.
+        #[cfg(feature = "jitv2")]
+        self.bump_gen_all();
+    }
+
+    /// JIT v2: bump every page's generation counter. Used by whole-buffer mutations
+    /// (restore, power-on) where per-page cursoring isn't worth the bookkeeping.
+    #[cfg(feature = "jitv2")]
+    fn bump_gen_all(&self) {
+        for g in &self.gen {
+            g.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -106,6 +153,8 @@ impl Resettable for Memory {
     fn power_on(&self) {
         let data = unsafe { self.data() };
         data.fill(0);
+        #[cfg(feature = "jitv2")]
+        self.bump_gen_all();
     }
 }
 
@@ -128,8 +177,10 @@ impl BusDevice for Memory {
             let byte_ptr = data.as_mut_ptr() as *mut u8;
             let offset = (addr & self.addr_mask) as usize;
             *byte_ptr.add(offset ^ 3) = val;
-            BUS_OK
         }
+        #[cfg(feature = "jitv2")]
+        self.bump_gen(addr);
+        BUS_OK
     }
 
     #[inline(always)]
@@ -150,8 +201,10 @@ impl BusDevice for Memory {
             let half_ptr = data.as_mut_ptr() as *mut u16;
             let offset = ((addr & self.addr_mask) >> 1) as usize;
             *half_ptr.add(offset ^ 1) = val;
-            BUS_OK
         }
+        #[cfg(feature = "jitv2")]
+        self.bump_gen(addr);
+        BUS_OK
     }
 
     #[inline(always)]
@@ -169,8 +222,10 @@ impl BusDevice for Memory {
             let data = self.data();
             let idx = ((addr & self.addr_mask) >> 2) as usize;
             *data.get_unchecked_mut(idx) = val;
-            BUS_OK
         }
+        #[cfg(feature = "jitv2")]
+        self.bump_gen(addr);
+        BUS_OK
     }
 
     #[inline(always)]
@@ -191,8 +246,10 @@ impl BusDevice for Memory {
             let qword_ptr = data.as_mut_ptr() as *mut u64;
             let offset = ((addr & self.addr_mask) >> 3) as usize;
             *qword_ptr.add(offset) = val.rotate_left(32);
-            BUS_OK
         }
+        #[cfg(feature = "jitv2")]
+        self.bump_gen(addr);
+        BUS_OK
     }
 
     #[inline]
@@ -227,6 +284,27 @@ impl BusDevice for Memory {
                 *qword_ptr.add(offset + i) = val.rotate_left(32);
             }
         }
+        // JIT v2: per-page write cursor (§7.2) — bump gen once per page touched by
+        // this DMA-style block write, not once per qword.
+        #[cfg(feature = "jitv2")]
+        {
+            let start_page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
+            let last_byte = addr.wrapping_add(((buf.len().max(1) - 1) as u32) * 8);
+            let end_page = ((last_byte & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
+            if end_page >= start_page {
+                for page in start_page..=end_page {
+                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // Wrapped around addr_mask: bump the two remaining spans.
+                for page in start_page..self.gen.len() {
+                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                }
+                for page in 0..=end_page {
+                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         BUS_OK
     }
 
@@ -242,8 +320,16 @@ impl BusDevice for Memory {
             let new_val = val.rotate_left(32);
             let new_mask = mask.rotate_left(32);
             *stored = (old & !new_mask) | (new_val & new_mask);
-            BUS_OK
         }
+        #[cfg(feature = "jitv2")]
+        self.bump_gen(addr);
+        BUS_OK
+    }
+
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+        Memory::gen_ptr(self, addr)
     }
 }
 
@@ -291,6 +377,11 @@ impl BusDevice for Arc<Memory> {
 
     fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
         (**self).write_block(addr, buf)
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+        (**self).gen_ptr(addr)
     }
 }
 
@@ -427,5 +518,47 @@ mod tests {
         // Spot-check a word inside the bank.
         let v = m.read32(0).data;
         assert_eq!(v, 0);
+    }
+
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn write_bumps_page_generation_only_for_touched_page() {
+        let m = Memory::new(1); // 1 MB = 256 pages of 4KB
+        let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+
+        m.write32(0, 0x1234); // page 0 only
+
+        let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        assert_eq!(gen0_after, gen0_before + 1, "written page must bump gen");
+        assert_eq!(gen1_after, gen1_before, "untouched page must not bump gen");
+    }
+
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn read_does_not_bump_generation() {
+        let m = Memory::new(1);
+        let before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let _ = m.read32(0);
+        let after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        assert_eq!(before, after);
+    }
+
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn write_block_bumps_every_page_it_spans() {
+        let m = Memory::new(1);
+        // Straddle the page-0/page-1 boundary: last qword lands in page 1.
+        let start = (JITV2_PAGE_SIZE - 8) as u32;
+        let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+
+        m.write_block(start, &[0u64, 0u64]);
+
+        let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        assert_eq!(gen0_after, gen0_before + 1);
+        assert_eq!(gen1_after, gen1_before + 1);
     }
 }

@@ -47,7 +47,7 @@ pub fn emulator_name() -> &'static str {
             return "Irresponsible Rust IRIX Simulator".to_string();
         }
 
-        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable"];
+        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable", "Irresistible"];
         let thirds = ["IRIX", "Indy", "Iris"];
         let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
 
@@ -128,6 +128,46 @@ struct RollbackCheckpoint {
     rtc: toml::Value,
     eeprom: toml::Value,
     scsi: toml::Value,
+    seeq: toml::Value,
+    hpc3: toml::Value,
+    rex3: Option<toml::Value>,
+    rex3_head1: Option<toml::Value>,
+}
+
+/// Full-machine in-memory checkpoint captured from *live* running state
+/// (unlike `RollbackCheckpoint`, which is specifically "the state right
+/// after the most recent `ci_restore` from a named snapshot on disk" and
+/// re-reads that snapshot's `cow.toml` to reflink SCSI overlays back into
+/// place on rollback). Used by the interactive monitor's `j2 trace <n>` /
+/// `j2 replay` (`SystemController::execute_command`) to get a real,
+/// byte-exact rewind point — including device state, not just CPU
+/// registers — for comparing an interpreter-only reference run against a
+/// real-JIT-dispatch run of the same instruction window.
+///
+/// Deliberately does **not** capture SCSI controller or COW-overlay dirty-
+/// sector state — there is no "just loaded from snapshot X" name to
+/// reference here (this captures live, mid-session state, not a disk
+/// snapshot restore), and building a live-capture equivalent of
+/// `RollbackCheckpoint`'s overlay handling is real, correctness-sensitive
+/// work (get it wrong and it's disk corruption, not just a debugging
+/// inconvenience) that early-boot PROM debugging — the actual motivating
+/// use case — doesn't need at all (PROM hasn't touched SCSI yet). Restoring
+/// a `LiveCheckpoint` taken after the guest has performed real disk I/O
+/// will silently leave SCSI/disk state at whatever it drifted to during the
+/// replayed window, not rewound — safe for CPU/JIT correctness comparisons
+/// (nothing here reads disk contents), unsafe to treat as a general
+/// save-state substitute once boot reaches real disk access.
+pub(crate) struct LiveCheckpoint {
+    bank_words: [Vec<u32>; 4],
+    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+    cpu: toml::Value,
+    mc: toml::Value,
+    ioc: toml::Value,
+    scc: toml::Value,
+    pit: toml::Value,
+    ps2: toml::Value,
+    rtc: toml::Value,
+    eeprom: toml::Value,
     seeq: toml::Value,
     hpc3: toml::Value,
     rex3: Option<toml::Value>,
@@ -578,6 +618,31 @@ impl Machine {
         if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
 
+        // Inject the CPU/self handles jitv2's compile-thread worker needs to
+        // pause the CPU around its own memory-growth flush (see
+        // `Jitv2::codegen`/`CompileQueue`'s doc comments — the CPU doesn't
+        // exist yet when `MipsExecutor::new` constructs its own `Jitv2`
+        // default, so this can only happen here, after `Arc::new(MipsCpu::new(..))`,
+        // same reasoning as `mc.set_cpu` right above).
+        #[cfg(feature = "jitv2")]
+        {
+            let jit = cpu.jitv2();
+            jit.lock().compile_queue.set_cpu(Arc::downgrade(&cpu_device));
+            jit.lock().compile_queue.set_owner(Arc::downgrade(&jit));
+            // Threaded compile is the default (`MipsExecutor::jitv2_inline_compile`
+            // starts `false`) — the queue must actually be running or every
+            // compile request silently vanishes (send()s into a consumer
+            // nothing is popping). `j2 inline on` reverses this later by
+            // stopping the queue and reclaiming its Codegen for the inline
+            // path (see that command's own handler).
+            let mut guard = jit.lock();
+            let codegen = guard.codegen.get_mut().take()
+                .expect("Machine::new: Jitv2::codegen must be Some before the compile queue has ever started");
+            let stats = guard.stats.clone();
+            let bus: Arc<dyn BusDevice> = phys.clone();
+            guard.compile_queue.start(bus, codegen, stats);
+        }
+
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
 
@@ -1004,6 +1069,50 @@ impl Machine {
         self.cpu.state_digest()
     }
 
+    /// Step exactly one architectural instruction and return how many
+    /// `step()` retired (usually 1; can be 2+ under real JIT dispatch — see
+    /// `MipsCpu::step_one_inline_counting_instructions`'s doc comment).
+    #[cfg(feature = "developer")]
+    pub fn cpu_step_one_inline_counting_instructions(&self) -> Result<usize, String> {
+        self.cpu.step_one_inline_counting_instructions()
+    }
+
+    /// Restore CPU registers from a `CpuStateDigest` — see
+    /// `MipsCpu::restore_state_digest`'s doc comment.
+    #[cfg(feature = "developer")]
+    pub fn cpu_restore_state_digest(&self, digest: &crate::mips_exec::CpuStateDigest) -> Result<(), String> {
+        self.cpu.restore_state_digest(digest)
+    }
+
+    /// Force `cp0_count`/`count_step` to a reference digest's values — see
+    /// `MipsCpu::fixup_cp0_count`'s doc comment.
+    #[cfg(feature = "developer")]
+    pub fn cpu_fixup_cp0_count(&self, digest: &crate::mips_exec::CpuStateDigest) -> Result<(), String> {
+        self.cpu.fixup_cp0_count(digest)
+    }
+
+    /// Enable/disable real JIT dispatch at runtime; returns the previous
+    /// value. See `MipsExecutor::jitv2_dispatch_enabled`'s doc comment.
+    #[cfg(all(feature = "jitv2", feature = "developer"))]
+    pub fn cpu_set_jitv2_dispatch_enabled(&self, enabled: bool) -> Result<bool, String> {
+        self.cpu.set_jitv2_dispatch_enabled(enabled)
+    }
+
+    /// Arm/disarm `jitcheck`'s hardware-read fixup recording — see
+    /// `MipsExecutor::hw_read_fixup_recording`'s doc comment.
+    #[cfg(feature = "developer")]
+    pub fn cpu_set_hw_read_fixup_recording(&self, recording: bool) -> Result<(), String> {
+        self.cpu.set_hw_read_fixup_recording(recording)
+    }
+
+    /// Set/clear the recorded hardware-read values to substitute for the
+    /// next replay-pass step — see
+    /// `MipsExecutor::hw_read_fixup_replay`'s doc comment.
+    #[cfg(feature = "developer")]
+    pub fn cpu_set_hw_read_fixup_replay(&self, fixups: Option<Vec<(u64, u8, u64)>>) -> Result<(), String> {
+        self.cpu.set_hw_read_fixup_replay(fixups)
+    }
+
     /// Full rewind: load the named snapshot, which now captures the COW
     /// overlay too so the filesystem state is deterministic per snapshot.
     /// The CPU resumes automatically (load_snapshot restarts it). After the
@@ -1154,6 +1263,97 @@ impl Machine {
 
         self.restart_peripherals();
         self.cpu.start();
+        Ok(())
+    }
+
+    /// Capture a `LiveCheckpoint` from the machine's current running state —
+    /// see that struct's doc comment for how this differs from
+    /// `capture_rollback_checkpoint` (no SCSI/overlay capture; no on-disk
+    /// snapshot name involved at all). Leaves the whole machine stopped on
+    /// return (CPU and peripherals) — every real caller immediately follows
+    /// this with a `restore_live_checkpoint` call anyway (which restarts
+    /// peripherals itself, CPU staying parked for inline single-stepping —
+    /// see its own doc comment), so there's no need to restart anything
+    /// here just to have it stopped again a moment later.
+    pub(crate) fn capture_live_checkpoint(&mut self) -> LiveCheckpoint {
+        self.stop();
+
+        let cpu = self.cpu.save_state();
+        let mc = self.mc.save_state();
+        let ioc = self.hpc3.ioc().save_state();
+        let scc = self.hpc3.ioc().scc().save_state();
+        let pit = self.hpc3.ioc().pit().save_state();
+        let ps2 = self.hpc3.ioc().ps2().save_state();
+        let rtc = self.hpc3.rtc().save_state();
+        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
+        let seeq = self.hpc3.seeq().save_state();
+        let hpc3 = self.hpc3.save_state();
+        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
+
+        let bank_words: [Vec<u32>; 4] = [
+            self._phys.snapshot_bank_inmem(0),
+            self._phys.snapshot_bank_inmem(1),
+            self._phys.snapshot_bank_inmem(2),
+            self._phys.snapshot_bank_inmem(3),
+        ];
+
+        let framebuffers = self._phys.rex3.as_ref()
+            .map(|r| r.snapshot_framebuffers_inmem());
+
+        // Deliberately NOT restart_peripherals()/cpu.start() here — see this
+        // function's own doc comment.
+
+        LiveCheckpoint {
+            bank_words,
+            framebuffers,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1,
+        }
+    }
+
+    /// Restore a `LiveCheckpoint` captured by `capture_live_checkpoint`.
+    /// Does not touch SCSI controller state or disk contents at all — see
+    /// `LiveCheckpoint`'s doc comment. Leaves the CPU thread stopped on
+    /// return (so a caller doing its own inline single-stepping via
+    /// `cpu_step_one_inline_counting_instructions` doesn't race a
+    /// free-running CPU thread for the executor lock), but restarts
+    /// MC/HPC3/REX3 before returning — the full `self.stop()` below is only
+    /// needed transiently, to safely load device state without a live
+    /// device thread mutating it mid-load; there's no reason to leave
+    /// peripherals stopped after that's done, and every prior version of
+    /// this function that did was a real, repeatedly-hit bug (the rest of
+    /// the monitor console — symbol lookups, device register reads —
+    /// stayed unresponsive after every `jitcheck` for no reason).
+    pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
+        self.stop();
+
+        self.cpu.load_state(&cp.cpu)?;
+        self.mc.load_state(&cp.mc)?;
+        self.hpc3.ioc().load_state(&cp.ioc)?;
+        self.hpc3.ioc().scc().load_state(&cp.scc)?;
+        self.hpc3.ioc().pit().load_state(&cp.pit)?;
+        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
+        self.hpc3.rtc().load_state(&cp.rtc)?;
+        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
+        self.hpc3.seeq().load_state(&cp.seeq)?;
+        self.hpc3.load_state(&cp.hpc3)?;
+        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+            rex3.load_state(rex3_toml)?;
+        }
+        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
+            rex3.load_state(rex3_toml)?;
+        }
+
+        for (i, words) in cp.bank_words.iter().enumerate() {
+            self._phys.restore_bank_inmem(i, words);
+        }
+        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+            rex3.restore_framebuffers_inmem(rgb, aux);
+        }
+
+        // Peripherals back up; CPU deliberately left stopped — see this
+        // function's own doc comment.
+        self.restart_peripherals();
         Ok(())
     }
 
@@ -1595,6 +1795,8 @@ impl Device for SystemController {
             ("reset".to_string(),         "Reset all hardware to power-on state".to_string()),
             ("save".to_string(),          "save <name> — Save snapshot to saves/<name>/".to_string()),
             ("load".to_string(),          "load <name> — Load snapshot from saves/<name>/".to_string()),
+            #[cfg(all(feature = "jitv2", feature = "developer"))]
+            ("jitcheck".to_string(), "jitcheck <n> [skip] — capture live state, run n instructions interpreter-only vs real JIT dispatch, reconverge past the first `skip` divergences and stop at the next one [DEV]".to_string()),
         ]
     }
 
@@ -1625,6 +1827,43 @@ impl Device for SystemController {
                 let name = args.first().ok_or_else(|| "Usage: load <name>".to_string())?;
                 let _ = writeln!(writer, "Loading snapshot '{}'...", name);
                 self.with_machine(|m| m.load_snapshot(name))
+            }
+            #[cfg(all(feature = "jitv2", feature = "developer"))]
+            "jitcheck" => {
+                let n: u64 = args.first()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("Usage: jitcheck <n> [skip]".to_string())?;
+                let skip: u64 = args.get(1)
+                    .map(|s| s.parse().map_err(|_| "Usage: jitcheck <n> [skip]".to_string()))
+                    .transpose()?
+                    .unwrap_or(0);
+                let _ = writeln!(writer, "jitcheck: capturing live state, running {} instructions interpreter-only then with real JIT dispatch (skipping first {} divergence(s))...", n, skip);
+                self.with_machine(|m| {
+                    let report = crate::validate::validate_jit_determinism(m, n, skip)
+                        .map_err(|e| format!("jitcheck failed: {}", e))?;
+                    for (i, d) in report.skipped.iter().enumerate() {
+                        let _ = writeln!(writer, "jitcheck: SKIPPED divergence #{} at instruction {} of {} (pc={:#018x}), reconverged and continued", i + 1, d.instruction, n, d.replay_pc);
+                        for (field, a, b) in &d.diffs {
+                            let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
+                        }
+                    }
+                    let next_divergence_number = report.skipped.len() + 1;
+                    match &report.stopped_at {
+                        None => {
+                            let _ = writeln!(writer, "jitcheck: no further divergence across {} instructions", n);
+                            let _ = writeln!(writer, "jitcheck: CPU left stopped (peripherals still running) with the replay (JIT-dispatch) pass's final state loaded — 'start' to resume the CPU");
+                        }
+                        Some(d) => {
+                            let _ = writeln!(writer, "jitcheck: DIVERGED (divergence #{}) at instruction {} of {} (pc={:#018x})", next_divergence_number, d.instruction, n, d.replay_pc);
+                            for (field, a, b) in &d.diffs {
+                                let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
+                            }
+                            let _ = writeln!(writer, "jitcheck: rerun with skip={} to reconverge past this one too", next_divergence_number);
+                            let _ = writeln!(writer, "jitcheck: stopped immediately at the divergence — CPU left stopped exactly as the JIT-dispatch pass left it (peripherals still running, console stays live) — 'start' to resume the CPU");
+                        }
+                    }
+                    Ok(())
+                })
             }
             _ => Err(format!("Unknown command: {}", cmd)),
         }

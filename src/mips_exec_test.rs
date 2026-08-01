@@ -110,6 +110,27 @@ mod tests {
             self.set_double(aligned_addr, val);
             BUS_OK
         }
+
+        // Always null: this whole file predates jitv2 and no test here calls
+        // `install_jit_hooks` — a null gen_ptr makes every page's
+        // `PhysicalCodePage::is_compilable()` false, so every jitv2 dispatch
+        // gate variant (real, jitv2_inline_compile, jitv2_lockstep) falls
+        // straight through to the plain interpreter, unconditionally,
+        // regardless of which jitv2 feature happens to be compiled in. Only
+        // `test_r4000cache_step_sequence` wants real jitv2 dispatch — it
+        // builds its own executor with a real gen-tracking memory and calls
+        // `install_jit_hooks` explicitly instead of using this helper's
+        // `MockMemory`/`create_executor_with_r4000cache`. Without this, a
+        // jitv2 gate variant that runs unconditionally (jitv2_lockstep's
+        // lockstep_check, in particular — see rules/jitv2/codegen-gotchas.md)
+        // can compile and run a function against an executor whose
+        // `core.handle_exception_fn` was never installed, aborting the whole
+        // process the moment that function raises an exception
+        // (`jit_hooks_not_installed_exception`, `panic = "abort"`).
+        #[cfg(feature = "jitv2")]
+        fn gen_ptr(&self, _addr: u32) -> *const std::sync::atomic::AtomicU64 {
+            std::ptr::null()
+        }
     }
 
     // Helper to create executor with mock memory
@@ -2946,11 +2967,86 @@ mod tests {
         }
     }
 
+    /// Same shape as `MockMemory`, but with a real per-page gen counter
+    /// (`is_compilable() == true`) — used only by
+    /// `test_r4000cache_step_sequence`, the one test in this file that
+    /// actually wants jitv2 dispatch to fire. Every other test uses the
+    /// shared `MockMemory`, whose `gen_ptr` is always null specifically so
+    /// jitv2 never intercepts (see its doc comment).
+    #[cfg(feature = "jitv2")]
+    struct JitCapableMockMemory {
+        data: Mutex<HashMap<u64, u8>>,
+        gens: Mutex<HashMap<u32, Box<std::sync::atomic::AtomicU64>>>,
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl JitCapableMockMemory {
+        fn new() -> Self {
+            Self { data: Mutex::new(HashMap::new()), gens: Mutex::new(HashMap::new()) }
+        }
+        fn set_double(&self, addr: u64, val: u64) {
+            for (i, b) in val.to_be_bytes().iter().enumerate() {
+                self.data.lock().unwrap().insert(addr + i as u64, *b);
+            }
+        }
+        fn get_word(&self, addr: u64) -> u32 {
+            let mut bytes = [0u8; 4];
+            for i in 0..4 { bytes[i] = *self.data.lock().unwrap().get(&(addr + i as u64)).unwrap_or(&0); }
+            u32::from_be_bytes(bytes)
+        }
+        fn get_double(&self, addr: u64) -> u64 {
+            let mut bytes = [0u8; 8];
+            for i in 0..8 { bytes[i] = *self.data.lock().unwrap().get(&(addr + i as u64)).unwrap_or(&0); }
+            u64::from_be_bytes(bytes)
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl BusDevice for JitCapableMockMemory {
+        fn read8(&self, addr: u32) -> BusRead8 {
+            BusRead8::ok(*self.data.lock().unwrap().get(&(addr as u64)).unwrap_or(&0))
+        }
+        fn write8(&self, addr: u32, val: u8) -> u32 { self.data.lock().unwrap().insert(addr as u64, val); BUS_OK }
+        fn read16(&self, addr: u32) -> BusRead16 {
+            let a = (addr & !1) as u64;
+            let mut b = [0u8; 2];
+            for i in 0..2 { b[i] = *self.data.lock().unwrap().get(&(a + i as u64)).unwrap_or(&0); }
+            BusRead16::ok(u16::from_be_bytes(b))
+        }
+        fn write16(&self, addr: u32, val: u16) -> u32 {
+            let a = (addr & !1) as u64;
+            for (i, b) in val.to_be_bytes().iter().enumerate() { self.data.lock().unwrap().insert(a + i as u64, *b); }
+            BUS_OK
+        }
+        fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.get_word((addr & !3) as u64)) }
+        fn write32(&self, addr: u32, val: u32) -> u32 {
+            let a = (addr & !3) as u64;
+            for (i, b) in val.to_be_bytes().iter().enumerate() { self.data.lock().unwrap().insert(a + i as u64, *b); }
+            BUS_OK
+        }
+        fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.get_double((addr & !7) as u64)) }
+        fn write64(&self, addr: u32, val: u64) -> u32 { self.set_double((addr & !7) as u64, val); BUS_OK }
+        fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+            let page = addr / crate::jitv2::PAGE_SIZE;
+            let mut gens = self.gens.lock().unwrap();
+            let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
+            counter.as_ref() as *const std::sync::atomic::AtomicU64
+        }
+    }
+
     #[test]
+    #[cfg(feature = "jitv2")]
     fn test_r4000cache_step_sequence() {
         // Exercise the full R4000Cache path: kseg0 fetch → L2 fill → L1I fill → exec_decoded.
-        // PC 0x80000000 → phys 0x00000000 (kseg0, cacheable).
-        let (mut exec, mem) = create_executor_with_r4000cache();
+        // PC 0x80000000 → phys 0x00000000 (kseg0, cacheable). Uses
+        // JitCapableMockMemory (not the shared MockMemory) plus
+        // install_jit_hooks specifically so jitv2 dispatch is exercisable
+        // here, unlike every other test in this file.
+        let mem = Arc::new(JitCapableMockMemory::new());
+        let mem_bus: Arc<dyn BusDevice> = mem.clone();
+        let cfg = MipsCpuConfig::indy();
+        let mut exec: MipsExecutor<PassthroughTlb, R4000Cache> = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        exec.install_jit_hooks();
 
         // Write instructions into memory as big-endian u32s packed into u64 chunks.
         // Offset 0:  ADDIU r1, r0, 42

@@ -8,6 +8,7 @@ pub mod build_features {
     pub const CAMERA:    bool = cfg!(feature = "camera");
     pub const PCAP:      bool = cfg!(feature = "pcap");
     pub const JIT:       bool = cfg!(feature = "jit");
+    pub const JITV2:     bool = cfg!(feature = "jitv2");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     /// N64 development board (Ultra64 GIO card) + POSIX shm bridge to an
     /// external gopher64. The GUI gates the "Enable dev board" toggle on this.
@@ -34,6 +35,7 @@ pub mod build_features {
 
 pub mod config;
 pub mod traits;
+pub mod trace;
 #[macro_use]
 pub mod devlog;
 pub mod timer;
@@ -117,6 +119,8 @@ pub mod ultra64;
 pub mod jit;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
+#[cfg(feature = "jitv2")]
+pub mod jitv2;
 
 #[cfg(test)]
 mod platform_profile_tests;

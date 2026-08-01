@@ -150,6 +150,15 @@ impl CyclesPtr {
 /// register file) lead the struct; large, per-instruction-irrelevant CP0
 /// registers and the compare-calibration bookkeeping (only ever touched on
 /// a CP0 Compare write, not every dispatch) trail at the end.
+///
+/// `#[repr(C)]`: JIT v2 compiled code addresses fields directly via a pinned
+/// base pointer + fixed byte offset (`mov [base+disp]`, rules/jitv2/jit-v2-design.md
+/// §5 — "memory-resident registers", no copy-in/copy-out shadow struct like v1's
+/// `JitContext`). That requires deterministic, ABI-stable field layout, which
+/// `repr(Rust)` does not guarantee. Offsets must be computed via
+/// `std::mem::offset_of!` at codegen time, never hardcoded — cfg-gated fields are
+/// still fine, they just shift the layout deterministically per build.
+#[repr(C)]
 pub struct MipsCore {
     /// Interrupt-pending word and instruction/cycle counter — the two
     /// fields every other thread in the process might read on any given
@@ -186,9 +195,23 @@ pub struct MipsCore {
     pub in_delay_slot: bool,
     /// The real branch/jump target `handle_exec_complete` commits to `pc`
     /// once the pending delay slot (`in_delay_slot`) retires — set by
-    /// `MipsExecutor::branch_delay` alongside `in_delay_slot = true`. Lives
-    /// on `MipsCore` for the same reason `in_delay_slot` does: one piece of
-    /// state, one owner, no separate executor-side copy to keep in sync.
+    /// `MipsExecutor::branch_delay` alongside `in_delay_slot = true`.
+    /// Lives on `MipsCore` (not just the executor) for the same reason
+    /// `in_delay_slot` does: a delay-slot word can be JIT-compiled and
+    /// dispatched as an *ordinary* standalone entry — the interpreter having
+    /// armed `in_delay_slot`/`delay_slot_target` on the previous dispatch
+    /// has no bearing on how that word got compiled (compile_region has no
+    /// idea a given entry word might sometimes be a foreign delay slot in
+    /// flight; see `EmitCtx`'s doc comment on `entry_word`) — so a plain
+    /// entry-word compile's exit must check `in_delay_slot` at runtime and,
+    /// if set, honor `delay_slot_target` instead of its own compile-time
+    /// fallthrough word, exactly mirroring `handle_exec_complete`. Without
+    /// this being readable from JIT-compiled code, that word silently
+    /// discards the pending transfer (observed live: the IRIX PROM reset
+    /// vector's own `j realstart` — reset vector's delay-slot nop got
+    /// JIT-compiled standalone via the `entry_offset == 1` dispatch-gate
+    /// probe, in `mips_exec.rs`'s `exec_decoded` — landed on the next
+    /// sequential word instead of `realstart`).
     pub delay_slot_target: u64,
 
     // General Purpose Registers (GPRs)
@@ -212,6 +235,213 @@ pub struct MipsCore {
     /// The first element is the callback function, the second is an opaque context pointer
     /// (typically a type-erased `*mut MipsExecutor<T,C>` set by the executor after construction).
     pub status_changed_cb: Option<(fn(*mut core::ffi::c_void, u32, u32), *mut core::ffi::c_void)>,
+
+    /// JIT v2: monomorphized C-ABI memory-access and exception-delivery
+    /// hooks, installed once by `MipsExecutor::install_jit_hooks` (mirrors
+    /// `status_changed_cb`'s established pattern — a type-erased context
+    /// pointer plus free functions generated per `<T,C>` instantiation, e.g.
+    /// `translate_32_kernel::<T,C>`). Compiled code reaches all of these at
+    /// fixed `offset_of!` offsets — no vtable/trait-object call, and no
+    /// per-instantiation Cranelift codegen needed since the *pointer value*
+    /// (not the compiled code) carries the monomorphization.
+    ///
+    /// `jit_ctx` is the shared first argument to every fn below — a
+    /// type-erased `*mut MipsExecutor<T,C>`, exactly like
+    /// `status_changed_cb`'s context pointer (never derived from `&MipsCore`
+    /// itself, since `MipsCore` is not guaranteed to be `MipsExecutor`'s
+    /// first field in memory — see `install_jit_hooks`'s doc comment).
+    #[cfg(feature = "jitv2")]
+    pub jit_ctx: *mut core::ffi::c_void,
+    /// Read wrappers: return the loaded value (zero-extended to u64 for
+    /// sub-64-bit widths, matching `MipsExecutor::read_data`'s own
+    /// convention), and set `jit_mem_exc` to `EXEC_COMPLETE` (0) on success
+    /// or the fault's `ExecStatus` (`EXEC_IS_EXCEPTION` bit set) otherwise —
+    /// compiled code must check `jit_mem_exc` after every call before
+    /// trusting the returned value. A single reusable field rather than an
+    /// out-param: exactly one memory op is ever in flight per compiled unit
+    /// before the check, so nothing aliases, and this avoids a Cranelift
+    /// stack-slot alloca per access.
+    #[cfg(feature = "jitv2")]
+    pub read8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    #[cfg(feature = "jitv2")]
+    pub read16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    #[cfg(feature = "jitv2")]
+    pub read32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    #[cfg(feature = "jitv2")]
+    pub read64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    /// Write wrappers: return `EXEC_COMPLETE` (0) on success or the fault's
+    /// `ExecStatus` otherwise — the return value here doubles as
+    /// `jit_mem_exc`'s value (also mirrored into the field for symmetry with
+    /// the read path, so compiled code can use one check helper for both).
+    ///
+    /// The value parameter is `u64` for every width, not `u8`/`u16`/`u32` —
+    /// deliberately: the x86-64 SysV C ABI does not guarantee a sub-word
+    /// integer argument's upper register bits are zeroed by the caller (the
+    /// *callee* is responsible for masking if it needs a clean value), and a
+    /// hand-built `cranelift_jit::JITModule::call_indirect` signature (see
+    /// `codegen.rs`'s `emit_mem_write`) has no obligation to do so either —
+    /// only whatever's in the low N bits is meaningful. A `u8`/`u16`/`u32`-
+    /// typed parameter here previously let garbage in the unused high bits
+    /// of the argument register leak into any `val as u64` widening the
+    /// callee did (observed live: SB writing garbage-prefixed values like
+    /// `0xffffff00` instead of `0x00` — the low byte was always correct, the
+    /// upper 24 bits were uninitialized register contents). `write*_fn`'s
+    /// caller (`jit_write8`/`jit_write16`/`jit_write32`/`jit_write64` in
+    /// `mips_exec.rs`) is responsible for masking to the real width itself
+    /// before using the value, exactly like `read*_fn`'s callers already
+    /// mask/extend a full u64 return value down to the size they need.
+    #[cfg(feature = "jitv2")]
+    pub write8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub write16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub write32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub write64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u32,
+    /// Masked doubleword write for the unaligned store family (SWL/SWR/
+    /// SDL/SDR — `MipsExecutor::write_data64_masked`'s JIT-callable
+    /// equivalent): `(jit_ctx, virt_addr, val, mask)`, writes only the byte
+    /// lanes set in `mask` at the (already doubleword-aligned) `virt_addr`,
+    /// leaving the rest of that doubleword untouched. Unlike
+    /// `write8_fn`/`write16_fn`/`write32_fn` (which each address a plain,
+    /// fixed-width, natively-aligned unit), a masked write goes through a
+    /// genuinely different bus/cache path (`BusDevice::write64_masked`/
+    /// `MipsCache::write64_masked`) that can partially update a doubleword
+    /// no single plain-width write could express — SWL/SWR/SDL/SDR need
+    /// this because they write a runtime-variable byte range starting at an
+    /// unaligned address, not a fixed natural width. Returns `EXEC_COMPLETE`
+    /// (0) on success or the fault's `ExecStatus` otherwise, same
+    /// convention as `write*_fn`.
+    #[cfg(feature = "jitv2")]
+    pub write64_masked_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u32,
+    /// Single-implementation exception delivery (§4.2): identical to
+    /// `MipsExecutor::handle_exception`, callable from compiled code.
+    /// Mutates Cause/EPC/Status/pc (vectors `core.pc` to the handler) and
+    /// returns the same `status` it was given. Compiled code's exception
+    /// exit stub calls this, then returns `EXEC_COMPLETE` to the
+    /// interpreter loop — pc is already at the vector, nothing left to do.
+    #[cfg(feature = "jitv2")]
+    pub handle_exception_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32) -> u32,
+    /// Fetch, decode, and execute exactly one instruction at the current
+    /// `core.pc` through the real interpreter dispatch (`MipsExecutor::step`'s
+    /// own fetch+exec_decoded path) and return its `ExecStatus`. Exists so
+    /// compiled code can force genuine forward progress on a condition it
+    /// can't itself resolve — `emit_fpu_entry_guard`'s FR-mismatch case
+    /// (paired with `kill_entry_fn`, see that field) is the current caller:
+    /// the JIT's own bail-to-exit_block just re-sets `core.pc` back to the
+    /// same instruction and returns `EXEC_COMPLETE`, which `exec_decoded`'s
+    /// caller can't distinguish from a real retirement — if this same PC is
+    /// still published/hot, the very next dispatch calls the identical
+    /// compiled function again, which bails again, forever. Calling this
+    /// directly instead guarantees the interpreter's real semantics run for
+    /// this one instruction no matter what compiled code decided it
+    /// couldn't handle. (CU1-clear no longer routes through here — see
+    /// `emit_fpu_entry_guard`'s doc comment: it materializes the real
+    /// `EXC_CPU` exception directly via `handle_exception_fn`, the same way
+    /// every other JIT-detected fault does, since the exact exception code
+    /// is known statically and doesn't need the interpreter's help to
+    /// determine.)
+    #[cfg(feature = "jitv2")]
+    pub interp_fallback_fn: unsafe extern "C" fn(*mut core::ffi::c_void) -> u32,
+    /// Un-publish the calling compiled function's own `(page, offset)` entry
+    /// (`PhysicalCodePage::kill`) so the JIT dispatch gate stops re-selecting
+    /// it. `offset` is the entry's own word offset within its page — the
+    /// only piece of `(page, offset)` compiled code doesn't already have
+    /// another way to recover (the executor's own `self.pcp` already tracks
+    /// the live page). Paired with `interp_fallback_fn` in
+    /// `emit_fpu_entry_guard`'s FR-mismatch arm: the whole compiled unit was
+    /// built assuming a specific `STATUS_FR` value that's no longer live, so
+    /// unlike a CU1 fault (a real, opcode-independent MIPS exception —
+    /// materialized directly, no kill needed) the entire artifact is wrong,
+    /// not just this one dispatch — killing it means the next visit gets a
+    /// genuine fresh compile against whatever FR mode is actually live then,
+    /// instead of this exact same stale function being dispatched and
+    /// bailing again on every future visit.
+    #[cfg(feature = "jitv2")]
+    pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u16),
+    /// Scratch: exception status from the most recent `read*_fn`/`write*_fn`
+    /// call (`EXEC_COMPLETE` i.e. 0 = no fault). See the read-wrapper fields'
+    /// doc comment above for the full contract.
+    #[cfg(feature = "jitv2")]
+    pub jit_mem_exc: u32,
+    /// FPU host-status hooks, mirroring `MipsExecutor::fpu_update_fcsr`'s
+    /// `platform::clear_fpu_status`/`platform::get_fpu_status` calls so
+    /// compiled FP arithmetic can update FCSR's Cause/Flag bits and raise
+    /// `EXC_FPE` exactly like the interpreter — these are plain host-arch
+    /// free functions (no executor/generic context needed, unlike the
+    /// memory/exception hooks), so `jit_ctx` is passed but unused; kept for
+    /// signature uniformity with the other hooks rather than a special case.
+    /// `fpu_get_status_fn` returns host FP exception flags already
+    /// translated into MIPS FCSR bit positions [6:2] (V,Z,O,U,I) — see
+    /// `platform::get_fpu_status`'s doc comment. `fpu_clear_status_fn`
+    /// clears the host's sticky flags for the next op.
+    #[cfg(feature = "jitv2")]
+    pub fpu_get_status_fn: unsafe extern "C" fn(*mut core::ffi::c_void) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub fpu_clear_status_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
+    /// Reprogram the host FPU rounding mode, mirroring
+    /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
+    /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
+    /// bits [1:0]). Same host-arch-free-function shape as the status hooks
+    /// above — `jit_ctx` unused.
+    #[cfg(feature = "jitv2")]
+    pub fpu_set_mode_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
+    /// `jitv2_lockstep` load/store verification scratch (see
+    /// `MipsExecutor::lockstep_check_load_store`): records the real
+    /// interpreter dispatch's virtual address, translated physical address,
+    /// and data value for whichever single load/store instruction is being
+    /// compared, so the JIT probe's own lockstep-only memory hooks
+    /// (`lockstep_jit_read`/`lockstep_jit_write`) can compare against a real
+    /// access instead of touching the bus a second time — a load can't be
+    /// safely re-issued (MMIO side effects) and a store can't be safely
+    /// re-applied (would double it), so this is the only way to compare "did
+    /// the JIT compute the same address/value" without actually running the
+    /// access twice.
+    ///
+    /// `Option`-shaped rather than three plain fields plus a separate
+    /// "valid" bool on purpose: an earlier version used a `lockstep_mem_valid:
+    /// bool` that `read_data_impl`/`write_data_impl` set `true`
+    /// unconditionally (success or fault) while only updating the
+    /// address/value fields on success — meaning a faulted or retried real
+    /// access left `valid=true` pointing at stale data from whatever earlier
+    /// access last succeeded, which `lockstep_jit_read`/`lockstep_jit_write`
+    /// would then silently compare the JIT probe against, producing a
+    /// spurious divergence report for a real EXEC_RETRY/exception that
+    /// `lockstep_check_load_store` now instead detects up front and skips
+    /// the JIT probe for entirely. Making "nothing to compare" an actual
+    /// `None` closes that class of bug structurally: `read_data_impl`/
+    /// `write_data_impl` only ever write `Some(..)` on a real success, and
+    /// explicitly write `None` on any non-success path — there is no way
+    /// for a stale `Some` to survive past a failed access.
+    ///
+    /// `None` also naturally covers "no real interpreter access has ever
+    /// happened on this `MipsCore` at all" (every direct `jit_fn(...)` test
+    /// in `equiv_test.rs` that touches memory, for instance, which never
+    /// goes through `lockstep_check_load_store`'s interpreter-first
+    /// dispatch at all): `lockstep_jit_read`/`lockstep_jit_write` see `None`
+    /// and fall through to a real bus access instead of asserting — same
+    /// behavior a direct JIT test expects today.
+    #[cfg(feature = "jitv2_lockstep")]
+    pub lockstep_mem: Option<LockstepMemCapture>,
+    /// Set whenever PC is about to land on an offset that is a legitimate
+    /// branch/jump target — the compile-worthiness signal `exec_decoded`'s
+    /// JIT dispatch gate checks alongside the offset-4/valid-bit conditions
+    /// (see `MipsExecutor::exec_decoded`'s doc comment for the full gate).
+    /// Lives on `MipsCore` rather than `MipsExecutor` specifically so
+    /// JIT-compiled code's own jump/branch exit stubs (`emit_absolute_pc_exit`,
+    /// `emit_runtime_pc_exit` in codegen.rs) can set it directly via a plain
+    /// store through `core_ptr` before returning to the interpreter — without
+    /// this, a jump taken *from* JIT-compiled code landing on a fresh,
+    /// never-before-published word would arrive with no trigger at all
+    /// (unless it happened to coincidentally sit at offset 4), silently
+    /// stalling that address in the interpreter forever even under a hot
+    /// loop reached exclusively via JIT-to-JIT control transfer. The
+    /// interpreter's own terminal actions (`handle_exec_complete`'s
+    /// delay-slot retirement, `exec_complete_pc_set`) set it the same way,
+    /// just from Rust instead of emitted IR. Cleared by `exec_decoded`'s
+    /// dispatch-time check, which is the only reader.
+    #[cfg(feature = "jitv2")]
+    pub jit_trigger: bool,
 
     // --- everything below is cold: not touched on the common per-instruction path ---
 
@@ -263,10 +493,6 @@ pub struct MipsCore {
     /// `Instant::now()` on snapshot load — Instants from a previous run are
     /// meaningless across a restore.
     pub(crate) compare_last_instant: std::time::Instant,
-    /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
-    /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences.
-    #[cfg(feature = "developer_ip7")]
-    pub compare_delta_stats: std::collections::HashMap<u32, u32>,
     /// Learned slow-tick CP0 delta in hardware counts (32.32 fixed-point, >> 32 = integer counts).
     /// Initialised to 0 (unknown). First delta seen is assumed to be the 100 Hz (slow) tick.
     pub compare_delta_slow: u64,
@@ -286,6 +512,22 @@ pub struct MipsCore {
     /// (which is only a bucket label, not a measured rate — see rules/perf/idle-pause-work.md).
     /// Zero = not yet calibrated.
     pub hw_per_ns: u64,
+    /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
+    /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences. Debug-only
+    /// bookkeeping the JIT never touches — kept at the tail, out of the way of the
+    /// codegen-visible fields above (see struct doc comment).
+    #[cfg(feature = "developer_ip7")]
+    pub compare_delta_stats: std::collections::HashMap<u32, u32>,
+}
+
+/// A completed real memory access, captured for `jitv2_lockstep`'s
+/// load/store verification — see `MipsCore::lockstep_mem`'s doc comment.
+#[cfg(feature = "jitv2_lockstep")]
+#[derive(Clone, Copy)]
+pub struct LockstepMemCapture {
+    pub addr: u64,
+    pub phys: u64,
+    pub value: u64,
 }
 
 /// Single nano-TLB entry.
@@ -356,6 +598,58 @@ impl NanoTlbEntry {
     pub fn invalidate(&mut self) { self.va_tag = 0; }
 }
 
+/// Placeholder for `MipsCore`'s `read*_fn` fields before
+/// `MipsExecutor::install_jit_hooks` runs. Panics — compiled code must never
+/// be dispatched against a core whose hooks aren't installed yet.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_read(_ctx: *mut core::ffi::c_void, _va: u64) -> u64 {
+    panic!("jitv2: read hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_write8(_ctx: *mut core::ffi::c_void, _va: u64, _v: u64) -> u32 {
+    panic!("jitv2: write hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_write16(_ctx: *mut core::ffi::c_void, _va: u64, _v: u64) -> u32 {
+    panic!("jitv2: write hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_write32(_ctx: *mut core::ffi::c_void, _va: u64, _v: u64) -> u32 {
+    panic!("jitv2: write hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_write64(_ctx: *mut core::ffi::c_void, _va: u64, _v: u64) -> u32 {
+    panic!("jitv2: write hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_write64_masked(_ctx: *mut core::ffi::c_void, _va: u64, _v: u64, _mask: u64) -> u32 {
+    panic!("jitv2: write64_masked hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_exception(_ctx: *mut core::ffi::c_void, _status: u32) -> u32 {
+    panic!("jitv2: exception hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_interp_fallback(_ctx: *mut core::ffi::c_void) -> u32 {
+    panic!("jitv2: interp_fallback hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_kill_entry(_ctx: *mut core::ffi::c_void, _offset: u16) {
+    panic!("jitv2: kill_entry hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_get_status(_ctx: *mut core::ffi::c_void) -> u32 {
+    panic!("jitv2: fpu_get_status hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_clear_status(_ctx: *mut core::ffi::c_void) {
+    panic!("jitv2: fpu_clear_status hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
+    panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
+}
+
 // SAFETY: The raw pointer in status_changed_cb is only accessed from the CPU thread.
 unsafe impl Send for MipsCore {}
 
@@ -381,6 +675,50 @@ impl MipsCore {
             fpu_fcsr: 0,
             nanotlb: [NanoTlbEntry::default(); 3],
             status_changed_cb: None,
+            // Placeholders — overwritten immediately by
+            // MipsExecutor::install_jit_hooks (same pattern as translate_fn's
+            // own placeholder init below in MipsExecutor::new). Panic if
+            // ever actually called: that would mean compiled code ran before
+            // hooks were installed, which must not happen for any executor
+            // that has jitv2 compiled units live.
+            #[cfg(feature = "jitv2")]
+            jit_ctx: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            read8_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
+            read16_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
+            read32_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
+            read64_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
+            write8_fn: jit_hooks_not_installed_write8,
+            #[cfg(feature = "jitv2")]
+            write16_fn: jit_hooks_not_installed_write16,
+            #[cfg(feature = "jitv2")]
+            write32_fn: jit_hooks_not_installed_write32,
+            #[cfg(feature = "jitv2")]
+            write64_fn: jit_hooks_not_installed_write64,
+            #[cfg(feature = "jitv2")]
+            write64_masked_fn: jit_hooks_not_installed_write64_masked,
+            #[cfg(feature = "jitv2")]
+            handle_exception_fn: jit_hooks_not_installed_exception,
+            #[cfg(feature = "jitv2")]
+            interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
+            #[cfg(feature = "jitv2")]
+            kill_entry_fn: jit_hooks_not_installed_kill_entry,
+            #[cfg(feature = "jitv2")]
+            jit_mem_exc: 0,
+            #[cfg(feature = "jitv2")]
+            fpu_get_status_fn: jit_hooks_not_installed_fpu_get_status,
+            #[cfg(feature = "jitv2")]
+            fpu_clear_status_fn: jit_hooks_not_installed_fpu_clear_status,
+            #[cfg(feature = "jitv2")]
+            fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,
+            #[cfg(feature = "jitv2_lockstep")]
+            lockstep_mem: None,
+            #[cfg(feature = "jitv2")]
+            jit_trigger: false,
             cp0_index: 0,
             cp0_random: 0,
             cp0_entrylo0: 0,
@@ -412,12 +750,12 @@ impl MipsCore {
             count_step_atomic: Arc::new(AtomicU64::new(1 << 31)),
             compare_last_cycles: 0,
             compare_last_instant: std::time::Instant::now(),
-            #[cfg(feature = "developer_ip7")]
-            compare_delta_stats: std::collections::HashMap::new(),
             compare_delta_slow: 0,
             compare_delta_fast: 0,
             compare_delta_prev: 0,
             hw_per_ns: 0,
+            #[cfg(feature = "developer_ip7")]
+            compare_delta_stats: std::collections::HashMap::new(),
         };
         core.reset_registers(false);
         core
@@ -1065,6 +1403,76 @@ impl MipsCore {
         }
         self.fpu_fccr = Self::fccr_from_fcsr(self.fpu_fcsr);
     }
+}
+
+/// Deliver an exception's architectural effect onto `core`: update
+/// Cause/EPC/Status per the R4000 exception-entry sequence and select the
+/// vector, exactly as `MipsExecutor::handle_exception` (`mips_exec.rs`) does
+/// — this function *is* that logic, extracted so it has exactly one
+/// implementation (the design doc's §4.2 "single-implementation delivery"
+/// principle already governs every other jitv2 exception path; this closes
+/// the one gap where the interpreter's exception vectoring itself wasn't
+/// callable independently of a full `MipsExecutor`).
+///
+/// Reads `core.in_delay_slot` directly — one field, one meaning, shared by
+/// both engines (see its doc comment): the interpreter's
+/// `branch_delay`/`handle_exec_complete` set it on the plain dispatch path,
+/// and jitv2's `emit_slot_semantics` (`jitv2/codegen.rs`) sets it directly
+/// around a delay slot's inlined body, since the JIT has no separate
+/// dispatch step of its own to hang it on. `jitv2_verify` (no executor, only
+/// a bare `MipsCore` reconstructed from a trace record) leaves it at
+/// whatever `MipsCore::new()`/the trace's seeded state left it as — a trace
+/// record's pre-state has no delay-slot context to recover, the same
+/// limitation that already makes load/store instructions unverifiable
+/// there.
+///
+/// Does NOT perform the two executor-level side effects the real
+/// `handle_exception` also does (`cache.set_llbit(false)`,
+/// `nanotlb_invalidate()`) — neither affects any field `CoreState`
+/// (`src/trace.rs`) tracks, and `jitv2_verify` has no cache/TLB to touch in
+/// the first place. `handle_exception` remains responsible for those; this
+/// function only owns the part that's genuinely portable.
+///
+/// `status` is the raw exception status word (`ExecStatus`, `mips_exec.rs`)
+/// — taken as `u32` here rather than the `ExecStatus` type alias to avoid a
+/// `mips_core -> mips_exec` module dependency for what's just `type
+/// ExecStatus = u32`. `EXEC_IS_TLB_REFILL`/`EXEC_IS_XTLB_REFILL`'s bit
+/// values (`1 << 28`, `1 << 29`) are inlined below; their canonical
+/// definitions and doc comments live in `mips_exec.rs`.
+pub fn deliver_exception(core: &mut MipsCore, status: u32) {
+    const EXEC_IS_TLB_REFILL: u32 = 1 << 28;
+    const EXEC_IS_XTLB_REFILL: u32 = 1 << 29;
+
+    let is_tlb_refill = status & EXEC_IS_TLB_REFILL != 0;
+    let is_xtlb_refill = status & EXEC_IS_XTLB_REFILL != 0;
+
+    let was_exl = (core.cp0_status & STATUS_EXL) != 0;
+
+    let mut cause = core.cp0_cause;
+    cause = (cause & !CAUSE_EXCCODE_MASK) | (status & CAUSE_EXCCODE_MASK);
+
+    if !was_exl {
+        if core.in_delay_slot {
+            cause |= CAUSE_BD;
+            core.cp0_epc = core.pc.wrapping_sub(4);
+        } else {
+            cause &= !CAUSE_BD;
+            core.cp0_epc = core.pc;
+        }
+    }
+    core.cp0_cause = cause;
+
+    core.cp0_status |= STATUS_EXL;
+
+    let bev = (core.cp0_status & STATUS_BEV) != 0;
+    let vector_base = if bev { 0xFFFFFFFF_BFC00200u64 } else { 0xFFFFFFFF_80000000u64 };
+    let offset = if !was_exl && is_tlb_refill {
+        if is_xtlb_refill { 0x080 } else { 0x000 }
+    } else {
+        0x180
+    };
+
+    core.pc = vector_base + offset;
 }
 
 /// CPU Privilege Modes
