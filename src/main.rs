@@ -38,7 +38,7 @@ fn main() {
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
     let mut machine = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || Box::new(Machine::new(cfg)))
         .unwrap()
         .join()
