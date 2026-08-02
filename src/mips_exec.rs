@@ -667,10 +667,14 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub decoded_count: Arc<AtomicU64>,
     /// Count of instructions fetched from uncached address space.
     pub uncached_fetch_count: Arc<AtomicU64>,
-    /// Raw pointers into core.cycles/interrupts/fasttick_count — avoids Arc::deref on every step.
+    /// Raw pointers into core.cycles/fasttick_count — avoids Arc::deref on every step.
     /// Safety: these point into Arcs owned by MipsCore which outlive the executor.
+    /// `interrupts` has no equivalent cached pointer — it's an inline
+    /// `MipsCore` field now (see its doc comment), so `&self.core.interrupts`
+    /// is always current and just as cheap; a cached pointer would go stale
+    /// across any move of `self` (which `cycles`/`fasttick_count` can't,
+    /// since `Arc::as_ptr` points at their own separate heap allocation).
     cycles_ptr:       *const AtomicU64,
-    interrupts_ptr:   *const AtomicU64,
     fasttick_ptr:     *const AtomicU64,
     local_fasttick:   u32,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
@@ -716,7 +720,7 @@ fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, a
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
 /// Rust does not allow `Self` inside a nested fn, so the generic trampoline lives here.
-// Safety: the raw pointers (cycles_ptr, interrupts_ptr, fasttick_ptr) point into Arc allocations
+// Safety: the raw pointers (cycles_ptr, fasttick_ptr) point into Arc allocations
 // owned by MipsCore which outlive the executor. The executor is only accessed from the CPU thread.
 unsafe impl<T: Tlb, C: MipsCache> Send for MipsExecutor<T, C> {}
 unsafe impl<T: Tlb, C: MipsCache> Sync for MipsExecutor<T, C> {}
@@ -851,7 +855,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
             cycles_ptr:     std::ptr::null(),
-            interrupts_ptr: std::ptr::null(),
             fasttick_ptr:   std::ptr::null(),
             local_fasttick: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
@@ -876,13 +879,25 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     /// Re-sync raw atomic pointers after the shared Arcs are injected post-construction.
-    /// Must be called whenever core.cycles, core.interrupts, or core.fasttick_count are replaced.
+    /// Must be called whenever core.cycles or core.fasttick_count are replaced.
     pub fn rebind_atomic_ptrs(&mut self) {
         self.cycles_ptr     = Arc::as_ptr(&self.core.cycles);
-        self.interrupts_ptr = Arc::as_ptr(&self.core.interrupts);
         self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
         #[cfg(feature = "idle-pause")]
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
+    }
+
+    /// Raw pointer to this executor's `MipsCore.interrupts` word, for devices
+    /// on other threads that need to set/clear interrupt bits (e.g.
+    /// `Ioc::set_interrupts`). Always re-derived from `self` at call time —
+    /// **never cache this pointer past a move of the executor** (e.g. across
+    /// `MipsExecutor` being moved into its owning `Arc<Mutex<...>>`). Callers
+    /// should call this once the executor is at its final, stable address
+    /// (inside that `Arc`) and treat the result as valid only from then on —
+    /// which holds for the rest of the process, since the executor never
+    /// moves again once there.
+    pub fn interrupts_ptr(&self) -> *const AtomicU64 {
+        &self.core.interrupts as *const AtomicU64
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -1062,12 +1077,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         /*
         // Reload external interrupt state every 16 instructions
         if self.core.local_cycles & 0xF == 0 {
-            self.cached_pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+            self.cached_pending = self.core.interrupts.load(Ordering::Relaxed);
         }
         let pending = self.cached_pending;
         */
         // this seems to be a wash or slightly better without a branch, relaxed atomic loads are essentially MOV
-        let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+        let pending = self.core.interrupts.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
 
@@ -1160,7 +1175,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// kernel depends on per-instruction interrupt delivery.
     #[inline(always)]
     pub fn step_lite(&mut self) -> ExecStatus {
-        let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+        let pending = self.core.interrupts.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
 
@@ -5292,7 +5307,11 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     running: Arc<AtomicBool>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     cycles: Arc<AtomicU64>,
-    pub interrupts: Arc<AtomicU64>,
+    /// Raw pointer into the executor's `MipsCore.interrupts` (an inline
+    /// field, not `Arc<AtomicU64>` — see that field's doc comment). Valid
+    /// for the process lifetime: `executor` below is the only owner of the
+    /// `MipsCore` this points into, and it's never dropped before shutdown.
+    interrupts_ptr: *const AtomicU64,
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
@@ -5303,10 +5322,17 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     idle_profile_reset: Arc<AtomicBool>,
 }
 
+// Safety: interrupts_ptr points into the MipsCore owned by `executor`
+// (Arc<Mutex<MipsExecutor>>), which outlives every MipsCpu clone/thread that
+// might read this pointer — the whole struct is already Send/Sync via its
+// other Arc fields; this one raw pointer needs the same guarantee spelled
+// out explicitly since raw pointers don't get it automatically.
+unsafe impl<T: Tlb, C: MipsCache> Send for MipsCpu<T, C> {}
+unsafe impl<T: Tlb, C: MipsCache> Sync for MipsCpu<T, C> {}
+
 impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     pub fn new(executor: MipsExecutor<T, C>) -> Self {
         let cycles = executor.core.cycles.clone();
-        let interrupts = executor.core.interrupts.clone();
         let fasttick_count = executor.core.fasttick_count.clone();
         #[cfg(feature = "idle-pause")]
         let idle_profile_on = executor.idle_profile_on.clone();
@@ -5315,13 +5341,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
         let executor_arc = Arc::new(Mutex::new(executor));
         executor_arc.lock().install_status_cb();
+        // MipsCore is now at its final, stable address (inside the Arc) —
+        // safe to take a raw pointer into it that outlives this constructor.
+        let interrupts_ptr = executor_arc.lock().interrupts_ptr();
 
         Self {
             executor: executor_arc,
             running: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
             cycles,
-            interrupts,
+            interrupts_ptr,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
@@ -5354,6 +5383,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
     pub fn cycles_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.cycles)
+    }
+
+    /// Raw pointer to the executor's `MipsCore.interrupts` word, for wiring
+    /// into devices on other threads that set/clear interrupt bits (e.g.
+    /// `Ioc::set_interrupts`). Fixed for the life of this `MipsCpu` — set
+    /// once in `new()` after the executor reached its final address.
+    pub fn interrupts_ptr(&self) -> *const AtomicU64 {
+        self.interrupts_ptr
     }
 
     pub fn running_flag(&self) -> Arc<AtomicBool> {
@@ -5820,17 +5857,20 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
     }
 
     fn signal(&self, signal: Signal) {
+        // Safety: interrupts_ptr points into the executor's MipsCore, which
+        // outlives this MipsCpu for the process lifetime (see the field's
+        // doc comment) — bypasses the executor mutex to reduce latency.
+        let interrupts = unsafe { &*self.interrupts_ptr };
         match signal {
             Signal::Reset(_soft) => {
-                self.interrupts.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
+                interrupts.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
             }
             Signal::Interrupt(line, active) => {
-                // Bypass mutex lock for interrupts to reduce latency
                 let mask = 1u64 << (line + 8);
                 if active {
-                    self.interrupts.fetch_or(mask, Ordering::SeqCst);
+                    interrupts.fetch_or(mask, Ordering::SeqCst);
                 } else {
-                    self.interrupts.fetch_and(!mask, Ordering::SeqCst);
+                    interrupts.fetch_and(!mask, Ordering::SeqCst);
                 }
             }
         }

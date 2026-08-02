@@ -64,7 +64,6 @@ pub struct Machine {
     _phys: Arc<Physical>, // Keep reference to Physical Bus
     mc: MemoryController,
     hpc3: Hpc3,
-    pub interrupts: Arc<AtomicU64>,
     monitor: Arc<Monitor>,
     /// Sender for async machine events (HardReset, PowerOff) from devices.
     pub event_tx: mpsc::SyncSender<MachineEvent>,
@@ -562,12 +561,11 @@ impl Machine {
         if let Some(rex3) = &phys.rex3 { rex3.set_count_step_atomic(Arc::clone(&executor.core.count_step_atomic)); }
 
         let cpu = Arc::new(MipsCpu::new(executor));
-        let interrupts = cpu.interrupts.clone();
 
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone();
         mc.set_cpu(Arc::downgrade(&cpu_device));
-        ioc.set_interrupts(interrupts.clone());
+        ioc.set_interrupts(cpu.interrupts_ptr());
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
@@ -624,7 +622,6 @@ impl Machine {
             _phys: phys,
             mc,
             hpc3,
-            interrupts,
             monitor,
             event_tx,
             event_rx: Some(event_rx),

@@ -142,7 +142,17 @@ pub struct MipsCore {
 
     // Interrupt handling
     // Bits 8..15 = IP0..IP7 (mirror CAUSE.IP layout).  Bit 63 = soft-reset request.
-    pub interrupts: Arc<AtomicU64>,
+    //
+    // Inline (not Arc<AtomicU64>) so it's a fixed offset_of! field reachable
+    // directly from a bare `*mut MipsCore` — the interpreter's hot loop and
+    // JIT-compiled code both need to load this with zero indirection (no
+    // Arc deref, no separate heap allocation to chase). External devices
+    // that need to set interrupt bits from their own thread (e.g. Ioc) get a
+    // raw `*const AtomicU64` into this field instead of a cloned Arc — see
+    // `MipsExecutor::interrupts_ptr_for_devices`. Safe because the executor
+    // (and therefore this MipsCore) lives in a top-level `Arc<Mutex<...>>`
+    // that outlives every device for the life of the process.
+    pub interrupts: AtomicU64,
     pub cycles: Arc<AtomicU64>,
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
     pub fasttick_count: Arc<AtomicU64>,
@@ -284,7 +294,7 @@ impl MipsCore {
             fpu_fenr: 0,
             fpu_fcsr: 0,
             local_cycles: 0,
-            interrupts: Arc::new(AtomicU64::new(0)),
+            interrupts: AtomicU64::new(0),
             cycles: Arc::new(AtomicU64::new(0)),
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,

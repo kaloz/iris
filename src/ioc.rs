@@ -168,8 +168,19 @@ struct IocState {
     dma_sel: u8,
     reset_reg: u8,
     write_reg: u8,
-    interrupts: Option<Arc<AtomicU64>>,
+    /// Raw pointer to the CPU executor's `MipsCore.interrupts` word (an
+    /// inline field, not `Arc<AtomicU64>` — see that field's doc comment in
+    /// mips_core.rs). Set once via `Ioc::set_interrupts` after the executor
+    /// is constructed; valid for the process lifetime from then on (the
+    /// executor lives in a top-level `Arc<Mutex<...>>` that outlives every
+    /// device, including this one).
+    interrupts: Option<*const AtomicU64>,
 }
+
+// Safety: `interrupts` points into the CPU executor's MipsCore, which
+// outlives this IocState (see the field's doc comment) — IocState is always
+// accessed through Arc<Mutex<IocState>>, which is what actually needs Send.
+unsafe impl Send for IocState {}
 
 struct IocIrqLine {
     state: Arc<Mutex<IocState>>,
@@ -315,7 +326,10 @@ impl Ioc {
         let _ = self.heartbeat.set(heartbeat);
     }
 
-    pub fn set_interrupts(&self, interrupts: Arc<AtomicU64>) {
+    /// `interrupts` must point into a `MipsCore` that outlives this `Ioc`
+    /// (see `IocState.interrupts`'s doc comment) — `MipsCpu::interrupts_ptr()`
+    /// is the intended source.
+    pub fn set_interrupts(&self, interrupts: *const AtomicU64) {
         self.state.lock().interrupts = Some(interrupts);
     }
 
@@ -502,7 +516,8 @@ impl Device for Ioc {
                 ip2, ip3, ip4, ip5, ip6);
             let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} extio={:08x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
                 s.sys_id, s.gc_select, s.extio, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
-            if let Some(ints) = &s.interrupts {
+            // Safety: see IocState.interrupts's doc comment.
+            if let Some(ints) = s.interrupts.map(|p| unsafe { &*p }) {
                 let raw = ints.load(Ordering::SeqCst);
                 let _ = writeln!(writer, "  Atomic interrupts word: {:016x}  (IP2={} IP3={} IP4={} IP5={} IP6={} IP7=TMR:{})",
                     raw,
@@ -783,7 +798,9 @@ impl IocState {
         let ip6 = self.err_stat != 0;
 
         // 3. Signal CPU
-        if let Some(interrupts) = &self.interrupts {
+        // Safety: interrupts points into the CPU executor's MipsCore, which
+        // outlives this Ioc (see IocState.interrupts's doc comment).
+        if let Some(interrupts) = self.interrupts.map(|p| unsafe { &*p }) {
             let mut set_mask = 0;
             let mut clear_mask = 0;
 
@@ -835,7 +852,8 @@ impl Resettable for Ioc {
         state.reset_reg = 0;
         state.write_reg = 0;
         // Clear CPU interrupt lines
-        if let Some(irqs) = &state.interrupts {
+        // Safety: see IocState.interrupts's doc comment.
+        if let Some(irqs) = state.interrupts.map(|p| unsafe { &*p }) {
             use std::sync::atomic::Ordering;
             irqs.store(0, Ordering::SeqCst);
         }
