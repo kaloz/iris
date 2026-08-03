@@ -2995,7 +2995,7 @@ mod tests {
         let s = exec.step();
         assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused taken BEQ sets PC directly, not EXEC_BRANCH_DELAY");
         assert_eq!(exec.core.pc, pc_base + 16, "PC should jump straight to branch target");
-        assert!(!exec.in_delay_slot, "fused path must never set in_delay_slot");
+        assert!(!exec.core.in_delay_slot, "fused path must never set in_delay_slot");
 
         let s = exec.step();
         assert_eq!(s, EXEC_COMPLETE, "ADDIU r3,r0,42");
@@ -3009,7 +3009,7 @@ mod tests {
         exec.core.write_gpr(1, 0);
         exec.step();
         assert_eq!(exec.core.pc, pc_base + 136, "PC should skip branch+NOP (PC+=8)");
-        assert!(!exec.in_delay_slot);
+        assert!(!exec.core.in_delay_slot);
         assert_eq!(exec.step(), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(1), 111, "instruction after skipped NOP must execute");
 
@@ -3019,7 +3019,7 @@ mod tests {
         let s = exec.step();
         assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused JR sets PC directly");
         assert_eq!(exec.core.pc, pc_base + 300, "PC should jump straight to r31");
-        assert!(!exec.in_delay_slot);
+        assert!(!exec.core.in_delay_slot);
     }
 
     #[test]
@@ -3262,7 +3262,7 @@ mod tests {
         let s2 = exec.step();
         assert_eq!(s2, EXEC_COMPLETE, "ADDIU in delay slot falls back to plain completion");
         assert_eq!(exec.core.pc, pc_base + 16, "PC must redirect to branch target, not pc+8");
-        assert!(!exec.in_delay_slot);
+        assert!(!exec.core.in_delay_slot);
         assert_eq!(exec.core.read_gpr(8), base_addr + 4, "ADDIU result must still be written");
         assert_eq!(exec.core.read_gpr(2), 0, "LW must NOT have executed as part of the fused pair");
 

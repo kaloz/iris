@@ -155,7 +155,7 @@ mod tests {
             exec.core.pc  = self.pc;
             exec.core.hi  = self.hi;
             exec.core.lo  = self.lo;
-            exec.in_delay_slot      = false;
+            exec.core.in_delay_slot      = false;
             exec.delay_slot_target  = 0;
         }
     }

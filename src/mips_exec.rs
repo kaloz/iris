@@ -631,7 +631,6 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub sysad: Arc<dyn BusDevice>,
     pub tlb: T,
     pub cache: C,
-    pub(crate) in_delay_slot: bool,
     pub delay_slot_target: u64,
     #[cfg(feature = "developer")]
     undo_buffer: UndoBuffer,
@@ -825,7 +824,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             sysad,
             tlb,
             cache,
-            in_delay_slot: false,
             delay_slot_target: 0,
             #[cfg(feature = "developer")]
             undo_buffer: UndoBuffer::new(),
@@ -1010,8 +1008,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[inline(always)]
     fn branch_delay(&mut self, target: u64) -> ExecStatus {
         self.delay_slot_target = target;
-        if !self.in_delay_slot {
-            self.in_delay_slot = true;
+        if !self.core.in_delay_slot {
+            self.core.in_delay_slot = true;
         }
         self.core.pc = self.core.pc.wrapping_add(4);
         EXEC_BRANCH_DELAY
@@ -1023,9 +1021,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// action instead of returning the bare EXEC_COMPLETE constant.
     #[inline(always)]
     fn handle_exec_complete(&mut self) -> ExecStatus {
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             self.core.pc = self.delay_slot_target;
-            self.in_delay_slot = false;
+            self.core.in_delay_slot = false;
         } else {
             self.core.pc = self.core.pc.wrapping_add(4);
         }
@@ -1118,7 +1116,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             // Soft reset (bit 63)
             if pending & SOFT_RESET_BIT != 0 {
                 self.core.reset(true); // clears interrupts word (including bit 63)
-                self.in_delay_slot = false;
+                self.core.in_delay_slot = false;
                 self.delay_slot_target = 0;
                 return EXEC_COMPLETE;
             }
@@ -1182,7 +1180,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (pending | self.core.cp0_cause as u64) != 0 {
             if pending & SOFT_RESET_BIT != 0 {
                 self.core.reset(true);
-                self.in_delay_slot = false;
+                self.core.in_delay_slot = false;
                 self.delay_slot_target = 0;
                 return EXEC_COMPLETE;
             }
@@ -1366,7 +1364,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // If EXL was already 1, preserve the original EPC from the first exception
         if !was_exl {
             // Handle Branch Delay
-            if self.in_delay_slot {
+            if self.core.in_delay_slot {
                 cause |= CAUSE_BD;
                 self.core.cp0_epc = self.core.pc.wrapping_sub(4); // Point to branch instr
             } else {
@@ -1430,7 +1428,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // Jump to exception vector
         self.core.pc = vector_base + offset;
         // Reset delay slot state as we are jumping to a new context
-        self.in_delay_slot = false;
+        self.core.in_delay_slot = false;
         status
     }
 
@@ -2107,7 +2105,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[cfg(feature = "opcodefusion")]
     fn exec_jr_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = self.core.read_gpr(d.rs as u32);
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             return self.branch_delay(target);
         }
         self.core.pc = target;
@@ -2319,7 +2317,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[cfg(feature = "opcodefusion")]
     #[inline(always)]
     fn exec_fused_addr_load_store_tail(&mut self, addr: u64, next_raw: u32) -> ExecStatus {
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             return self.handle_exec_complete();
         }
         self.core.pc = self.core.pc.wrapping_add(4);
@@ -2578,7 +2576,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[cfg(feature = "opcodefusion")]
     fn exec_j_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = ((self.core.pc + 4) & 0xFFFFFFFF_F0000000) | d.immi64();
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             return self.branch_delay(target);
         }
         self.core.pc = target;
@@ -2599,7 +2597,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_jal_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = ((self.core.pc + 4) & 0xFFFFFFFF_F0000000) | d.immi64();
         self.core.write_gpr(31, self.core.pc + 8); // Return address (PC of delay slot + 4)
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             return self.branch_delay(target);
         }
         self.core.pc = target;
@@ -2630,12 +2628,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         if rs_val == rt_val {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-            if self.in_delay_slot {
+            if self.core.in_delay_slot {
                 return self.branch_delay(target);
             }
             self.core.pc = target;
             EXEC_COMPLETE_NO_INC
-        } else if self.in_delay_slot {
+        } else if self.core.in_delay_slot {
             self.handle_exec_complete()
         } else {
             self.handle_branch_likely_skip()
@@ -2661,12 +2659,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rt_val = self.core.read_gpr(d.rt as u32);
         if rs_val != rt_val {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-            if self.in_delay_slot {
+            if self.core.in_delay_slot {
                 return self.branch_delay(target);
             }
             self.core.pc = target;
             EXEC_COMPLETE_NO_INC
-        } else if self.in_delay_slot {
+        } else if self.core.in_delay_slot {
             self.handle_exec_complete()
         } else {
             self.handle_branch_likely_skip()
@@ -2935,7 +2933,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     // decode-time combination is exact). Skips decoding/dispatching the ORI.
     #[cfg(feature = "opcodefusion")]
     fn exec_lui_imm32(&mut self, d: &DecodedInstr) -> ExecStatus {
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             // This LUI is itself a delay-slot instruction: the fused ORI is NOT
             // also in the delay slot (a delay slot is exactly one instruction) —
             // it's really the instruction at/after the branch target. Treat this
@@ -2956,7 +2954,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     // the halves together.
     #[cfg(feature = "opcodefusion")]
     fn exec_lui_simm32(&mut self, d: &DecodedInstr) -> ExecStatus {
-        if self.in_delay_slot {
+        if self.core.in_delay_slot {
             // See exec_lui_imm32: this LUI is a delay-slot instruction, so the
             // fused ADDIU is really the (unfused) instruction after the branch
             // target — fall back to plain LUI semantics and let it be fetched
@@ -4725,7 +4723,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             fpu_fcsr: self.core.fpu_fcsr,
             running: self.core.running,
             halted: self.core.halted,
-            in_delay_slot: self.in_delay_slot,
+            in_delay_slot: self.core.in_delay_slot,
             delay_slot_target: self.delay_slot_target,
             memory_writes: Vec::new(), // Will be populated separately
         }
@@ -4778,7 +4776,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         crate::platform::set_fpu_mode((snapshot.fpu_fcsr & 0x3) as u8);
         self.core.running = snapshot.running;
         self.core.halted = snapshot.halted;
-        self.in_delay_slot = snapshot.in_delay_slot;
+        self.core.in_delay_slot = snapshot.in_delay_slot;
         self.delay_slot_target = snapshot.delay_slot_target;
     }
 
@@ -5638,7 +5636,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             cp0_badvaddr: c.cp0_badvaddr,
             cp0_entryhi: c.cp0_entryhi,
             count_step: c.count_step,
-            in_delay_slot: exec.in_delay_slot,
+            in_delay_slot: c.in_delay_slot,
         })
     }
 }
@@ -7086,7 +7084,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Resettable for Mips
         exec.core.reset(false);
         exec.tlb.power_on();
         exec.cache.power_on();
-        exec.in_delay_slot = false;
+        exec.core.in_delay_slot = false;
         exec.delay_slot_target = 0;
         #[cfg(feature = "developer")]
         exec.undo_buffer.clear();
@@ -7149,7 +7147,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
         tbl.insert("fpu".into(), toml::Value::Table(fpu));
 
         // Execution state
-        tbl.insert("in_delay_slot".into(),     toml::Value::Boolean(exec.in_delay_slot));
+        tbl.insert("in_delay_slot".into(),     toml::Value::Boolean(c.in_delay_slot));
         tbl.insert("delay_slot_target".into(), hex_u64(exec.delay_slot_target));
 
         // TLB
@@ -7214,7 +7212,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             ldf!(fpu_fir); ldf!(fpu_fccr); ldf!(fpu_fexr); ldf!(fpu_fenr); ldf!(fpu_fcsr);
         }
 
-        if let Some(x) = get_field(v, "in_delay_slot")     { exec.in_delay_slot     = toml_bool(x).unwrap_or(false); }
+        if let Some(x) = get_field(v, "in_delay_slot")     { exec.core.in_delay_slot     = toml_bool(x).unwrap_or(false); }
         if let Some(x) = get_field(v, "delay_slot_target") { exec.delay_slot_target = toml_u64(x).unwrap_or(0); }
 
         if let Some(tlb_v) = get_field(v, "tlb") {

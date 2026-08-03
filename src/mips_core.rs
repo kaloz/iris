@@ -160,6 +160,18 @@ pub struct MipsCore {
     // Execution state
     pub running: bool,
     pub halted: bool,
+    /// Whether the instruction about to execute is a branch/jump's delay
+    /// slot — set by `branch_delay` when the branch itself dispatches,
+    /// cleared by `handle_exec_complete` once the slot retires. Consulted by
+    /// `deliver_exception`/`handle_exception` to compute EPC/Cause.BD
+    /// correctly for an exception raised from within a delay slot (EPC must
+    /// point at the *branch*, not the slot). One field, one meaning, for
+    /// both the interpreter (which dispatches the slot as its own step) and
+    /// jitv2-compiled code (`emit_slot_semantics` sets/clears this directly
+    /// around a delay slot it inlines, since it has no separate dispatch
+    /// step of its own to hang the flag on) — there is no second,
+    /// JIT-specific copy of this state.
+    pub in_delay_slot: bool,
 
     /// Called whenever CP0 Status (reg 12) is written, with (old_value, new_value).
     /// The first element is the callback function, the second is an opaque context pointer
@@ -299,6 +311,7 @@ impl MipsCore {
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,
             halted: false,
+            in_delay_slot: false,
             status_changed_cb: None,
             nanotlb: [NanoTlbEntry::default(); 3],
         };

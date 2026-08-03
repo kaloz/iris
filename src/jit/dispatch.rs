@@ -312,7 +312,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             // Probe the JIT code cache
             let (pc, in_delay_slot) = {
                 let exec = unsafe { &*exec_ptr };
-                (exec.core.pc, exec.in_delay_slot)
+                (exec.core.pc, exec.core.in_delay_slot)
             };
             let pc32 = pc as u32;
 
@@ -736,7 +736,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 chain_break_limit += 1;
                                 break;
                             }
-                            let (next_pc, next_delay) = (exec.core.pc, exec.in_delay_slot);
+                            let (next_pc, next_delay) = (exec.core.pc, exec.core.in_delay_slot);
                             let next_pc32 = next_pc as u32;
                             let in_prom = (next_pc32 >= 0x9FC00000 && next_pc32 < 0xA0000000)
                                 || (next_pc32 >= 0xBFC00000);
@@ -965,7 +965,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     cp0_count: exec.core.cp0_count,
                     cp0_status: exec.core.cp0_status,
                     cp0_cause: exec.core.cp0_cause,
-                    in_delay_slot: exec.in_delay_slot as u8,
+                    in_delay_slot: exec.core.in_delay_slot as u8,
                     _pad: [0; 7],
                     gpr_hash: TraceRecord::hash_gprs(&exec.core.gpr),
                 });
@@ -1090,7 +1090,7 @@ fn interpreter_loop<T: Tlb, C: MipsCache>(
                     cp0_count: exec.core.cp0_count,
                     cp0_status: exec.core.cp0_status,
                     cp0_cause: exec.core.cp0_cause,
-                    in_delay_slot: exec.in_delay_slot as u8,
+                    in_delay_slot: exec.core.in_delay_slot as u8,
                     _pad: [0; 7],
                     gpr_hash: TraceRecord::hash_gprs(&exec.core.gpr),
                 });

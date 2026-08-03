@@ -55,7 +55,7 @@ impl CpuRollbackSnapshot {
             cp0_entrylo1:      exec.core.cp0_entrylo1,
             cp0_pagemask:      exec.core.cp0_pagemask,
             nanotlb:           exec.core.nanotlb,
-            in_delay_slot:     exec.in_delay_slot,
+            in_delay_slot:     exec.core.in_delay_slot,
             delay_slot_target: exec.delay_slot_target,
             cached_pending:    exec.cached_pending,
             tlb,
@@ -81,7 +81,7 @@ impl CpuRollbackSnapshot {
         exec.core.cp0_entrylo1 = self.cp0_entrylo1;
         exec.core.cp0_pagemask = self.cp0_pagemask;
         exec.core.nanotlb      = self.nanotlb;
-        exec.in_delay_slot     = self.in_delay_slot;
+        exec.core.in_delay_slot     = self.in_delay_slot;
         exec.delay_slot_target = self.delay_slot_target;
         exec.cached_pending    = self.cached_pending;
         exec.tlb.restore_from_mips_tlb(&self.tlb);
