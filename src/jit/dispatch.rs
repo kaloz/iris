@@ -467,9 +467,9 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 
                             // For branch-likely-not-taken, the delay slot is
                             // nullified: the JIT counts it in block_len but the
-                            // interpreter's EXEC_BRANCH_LIKELY_SKIP handles it
-                            // in one step. Detect via JIT PC + 4 == expected
-                            // not-taken PC (block_pc + (block_len-1)*4 + 8).
+                            // interpreter's handle_branch_likely_skip handles it
+                            // in one step (PC += 8). Detect via JIT PC + 4 ==
+                            // expected not-taken PC (block_pc + (block_len-1)*4 + 8).
                             let likely_not_taken = block_has_likely
                                 && block_len >= 2
                                 && jit_pc == pc.wrapping_add((block_len as u64 - 2) * 4 + 8);

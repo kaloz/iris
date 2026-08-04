@@ -494,17 +494,20 @@ impl Default for DecodedInstr {
     }
 }
 
-// Non-exception status tags in bits [15:8]
-pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // normal completion (advance PC by 4)
-pub const EXEC_COMPLETE_NO_INC:    ExecStatus = 0x0000_0080; // completion, PC already set (no increment)
+// Non-exception status tags in bits [15:8]. EXEC_COMPLETE carries no
+// PC-related meaning — every handler sets core.pc itself before returning
+// (directly, or via branch_delay/handle_exec_complete/
+// handle_branch_likely_skip) — it's just "ran fine, no
+// exception/retry/breakpoint". EXEC_COMPLETE_NO_INC / EXEC_BRANCH_DELAY /
+// EXEC_BRANCH_LIKELY_SKIP / EXEC_COMPLETE_SKIP8 used to distinguish *why*
+// PC ended up where it did (interpreter PC+=4 vs a JIT/ERET direct-set vs a
+// taken branch vs PC+=8) back when callers needed that to decide whether to
+// advance PC themselves; now that every handler is unconditionally
+// responsible for its own PC, the distinction is dead — removed. Real
+// callers that need "was a branch just taken" (e.g. gdbstub's step_one)
+// check `core.in_delay_slot` instead.
+pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // ran fine, no exception/retry/breakpoint
 pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry same instr
-pub const EXEC_BRANCH_DELAY:       ExecStatus = 0x0000_0200; // branch taken; target in delay_slot_target
-// Both "branch likely not taken" and "fused 2-instruction straight-line
-// sequence complete" (e.g. LUI+ORI/ADDIU load32) mean exactly the same thing
-// at dispatch time: PC += 8, nothing else. Kept as one constant with two names
-// so each call site reads clearly for its own context.
-pub const EXEC_BRANCH_LIKELY_SKIP: ExecStatus = 0x0000_0400; // branch likely not taken, skip delay slot
-pub const EXEC_COMPLETE_SKIP8:     ExecStatus = EXEC_BRANCH_LIKELY_SKIP; // completion, PC+=8 (fused straight-line sequence)
 pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
 
 // Exception flags
@@ -1004,7 +1007,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// and advance PC to the delay-slot instruction. If a delay slot is
     /// already active (branch-in-delay-slot, unusual but legal), the existing
     /// one is left alone — only its target-of-record differs, PC still just
-    /// advances by 4 to fetch/execute whatever sits there.
+    /// advances by 4 to fetch/execute whatever sits there. `core.in_delay_slot`
+    /// is the real signal that a branch/jump was just taken (checked by e.g.
+    /// gdbstub's step_one to know whether to also step the delay slot) — the
+    /// return value carries no information of its own, every handler already
+    /// sets `core.pc` itself.
     #[inline(always)]
     fn branch_delay(&mut self, target: u64) -> ExecStatus {
         self.delay_slot_target = target;
@@ -1012,7 +1019,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.core.in_delay_slot = true;
         }
         self.core.pc = self.core.pc.wrapping_add(4);
-        EXEC_BRANCH_DELAY
+        EXEC_COMPLETE
     }
 
     /// Terminal action for a handler that completes normally: advance into a
@@ -1035,7 +1042,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[inline(always)]
     fn handle_branch_likely_skip(&mut self) -> ExecStatus {
         self.core.pc = self.core.pc.wrapping_add(8);
-        EXEC_BRANCH_LIKELY_SKIP
+        EXEC_COMPLETE
     }
 
     /// Finish a handler given a raw status straight out of read_data/write_data/
@@ -2109,7 +2116,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return self.branch_delay(target);
         }
         self.core.pc = target;
-        EXEC_COMPLETE_NO_INC
+        EXEC_COMPLETE
     }
     fn exec_jalr(&mut self, d: &DecodedInstr) -> ExecStatus {
         let target = self.core.read_gpr(d.rs as u32);
@@ -2580,7 +2587,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return self.branch_delay(target);
         }
         self.core.pc = target;
-        EXEC_COMPLETE_NO_INC
+        EXEC_COMPLETE
     }
 
     // JAL - Jump and Link
@@ -2601,7 +2608,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return self.branch_delay(target);
         }
         self.core.pc = target;
-        EXEC_COMPLETE_NO_INC
+        EXEC_COMPLETE
     }
 
     // BEQ - Branch on Equal
@@ -2617,11 +2624,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     // BEQ fused with a NOP delay slot (see FLAG_IMM_IS_NEXT): the delay slot is
-    // never fetched/decoded/dispatched. Taken sets PC=target directly
-    // (EXEC_COMPLETE_NO_INC); not taken reuses EXEC_BRANCH_LIKELY_SKIP's PC+=8.
-    // If THIS branch is itself in another branch's delay slot (see
-    // exec_jr_nop), neither shortcut is safe — fall back to plain behavior so
-    // the "fused" NOP is fetched/executed normally as the real delay slot.
+    // never fetched/decoded/dispatched. Taken sets PC=target directly; not
+    // taken uses handle_branch_likely_skip's PC+=8. If THIS branch is itself
+    // in another branch's delay slot (see exec_jr_nop), neither shortcut is
+    // safe — fall back to plain behavior so the "fused" NOP is
+    // fetched/executed normally as the real delay slot.
     #[cfg(feature = "opcodefusion")]
     fn exec_beq_nop(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32);
@@ -2632,7 +2639,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 return self.branch_delay(target);
             }
             self.core.pc = target;
-            EXEC_COMPLETE_NO_INC
+            EXEC_COMPLETE
         } else if self.core.in_delay_slot {
             self.handle_exec_complete()
         } else {
@@ -2663,7 +2670,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 return self.branch_delay(target);
             }
             self.core.pc = target;
-            EXEC_COMPLETE_NO_INC
+            EXEC_COMPLETE
         } else if self.core.in_delay_slot {
             self.handle_exec_complete()
         } else {
@@ -3616,7 +3623,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             FUNCT_TLBWI => { self.exec_tlbwi(); self.handle_exec_complete() }
             FUNCT_TLBWR => { self.exec_tlbwr(); self.handle_exec_complete() }
             FUNCT_TLBP => { self.exec_tlbp(); self.handle_exec_complete() }
-            FUNCT_ERET => self.exec_eret(), // already EXEC_COMPLETE_NO_INC — PC set directly, terminal as-is
+            FUNCT_ERET => self.exec_eret(), // PC set directly, terminal as-is
             FUNCT_WAIT => self.handle_exec_complete(), // phi opcode: invalid but not RI on R4000 (NOP)
             _ => {
                 let s = self.reserved_instruction(d);
@@ -3741,8 +3748,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // ERET jumps immediately without delay slot
         self.core.pc = target;
 
-        // Return EXEC_COMPLETE_NO_INC since we've already set PC
-        EXEC_COMPLETE_NO_INC
+        EXEC_COMPLETE
     }
 
     // ===== COP1 (FPU) Instructions =====
@@ -7283,37 +7289,34 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
     }
 
     fn step_one(&self) -> StopReason {
-        use crate::mips_exec::{
-            EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_BREAKPOINT, EXEC_COMPLETE,
-            EXEC_COMPLETE_NO_INC,
-        };
+        use crate::mips_exec::EXEC_BREAKPOINT;
         self.cpu.stop(); // ensure no thread is running
         let mut exec = self.cpu.executor.lock();
         exec.last_bp_hit = None;
 
-        // Execute one instruction. If it's a branch, also execute the delay slot.
+        // Execute one instruction. If it's a branch, also execute the delay
+        // slot, so a single GDB-visible step lands past it rather than
+        // stopping mid-delay-slot. `core.in_delay_slot` (set by
+        // branch_delay, cleared by handle_exec_complete) is the real signal
+        // that a branch/jump was just taken and its delay slot hasn't run
+        // yet — status codes carry no PC-related information of their own
+        // (every handler sets core.pc itself before returning).
         //eprintln!("GDB: step_one: PC={:#018x}", exec.core.pc);
         let status = exec.step();
         //eprintln!("GDB: step_one: after step status={:#010x} PC={:#018x}", status, exec.core.pc);
-        let reason = match status {
-            EXEC_BREAKPOINT => {
-                drop(exec);
-                return StopReason::SwBreakpoint;
-            }
-            EXEC_BRANCH_DELAY => {
-                // Branch taken — execute delay slot instruction too.
-                let ds_status = exec.step();
-                if ds_status == EXEC_BREAKPOINT {
-                    StopReason::SwBreakpoint
-                } else {
-                    StopReason::DoneStep
-                }
-            }
-            EXEC_BRANCH_LIKELY_SKIP => {
-                // Branch likely not taken — delay slot skipped, PC already advanced.
+        let reason = if status == EXEC_BREAKPOINT {
+            drop(exec);
+            return StopReason::SwBreakpoint;
+        } else if exec.core.in_delay_slot {
+            // Branch taken — execute delay slot instruction too.
+            let ds_status = exec.step();
+            if ds_status == EXEC_BREAKPOINT {
+                StopReason::SwBreakpoint
+            } else {
                 StopReason::DoneStep
             }
-            _ => StopReason::DoneStep,
+        } else {
+            StopReason::DoneStep
         };
         exec.flush_cycles();
         drop(exec);

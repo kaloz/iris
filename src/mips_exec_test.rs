@@ -3,7 +3,7 @@ mod tests {
     use std::sync::Mutex;
     use std::collections::HashMap;
     use crate::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
-    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_COMPLETE_NO_INC, EXEC_COMPLETE_SKIP8, EXEC_BREAKPOINT, EXEC_BRANCH_DELAY, EXEC_BRANCH_LIKELY_SKIP, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
+    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
     use crate::mips_isa::*;
     use crate::mips_tlb::PassthroughTlb;
     use crate::mips_cache_v2::{PassthroughCache, MipsCache, R4000Cache};
@@ -291,7 +291,7 @@ mod tests {
         let offset = 4; // Target = PC + 4 + 4*4 = 0x1000 + 4 + 16 = 0x1014
         let instr = make_i(OP_BEQ, 1, 2, offset as u16);
         
-        { let _s = exec.exec(instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { let _s = exec.exec(instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
 
         // Reset executor for independent test
         let (mut exec, _) = create_executor();
@@ -316,7 +316,7 @@ mod tests {
         let instr = make_j(OP_J, target);
         // Target address = (PC+4) & 0xF0000000 | (target << 2)
         // 0x1004 & ... | 0x400 = 0x400
-        { let _s = exec.exec(instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400); }
+        { let _s = exec.exec(instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400); }
 
         // Reset executor for independent test
         let (mut exec, _) = create_executor();
@@ -324,7 +324,7 @@ mod tests {
 
         // JAL target
         let instr = make_j(OP_JAL, target);
-        { let _s = exec.exec(instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400); assert_eq!(exec.core.read_gpr(31), 0x1008); }
+        { let _s = exec.exec(instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400); assert_eq!(exec.core.read_gpr(31), 0x1008); }
     }
 
     #[test]
@@ -669,10 +669,9 @@ mod tests {
 
         // Execute ERET instruction
         // COP0 with RS=TLB (0x10) and FUNCT=ERET (0x18)
-        // ERET sets PC directly (no delay slot) and reports EXEC_COMPLETE_NO_INC
-        // so exec_decoded's normal PC+4 doesn't clobber it.
+        // ERET sets PC directly (no delay slot).
         let eret_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x18;
-        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE_NO_INC);
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
 
         // Verify PC was restored from EPC and EXL was cleared
         assert_eq!(exec.core.pc, 0xBFC00100);
@@ -683,7 +682,7 @@ mod tests {
         exec.core.cp0_status = 0x04;  // ERL bit set
         exec.core.pc = 0xBFC00400;
 
-        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE_NO_INC);
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
 
         // Verify PC was restored from ErrorEPC and ERL was cleared
         assert_eq!(exec.core.pc, 0xBFC00300);
@@ -701,7 +700,7 @@ mod tests {
 
         // BEQL r1, r2, offset=4 (branch to 0x1000 + 4 + 4*4 = 0x1014)
         let beql_instr = make_i(OP_BEQL, 1, 2, 4);
-        { let _s = exec.exec(beql_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
+        { let _s = exec.exec(beql_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
 
         // PC should be at 0x1004 (delay slot)
         assert_eq!(exec.core.pc, 0x1004);
@@ -720,7 +719,7 @@ mod tests {
 
         // BNEL r1, r2, offset=8
         let bnel_instr = make_i(OP_BNEL, 1, 2, 8);
-        { let _s = exec.exec(bnel_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x2024 ); };
+        { let _s = exec.exec(bnel_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x2024 ); };
 
         // Execute delay slot NOP
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
@@ -731,7 +730,7 @@ mod tests {
         exec.core.write_gpr(1, 0);
 
         let blezl_instr = make_i(OP_BLEZL, 1, 0, 2);
-        { let _s = exec.exec(blezl_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x300C ); };
+        { let _s = exec.exec(blezl_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x300C ); };
 
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x300C);
@@ -741,7 +740,7 @@ mod tests {
         exec.core.write_gpr(1, 100);
 
         let bgtzl_instr = make_i(OP_BGTZL, 1, 0, 2);
-        { let _s = exec.exec(bgtzl_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400C ); };
+        { let _s = exec.exec(bgtzl_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x400C ); };
 
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x400C);
@@ -760,7 +759,7 @@ mod tests {
 
         // BEQL r1, r2, offset=4 (won't branch because r1 != r2)
         let beql_instr = make_i(OP_BEQL, 1, 2, 4);
-        assert_eq!(exec.exec(beql_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(beql_instr), EXEC_COMPLETE);
 
         // PC should skip both the branch instruction AND the delay slot (PC + 8)
         assert_eq!(exec.core.pc, 0x1008);
@@ -776,7 +775,7 @@ mod tests {
         exec.core.write_gpr(1, 42);
         exec.core.write_gpr(2, 42);
         let bnel_instr = make_i(OP_BNEL, 1, 2, 4);
-        assert_eq!(exec.exec(bnel_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bnel_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x2008);
 
         // Test BLEZL - NOT TAKEN
@@ -784,7 +783,7 @@ mod tests {
         exec.core.write_gpr(1, 100);  // positive value
 
         let blezl_instr = make_i(OP_BLEZL, 1, 0, 2);
-        assert_eq!(exec.exec(blezl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(blezl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x3008);
 
         // Test BGTZL - NOT TAKEN
@@ -792,7 +791,7 @@ mod tests {
         exec.core.write_gpr(1, 0);  // zero
 
         let bgtzl_instr = make_i(OP_BGTZL, 1, 0, 2);
-        assert_eq!(exec.exec(bgtzl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bgtzl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x4008);
 
         // Test BGTZL with negative - NOT TAKEN
@@ -800,7 +799,7 @@ mod tests {
         exec.core.write_gpr(1, -10i64 as u64);
 
         let bgtzl_instr = make_i(OP_BGTZL, 1, 0, 2);
-        assert_eq!(exec.exec(bgtzl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bgtzl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x5008);
     }
 
@@ -813,7 +812,7 @@ mod tests {
         exec.core.write_gpr(1, -10i64 as u64);
 
         let bltzl_instr = make_i(OP_REGIMM, 1, RT_BLTZL, 4);
-        { let _s = exec.exec(bltzl_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
+        { let _s = exec.exec(bltzl_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
 
         let nop = make_r(0, 0, 0, 0, 0, 0);
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
@@ -824,7 +823,7 @@ mod tests {
         exec.core.write_gpr(1, 100);
 
         let bltzl_instr = make_i(OP_REGIMM, 1, RT_BLTZL, 4);
-        assert_eq!(exec.exec(bltzl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bltzl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x2008);
 
         // Test BGEZL (Branch on Greater Than or Equal to Zero Likely) - TAKEN
@@ -832,7 +831,7 @@ mod tests {
         exec.core.write_gpr(1, 0);
 
         let bgezl_instr = make_i(OP_REGIMM, 1, RT_BGEZL, 4);
-        { let _s = exec.exec(bgezl_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3014 ); };
+        { let _s = exec.exec(bgezl_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3014 ); };
 
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x3014);
@@ -842,7 +841,7 @@ mod tests {
         exec.core.write_gpr(1, -10i64 as u64);
 
         let bgezl_instr = make_i(OP_REGIMM, 1, RT_BGEZL, 4);
-        assert_eq!(exec.exec(bgezl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bgezl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x4008);
 
         // Test BLTZALL (Branch on Less Than Zero And Link Likely) - TAKEN
@@ -851,7 +850,7 @@ mod tests {
         exec.core.write_gpr(31, 0);
 
         let bltzall_instr = make_i(OP_REGIMM, 1, RT_BLTZALL, 4);
-        { let _s = exec.exec(bltzall_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x5014 ); };
+        { let _s = exec.exec(bltzall_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x5014 ); };
         assert_eq!(exec.core.read_gpr(31), 0x5008);  // Return address saved
 
         assert_eq!(exec.exec(nop), EXEC_COMPLETE);
@@ -863,7 +862,7 @@ mod tests {
         exec.core.write_gpr(31, 0);
 
         let bgezall_instr = make_i(OP_REGIMM, 1, RT_BGEZALL, 4);
-        assert_eq!(exec.exec(bgezall_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bgezall_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(31), 0x6008);  // Return address still saved even though not taken
         assert_eq!(exec.core.pc, 0x6008);
     }
@@ -1681,7 +1680,7 @@ mod tests {
 
         // Test BC1T - Branch on FPU True (should branch)
         let bc1t_instr = make_cop1_branch(1, 4); // offset=4 -> target=0x1000+4+4*4=0x1014
-        { let _s = exec.exec(bc1t_instr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
+        { let _s = exec.exec(bc1t_instr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014 ); };
 
         // Reset
         exec.core.pc = 0x2000;
@@ -1696,20 +1695,20 @@ mod tests {
 
         // Test BC1F - Branch on FPU False (should branch, CC is false)
         let bc1f_instr2 = make_cop1_branch(0, 4);
-        { let _s = exec.exec(bc1f_instr2); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3014 ); };
+        { let _s = exec.exec(bc1f_instr2); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3014 ); };
 
         // Test BC1TL - Branch on FPU True Likely (should not branch and nullify)
         exec.core.set_fpu_cc(0, false);
         exec.core.pc = 0x4000;
         let bc1tl_instr = make_cop1_branch(3, 4); // bit 1 set = likely
-        assert_eq!(exec.exec(bc1tl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bc1tl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x4008); // PC+8 (skip delay slot)
 
         // Test BC1FL - Branch on FPU False Likely (should not branch and nullify)
         exec.core.set_fpu_cc(0, true);
         exec.core.pc = 0x5000;
         let bc1fl_instr = make_cop1_branch(2, 4); // bit 1 set = likely, bit 0 clear = false
-        assert_eq!(exec.exec(bc1fl_instr), EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(exec.exec(bc1fl_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0x5008);
     }
 
@@ -2017,13 +2016,13 @@ mod tests {
         // JR r1
         exec.core.write_gpr(1, 0x1000);
         let instr_jr = make_r(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR);
-        { let _s = exec.exec(instr_jr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1000); }
+        { let _s = exec.exec(instr_jr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1000); }
 
         // JALR r1, r31 (default)
         exec.core.pc = 0x2000;
         exec.core.write_gpr(1, 0x3000);
         let instr_jalr = make_r(OP_SPECIAL, 1, 0, 31, 0, FUNCT_JALR);
-        { let _s = exec.exec(instr_jalr); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3000); assert_eq!(exec.core.read_gpr(31), 0x2008); }
+        { let _s = exec.exec(instr_jalr); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3000); assert_eq!(exec.core.read_gpr(31), 0x2008); }
     }
 
     #[test]
@@ -2120,28 +2119,28 @@ mod tests {
         // BLTZ r1, offset
         exec.core.write_gpr(1, -1i64 as u64);
         let instr_bltz = make_i(OP_REGIMM, 1, RT_BLTZ, 4);
-        { let _s = exec.exec(instr_bltz); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { let _s = exec.exec(instr_bltz); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
 
         // BGEZ r1, offset
         let (mut exec, _) = create_executor();
         exec.core.pc = 0x1000;
         exec.core.write_gpr(1, 0);
         let instr_bgez = make_i(OP_REGIMM, 1, RT_BGEZ, 4);
-        { let _s = exec.exec(instr_bgez); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { let _s = exec.exec(instr_bgez); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
 
         // BLEZ r1, offset
         let (mut exec, _) = create_executor();
         exec.core.pc = 0x1000;
         exec.core.write_gpr(1, 0);
         let instr_blez = make_i(OP_BLEZ, 1, 0, 4);
-        { let _s = exec.exec(instr_blez); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { let _s = exec.exec(instr_blez); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
 
         // BGTZ r1, offset
         let (mut exec, _) = create_executor();
         exec.core.pc = 0x1000;
         exec.core.write_gpr(1, 1);
         let instr_bgtz = make_i(OP_BGTZ, 1, 0, 4);
-        { let _s = exec.exec(instr_bgtz); assert_eq!(_s, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { let _s = exec.exec(instr_bgtz); assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
     }
 
     #[test]
@@ -2812,7 +2811,7 @@ mod tests {
         exec.core.pc = 0x1000;
         let bc1t_cc0 = make_bc1(0, true, false, 4); // offset 4 -> PC+4+(4<<2) = 0x1000+4+16 = 0x1014
         let result = exec.exec(bc1t_cc0);
-        { assert_eq!(result, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
+        { assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x1014); }
 
         // Test BC1F on CC0 (should not branch - CC0 is true)
         exec.core.pc = 0x2000;
@@ -2824,19 +2823,19 @@ mod tests {
         exec.core.pc = 0x3000;
         let bc1t_cc3 = make_bc1(3, true, false, 8); // offset 8 -> PC+4+(8<<2) = 0x3000+4+32 = 0x3024
         let result = exec.exec(bc1t_cc3);
-        { assert_eq!(result, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3024); }
+        { assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3024); }
 
         // Test BC1F on CC5 (should branch - CC5 is false)
         exec.core.pc = 0x4000;
         let bc1f_cc5 = make_bc1(5, false, false, -2); // offset -2 -> PC+4+(-2<<2) = 0x4000+4-8 = 0x3FFC
         let result = exec.exec(bc1f_cc5);
-        { assert_eq!(result, EXEC_BRANCH_DELAY, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3FFC); }
+        { assert!(exec.core.in_delay_slot, "Expected BranchDelay"); assert_eq!(exec.delay_slot_target, 0x3FFC); }
 
         // Test BC1TL (likely) on CC5 (should not take, nullify delay slot - CC5 is false)
         exec.core.pc = 0x5000;
         let bc1tl_cc5 = make_bc1(5, true, true, 4);
         let result = exec.exec(bc1tl_cc5);
-        assert_eq!(result, EXEC_BRANCH_LIKELY_SKIP);
+        assert_eq!(result, EXEC_COMPLETE);
     }
 
     #[test]
@@ -2993,7 +2992,7 @@ mod tests {
 
         exec.core.pc = pc_base;
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused taken BEQ sets PC directly, not EXEC_BRANCH_DELAY");
+        assert_eq!(s, EXEC_COMPLETE, "fused taken BEQ sets PC directly, no delay slot");
         assert_eq!(exec.core.pc, pc_base + 16, "PC should jump straight to branch target");
         assert!(!exec.core.in_delay_slot, "fused path must never set in_delay_slot");
 
@@ -3017,7 +3016,7 @@ mod tests {
         exec.core.pc = pc_base + 256;
         exec.core.write_gpr(31, pc_base + 300);
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE_NO_INC, "fused JR sets PC directly");
+        assert_eq!(s, EXEC_COMPLETE, "fused JR sets PC directly");
         assert_eq!(exec.core.pc, pc_base + 300, "PC should jump straight to r31");
         assert!(!exec.core.in_delay_slot);
     }
@@ -3068,7 +3067,7 @@ mod tests {
         exec.core.write_gpr(1, 0);
         exec.core.write_gpr(3, 0);
         let s = exec.step();
-        assert_eq!(s, EXEC_BRANCH_DELAY, "must re-decode as unfused branch once delay slot is no longer a NOP");
+        assert!(exec.core.in_delay_slot, "must re-decode as unfused branch once delay slot is no longer a NOP");
         assert_eq!(exec.delay_slot_target, pc_base + 16);
         let s2 = exec.step();
         assert_eq!(s2, EXEC_COMPLETE);
@@ -3118,7 +3117,7 @@ mod tests {
 
         exec.core.pc = pc_base;
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE_SKIP8, "fused LUI+ORI should complete in one step");
+        assert_eq!(s, EXEC_COMPLETE, "fused LUI+ORI should complete in one step");
         assert_eq!(exec.core.pc, pc_base + 8, "PC should skip both fused instructions");
         assert_eq!(exec.core.read_gpr(3) as u32, 0xa87474f0);
         // Upper 32 bits: LUI's result is sign-extended (0xa874<<16 has bit31 set),
@@ -3126,12 +3125,12 @@ mod tests {
         assert_eq!(exec.core.read_gpr(3), 0xFFFFFFFFa87474f0);
 
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE_SKIP8, "fused LUI+ADDIU should complete in one step");
+        assert_eq!(s, EXEC_COMPLETE, "fused LUI+ADDIU should complete in one step");
         assert_eq!(exec.core.pc, pc_base + 16);
         assert_eq!(exec.core.read_gpr(2), 0x12345678);
 
         let s = exec.step();
-        assert_eq!(s, EXEC_COMPLETE_SKIP8);
+        assert_eq!(s, EXEC_COMPLETE);
         assert_eq!(exec.core.pc, pc_base + 24);
         // lui=0x12340000, addiu adds sign_extend(0xFFFF)=-1 -> 0x1233FFFF
         assert_eq!(exec.core.read_gpr(2), 0x1233FFFF);
@@ -3253,7 +3252,7 @@ mod tests {
 
         exec.core.pc = pc_base;
         let s = exec.step();
-        assert_eq!(s, EXEC_BRANCH_DELAY, "BEQ taken, real delay slot begins");
+        assert!(exec.core.in_delay_slot, "BEQ taken, real delay slot begins");
         assert_eq!(exec.core.pc, pc_base + 4);
 
         // Execute the ADDIU (in the delay slot): must NOT fuse away the LW —
@@ -3411,7 +3410,7 @@ mod tests {
         exec.core.write_gpr(2, 5);
         let instr = make_i(OP_BEQ, 1, 2, 0xFFFC); // -4
         let s = exec.exec(instr);
-        assert_eq!(s, EXEC_BRANCH_DELAY);
+        assert!(exec.core.in_delay_slot);
         assert_eq!(exec.delay_slot_target, 0x2004u64.wrapping_add((-4i64 * 4) as u64));
 
         // BGTZ with negative offset (not taken because rs=0)
@@ -3425,7 +3424,7 @@ mod tests {
         exec.core.write_gpr(1, (-1i64) as u64);
         let instr = make_i(OP_REGIMM, 1, RT_BLTZ as u32, 0xFFFC);
         let s = exec.exec(instr);
-        assert_eq!(s, EXEC_BRANCH_DELAY);
+        assert!(exec.core.in_delay_slot);
         assert_eq!(exec.delay_slot_target, 0x2004u64.wrapping_add((-4i64 * 4) as u64));
     }
 
@@ -3437,21 +3436,21 @@ mod tests {
         exec.core.pc = 0x1000;
         let instr = make_j(OP_J, 1);
         let s = exec.exec(instr);
-        assert_eq!(s, EXEC_BRANCH_DELAY);
+        assert!(exec.core.in_delay_slot);
         assert_eq!(exec.delay_slot_target, 4);
 
         // J with max target=0x3FFFFFF: low 28 bits = 0xFFFFFFFC
         exec.core.pc = 0x1000;
         let instr = make_j(OP_J, 0x3FFFFFF);
         let s = exec.exec(instr);
-        assert_eq!(s, EXEC_BRANCH_DELAY);
+        assert!(exec.core.in_delay_slot);
         assert_eq!(exec.delay_slot_target, (0x1004u64 & 0xFFFFFFFF_F0000000) | 0x0FFFFFFC);
 
         // JAL saves return address
         exec.core.pc = 0x1000;
         let instr = make_j(OP_JAL, 0x100);
         let s = exec.exec(instr);
-        assert_eq!(s, EXEC_BRANCH_DELAY);
+        assert!(exec.core.in_delay_slot);
         assert_eq!(exec.delay_slot_target, (0x1004u64 & 0xFFFFFFFF_F0000000) | 0x400);
         assert_eq!(exec.core.read_gpr(31), 0x1008);
     }
