@@ -1045,6 +1045,26 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         EXEC_COMPLETE
     }
 
+    /// Terminal action for a *non-likely* conditional branch's not-taken arm
+    /// (BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ/BLTZAL/BGEZAL — never the "likely" family,
+    /// which annuls the slot entirely via `handle_branch_likely_skip` instead).
+    /// Per the MIPS spec the delay slot always executes, taken or not — this
+    /// is structurally identical to `branch_delay`, just with the resolved
+    /// target fixed at `pc+8` instead of the branch's computed target. Before
+    /// this existed, not-taken went through the same path as an ordinary
+    /// completed instruction (`handle_exec_complete`'s plain `pc+=4`), which
+    /// executes correctly (the delay slot's *next* dispatch just lands on
+    /// pc+4 and runs normally either way) but leaves `core.in_delay_slot`
+    /// false while the delay slot instruction executes — so if that
+    /// instruction itself faults, `handle_exception` sees `in_delay_slot ==
+    /// false` and gets `Cause.BD` and `EPC` wrong (should point at this
+    /// branch with BD set, per spec; would instead point straight at the
+    /// delay-slot instruction with BD clear).
+    #[inline(always)]
+    fn handle_branch_not_taken(&mut self) -> ExecStatus {
+        self.branch_delay(self.core.pc.wrapping_add(8))
+    }
+
     /// Finish a handler given a raw status straight out of read_data/write_data/
     /// translate (i.e. not yet run through handle_exception): dispatches to
     /// handle_exception if the EXEC_IS_EXCEPTION bit is set, otherwise passes
@@ -2619,7 +2639,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            self.handle_exec_complete()
+            self.handle_branch_not_taken()
         }
     }
 
@@ -2655,7 +2675,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            self.handle_exec_complete()
+            self.handle_branch_not_taken()
         }
     }
 
@@ -2685,7 +2705,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            self.handle_exec_complete()
+            self.handle_branch_not_taken()
         }
     }
 
@@ -2696,7 +2716,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
             self.branch_delay(target)
         } else {
-            self.handle_exec_complete()
+            self.handle_branch_not_taken()
         }
     }
 
@@ -2751,12 +2771,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_bltz(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val < 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_branch_not_taken() }
     }
     fn exec_bgez(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
-        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_branch_not_taken() }
     }
     fn exec_bltzl_ri(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
@@ -2796,13 +2816,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val < 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
+        if rs_val < 0 { self.branch_delay(target) } else { self.handle_branch_not_taken() }
     }
     fn exec_bgezal(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
         let target = self.core.pc.wrapping_add(4).wrapping_add(d.immu64());
         self.core.write_gpr(31, self.core.pc + 8);
-        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_exec_complete() }
+        if rs_val >= 0 { self.branch_delay(target) } else { self.handle_branch_not_taken() }
     }
     fn exec_bltzall(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rs_val = self.core.read_gpr(d.rs as u32) as i64;
@@ -3877,7 +3897,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         } else if likely {
             self.handle_branch_likely_skip()
         } else {
-            self.handle_exec_complete()
+            self.handle_branch_not_taken()
         }
     }
 

@@ -300,10 +300,63 @@ mod tests {
         exec.core.pc = 0x1000;
 
         // BNE r1, r2, offset
-        // r1 == r2, not taken
+        // r1 == r2, not taken — the delay slot still always executes per
+        // spec (see test_branch_not_taken_delay_slot_sets_cause_bd for why
+        // this matters beyond just where PC ends up): in_delay_slot must be
+        // set with delay_slot_target = pc+8, exactly like the taken case
+        // above but with the fixed not-taken target instead of a computed one.
         let instr = make_i(OP_BNE, 1, 2, offset as u16);
         assert_eq!(exec.exec(instr), EXEC_COMPLETE);
-        assert_eq!(exec.core.pc, 0x1004); // PC advanced by 4
+        assert!(exec.core.in_delay_slot, "not-taken branch must still arm the delay slot (spec: BD always executes)");
+        assert_eq!(exec.delay_slot_target, 0x1008, "not-taken target is pc+8, not a computed branch target");
+        assert_eq!(exec.core.pc, 0x1004); // PC advanced by 4 to the delay slot itself, same as the taken case
+    }
+
+    /// MIPS spec: the instruction after a branch always executes, taken or
+    /// not — and if that delay-slot instruction itself faults, the exception
+    /// must report Cause.BD=1 and EPC pointing at the *branch*, not the
+    /// delay-slot instruction (so the OS handler can back up and re-execute
+    /// the branch+slot pair together, per the ISA's exception-delivery rules
+    /// for branch delay slots). Before this was fixed, a not-taken branch's
+    /// delay slot ran with `in_delay_slot == false` (indistinguishable from
+    /// an ordinary sequential instruction), so a fault there got Cause.BD=0
+    /// and EPC pointing straight at the delay-slot instruction — wrong per
+    /// spec even though the common case (no fault in the slot) executed with
+    /// the correct final PC either way.
+    #[test]
+    fn test_branch_not_taken_delay_slot_sets_cause_bd() {
+        let (mut exec, mem) = create_executor();
+        // kseg0: PassthroughTlb masks to a physical addr (virt & 0x1FFFFFFF)
+        // before MockMemory ever sees it, so the mock's writes below must
+        // target that physical address, not pc_base directly (MockMemory's
+        // flat map has no translation of its own — see
+        // test_addr_calc_load_store_fusion_fault's identical pc_base/`0`
+        // split for the same reason).
+        let pc_base: u64 = 0xFFFFFFFF80001000;
+        let phys_base: u64 = pc_base & 0x1FFFFFFF;
+
+        // BEQ r1, r2 (unequal -> not taken), delay slot LW v0, 1(t0) (misaligned -> faults)
+        exec.core.write_gpr(1, 1);
+        exec.core.write_gpr(2, 2);
+        exec.core.write_gpr(8, 0x3000); // t0, base for the misaligned load
+        exec.core.pc = pc_base;
+        let beq = make_i(OP_BEQ, 1, 2, 4);
+        let lw = make_i(OP_LW as u32, 8, 2, 1); // odd offset misaligns any word base
+        mem.set_word(phys_base, beq);
+        mem.set_word(phys_base + 4, lw);
+
+        let s1 = exec.step();
+        assert_eq!(s1, EXEC_COMPLETE, "not-taken BEQ itself must not fault");
+        assert!(exec.core.in_delay_slot, "not-taken branch must still arm the delay slot");
+        assert_eq!(exec.core.pc, pc_base + 4, "pc must sit at the delay-slot instruction");
+
+        let s2 = exec.step();
+        assert!(s2 & EXEC_IS_EXCEPTION != 0, "misaligned load in the delay slot must fault");
+        assert_eq!((s2 >> 2) & 0x1F, EXC_ADEL);
+        assert_ne!(exec.core.cp0_cause & crate::mips_core::CAUSE_BD, 0,
+            "Cause.BD must be set: the fault happened in a delay slot, taken or not");
+        assert_eq!(exec.core.cp0_epc, pc_base,
+            "EPC must point at the branch itself (pc_base), not the delay-slot instruction (pc_base+4)");
     }
 
     #[test]
