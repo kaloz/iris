@@ -37,7 +37,7 @@ impl IdleParkState {
     /// Update idle ring. Returns true when the current state repeated (safe to park).
     pub fn update(&mut self, core: &MipsCore) -> bool {
         let ie = core.interrupts_enabled();
-        let pending = core.interrupts.load(Ordering::Relaxed) as u32;
+        let pending = core.hot.interrupts.load(Ordering::Relaxed) as u32;
         let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
         let im = core.cp0_status & STATUS_IM_MASK;
         let interrupt_ready = (ip & im) != 0;
@@ -86,7 +86,7 @@ impl IdleParkState {
                 core.cp0_cause |= CAUSE_IP7;
                 break;
             }
-            let pending = core.interrupts.load(Ordering::Relaxed) as u32;
+            let pending = core.hot.interrupts.load(Ordering::Relaxed) as u32;
             let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
             let im = core.cp0_status & STATUS_IM_MASK;
             if (ip & im) != 0 {
@@ -108,7 +108,7 @@ impl IdleParkState {
             let adv_hw = ((elapsed_ns as u128 * hw_per_ns as u128) >> 32) as u64;
             core.cp0_count = core.cp0_count.wrapping_add(adv_hw << 32);
             let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
-            core.local_cycles = core.local_cycles.wrapping_add(adv_instrs);
+            core.hot.cycles = core.hot.cycles.wrapping_add(adv_instrs);
         }
     }
 }

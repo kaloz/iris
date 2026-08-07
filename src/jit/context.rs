@@ -68,7 +68,6 @@ pub struct JitContext {
 
     // Interrupt handling (cached from executor)
     pub cached_pending: u64,
-    pub local_cycles: u64,
 
     // JIT dispatch state
     pub exit_reason: u32,
@@ -108,7 +107,6 @@ impl JitContext {
             in_delay_slot: false,
             delay_slot_target: 0,
             cached_pending: 0,
-            local_cycles: 0,
             exit_reason: EXIT_NORMAL,
             block_instrs_executed: 0,
             executor_ptr: 0,
@@ -155,7 +153,6 @@ impl JitContext {
         self.in_delay_slot = exec.core.in_delay_slot;
         self.delay_slot_target = exec.delay_slot_target;
         self.cached_pending = exec.cached_pending;
-        self.local_cycles = exec.core.local_cycles;
     }
 
     /// Copy JitContext state back to the emulator.

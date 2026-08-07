@@ -50,6 +50,98 @@ pub const KSU_KERNEL: u32 = 0b00;
 pub const KSU_SUPERVISOR: u32 = 0b01;
 pub const KSU_USER: u32 = 0b10;
 
+/// The two words in `MipsCore` every other thread in the process might read
+/// on any given tick — grouped and cache-line-aligned so they share one
+/// line deliberately (both are single-word, cross-thread-read,
+/// per-instruction-adjacent counters — no reason to let the compiler's
+/// default layout scatter them next to fields with completely different
+/// access patterns and risk false sharing).
+///
+/// Both fields are inline (not `Arc<AtomicU64>`) so they're fixed
+/// `offset_of!` fields reachable directly from a bare `*mut MipsCore` — the
+/// interpreter's hot loop and JIT-compiled code both need to touch these
+/// with zero indirection (no Arc deref, no separate heap allocation to
+/// chase). External devices/threads that need to read/set them get a raw
+/// pointer into this struct instead of a cloned `Arc` — see
+/// `MipsExecutor::interrupts_ptr`/`cycles_ptr` and `MipsCpu`'s own
+/// same-named accessors. Safe because the executor (and therefore this
+/// `MipsCore`) lives in a top-level `Arc<Mutex<...>>` that outlives every
+/// device for the life of the process — callers obtain the pointer once,
+/// after the executor has reached its final, stable address.
+#[repr(align(64))]
+#[derive(Default)]
+pub struct Hot {
+    /// Interrupt-pending word. Bits 8..15 = IP0..IP7 (mirror CAUSE.IP
+    /// layout). Bit 63 = soft-reset request. A real atomic (unlike
+    /// `cycles` below): devices set/clear individual bits from their own
+    /// thread via `fetch_or`/`fetch_and`, which needs a genuine RMW, not
+    /// just eventual visibility of a monotonic count.
+    pub interrupts: AtomicU64,
+    /// Instruction/cycle counter — incremented directly, every instruction,
+    /// by whichever engine (interpreter or JIT-compiled code) retires it.
+    /// Never a batched local shadow flushed only when control returns to
+    /// `step()`'s outer loop: a dispatch loop that stays entirely inside
+    /// JIT-compiled code for a long stretch (a hot guest loop) would
+    /// otherwise never publish progress to `cycles` at all until it
+    /// happened to exit — and at least one real guest workaround (a BSD
+    /// SCSI driver's busy-wait, `Wd33c93a`'s deferred-interrupt worker
+    /// thread) depends on this counter visibly incrementing while it spins,
+    /// not just eventually catching up.
+    ///
+    /// Plain `u64`, not `AtomicU64`: readers on other threads only need
+    /// eventual visibility of the count itself, not a synchronizing RMW —
+    /// incremented via `ptr::write_volatile`/read via `ptr::read_volatile`
+    /// (see `MipsExecutor::step`'s increment site) rather than `fetch_add`,
+    /// cheaper on the hot path while still guaranteeing the compiler can't
+    /// elide or reorder the write away, which a plain non-volatile write
+    /// technically could across an unbounded loop.
+    pub cycles: u64,
+}
+
+/// A raw pointer into `Hot::cycles`, handed out by `MipsExecutor::cycles_ptr`/
+/// `MipsCpu::cycles_ptr` to devices on other threads that need to read the
+/// live cycle count (status displays, `Wd33c93a`'s deferred-interrupt
+/// spin-wait). Wraps the bare `*const u64` in a `Send`/`Sync` newtype
+/// instead of blanket-asserting `unsafe impl Send`/`Sync` on every struct
+/// that stores one — narrows the safety claim to exactly this one pointer
+/// (valid for the process lifetime once obtained: it points into the
+/// `MipsCore` owned by the executor's own top-level `Arc<Mutex<...>>`, which
+/// outlives every device) rather than silencing the compiler's check for a
+/// struct's other fields too, which would then need re-verifying by
+/// inspection every time a new field is added.
+///
+/// `Copy`: cheap to pass/store by value everywhere a bare pointer would be,
+/// no lifetime to track. Read with `.get()`, which does the
+/// `ptr::read_volatile` itself — see `Hot::cycles`'s doc comment for why a
+/// volatile read, not a plain one.
+#[derive(Clone, Copy)]
+pub struct CyclesPtr(*const u64);
+
+unsafe impl Send for CyclesPtr {}
+unsafe impl Sync for CyclesPtr {}
+
+impl CyclesPtr {
+    /// Construct from a raw pointer obtained via `MipsExecutor::cycles_ptr`/
+    /// `MipsCpu::cycles_ptr` — never call this with anything else.
+    pub fn new(ptr: *const u64) -> Self {
+        Self(ptr)
+    }
+
+    /// A `CyclesPtr` that reads as `0` forever — for fields not yet wired up
+    /// (`Rex3`/`Wd33c93a` are constructed before the CPU exists; see
+    /// `set_cpu_cycles` on each).
+    pub const fn dangling() -> Self {
+        Self(std::ptr::null())
+    }
+
+    /// Read the current cycle count. Volatile: see `Hot::cycles`'s doc
+    /// comment for why a plain read isn't enough. Returns 0 if this
+    /// `CyclesPtr` hasn't been wired up yet (`dangling()`/not yet set).
+    pub fn get(self) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { std::ptr::read_volatile(self.0) } }
+    }
+}
+
 /// MIPS CPU Core with full register state
 pub struct MipsCore {
     // General Purpose Registers (GPRs)
@@ -136,24 +228,12 @@ pub struct MipsCore {
     pub fpu_fenr: u32,        // 28: FP Enables
     pub fpu_fcsr: u32,        // 31: FP Control/Status
 
-    /// Local (non-atomic) cycle counter — incremented every instruction by MipsExecutor::step().
-    /// Used by write_cp0 calibration to get an accurate dc without waiting for the atomic flush.
-    pub local_cycles: u64,
-
-    // Interrupt handling
-    // Bits 8..15 = IP0..IP7 (mirror CAUSE.IP layout).  Bit 63 = soft-reset request.
-    //
-    // Inline (not Arc<AtomicU64>) so it's a fixed offset_of! field reachable
-    // directly from a bare `*mut MipsCore` — the interpreter's hot loop and
-    // JIT-compiled code both need to load this with zero indirection (no
-    // Arc deref, no separate heap allocation to chase). External devices
-    // that need to set interrupt bits from their own thread (e.g. Ioc) get a
-    // raw `*const AtomicU64` into this field instead of a cloned Arc — see
-    // `MipsExecutor::interrupts_ptr_for_devices`. Safe because the executor
-    // (and therefore this MipsCore) lives in a top-level `Arc<Mutex<...>>`
-    // that outlives every device for the life of the process.
-    pub interrupts: AtomicU64,
-    pub cycles: Arc<AtomicU64>,
+    /// Interrupt-pending word and instruction/cycle counter — the two
+    /// fields every other thread in the process might read on any given
+    /// tick, grouped into one cache-line-aligned struct (see [`Hot`]'s own
+    /// doc comment) rather than left to whatever the compiler's default
+    /// field layout happens to produce.
+    pub hot: Hot,
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
     pub fasttick_count: Arc<AtomicU64>,
 
@@ -305,9 +385,7 @@ impl MipsCore {
             fpu_fexr: 0,
             fpu_fenr: 0,
             fpu_fcsr: 0,
-            local_cycles: 0,
-            interrupts: AtomicU64::new(0),
-            cycles: Arc::new(AtomicU64::new(0)),
+            hot: Hot::default(),
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,
             halted: false,
@@ -339,7 +417,7 @@ impl MipsCore {
             self.cp0_compare = 0;
             self.count_step = 1 << 31;
             self.count_step_atomic.store(1 << 31, Ordering::Relaxed);
-            self.local_cycles = 0;
+            self.hot.cycles = 0;
             self.compare_last_cycles = 0;
             self.compare_last_instant = std::time::Instant::now();
             self.cp0_random = self.tlb_entries - 1;
@@ -390,7 +468,7 @@ impl MipsCore {
     /// Reset the CPU to initial state
     pub fn reset(&mut self, soft: bool) {
         self.reset_registers(soft);
-        self.interrupts.store(0, Ordering::SeqCst);
+        self.hot.interrupts.store(0, Ordering::SeqCst);
     }
 
     /// Read a GPR by index. gpr[0] is always kept at zero.
@@ -408,7 +486,7 @@ impl MipsCore {
 
     /// Update Random register based on current cycle count
     pub fn update_random(&mut self) {
-        let current_cycles = self.cycles.load(Ordering::Relaxed);
+        let current_cycles = self.hot.cycles;
         let wired = self.cp0_wired;
         let max_entry = self.tlb_entries - 1;
 
@@ -573,7 +651,7 @@ impl MipsCore {
             6 => {
                 self.cp0_wired = value as u32;
                 self.cp0_random = self.tlb_entries - 1;
-                self.cp0_random_cycle = self.cycles.load(Ordering::Relaxed);
+                self.cp0_random_cycle = self.hot.cycles;
             }
             8 => { /* BadVAddr is read-only */ }
             9 => self.cp0_count = value << 32,
@@ -609,7 +687,7 @@ impl MipsCore {
                 const NS_PER_GUEST_CYCLE: u64 = 10;
                 #[cfg(not(feature = "ci_clock"))]
                 let now = std::time::Instant::now();
-                let cycles_now = self.local_cycles;
+                let cycles_now = self.hot.cycles;
                 // Compute new_delta before the calibration block so we can guard on it.
                 // Top bit set means cp0_count > cp0_compare — counter hasn't wrapped correctly
                 // or the kernel is writing a compare in the past. Skip calibration entirely.
@@ -730,13 +808,13 @@ impl MipsCore {
     /// Set interrupt bit
     #[inline]
     pub fn set_interrupt(&self, bit: u8) {
-        self.interrupts.fetch_or(1u64 << (bit + 8), Ordering::SeqCst);
+        self.hot.interrupts.fetch_or(1u64 << (bit + 8), Ordering::SeqCst);
     }
 
     /// Clear interrupt bit
     #[inline]
     pub fn clear_interrupt(&self, bit: u8) {
-        self.interrupts.fetch_and(!(1u64 << (bit + 8)), Ordering::SeqCst);
+        self.hot.interrupts.fetch_and(!(1u64 << (bit + 8)), Ordering::SeqCst);
     }
 
     /// Get current privilege mode

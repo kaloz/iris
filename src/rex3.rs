@@ -1197,8 +1197,17 @@ pub struct Rex3 {
     /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
     /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
     pub heartbeat: Arc<AtomicU64>,
-    /// CPU cycle counter, shared with the CPU thread.
-    pub cycles: Arc<AtomicU64>,
+    /// Pointer into the CPU's `MipsCore.hot.cycles` word (see
+    /// `CyclesPtr`/`Hot::cycles`'s doc comments). Set exactly once, from
+    /// `set_cpu_cycles`, during single-threaded `Machine::new` setup — after
+    /// the CPU exists (`Rex3::new` runs before it does, so this can't be a
+    /// constructor parameter; see `MipsCpu::cycles_ptr`) but strictly before
+    /// any device thread (including this struct's own refresh thread) is
+    /// spawned, so a plain `Cell` (same as `interp_setup_cache` above) is
+    /// enough — no atomicity needed for the pointer variable itself.
+    /// `CyclesPtr::dangling()` until `set_cpu_cycles` runs; its own `get()`
+    /// treats that as "not wired up yet" and reports 0.
+    pub cycles: std::cell::Cell<crate::mips_core::CyclesPtr>,
     /// CP0 Count==Compare match counter — incremented every fastick interrupt.
     pub fasttick_count: Arc<AtomicU64>,
     pub decoded_count: Arc<AtomicU64>,
@@ -1228,7 +1237,7 @@ pub struct Rex3 {
 unsafe impl Sync for Rex3 {}
 
 impl Rex3 {
-    pub fn new(heartbeat: Arc<AtomicU64>, cycles: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
+    pub fn new(heartbeat: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
         let config = Rex3Config::default();
         config.config.store(CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
                         (8 << CONFIG_BFIFODEPTH_SHIFT) |
@@ -1330,7 +1339,7 @@ impl Rex3 {
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
             interp_setup_cache: std::cell::Cell::new((u32::MAX, u32::MAX, u32::MAX)),
             heartbeat,
-            cycles,
+            cycles: std::cell::Cell::new(crate::mips_core::CyclesPtr::dangling()),
             fasttick_count,
             decoded_count,
             l1i_hit_count,
@@ -1474,6 +1483,14 @@ impl Rex3 {
     #[cfg(feature = "developer")]
     pub fn set_count_step_atomic(&self, arc: Arc<AtomicU64>) {
         *self.count_step_atomic.lock() = arc;
+    }
+
+    /// Wire up the CPU cycle counter — called from `Machine::new` once
+    /// `MipsCpu` exists (`Rex3::new` runs before it does, so this can't be a
+    /// constructor parameter; see `Hot::cycles`'s doc comment for why it's a
+    /// raw pointer at all, not a shared `Arc<AtomicU64>`).
+    pub fn set_cpu_cycles(&self, ptr: crate::mips_core::CyclesPtr) {
+        self.cycles.set(ptr);
     }
 
     fn setup(&self, ctx: &mut Rex3Context) {
@@ -3843,7 +3860,7 @@ impl Rex3 {
             let bar_stats = crate::disp::BarStats {
                 now:          start,
                 hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
-                cycles:       self.cycles.load(Ordering::Relaxed),
+                cycles:       self.cycles.get().get(),
                 fasttick:     self.fasttick_count.load(Ordering::Relaxed),
                 #[cfg(feature = "developer")]
                 decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),

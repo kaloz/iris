@@ -10,7 +10,11 @@ use crate::traits::Device;
 
 pub struct PerfMonitor {
     cpu_running: Arc<AtomicBool>,
-    cycles: Arc<AtomicU64>,
+    /// Pointer into the CPU's `MipsCore.hot.cycles` word — see
+    /// `CyclesPtr`/`Hot::cycles`'s doc comments. Obtained from
+    /// `MipsCpu::cycles_ptr()`, which has the same "stable from construction
+    /// onward" guarantee `interrupts_ptr` does.
+    cycles: crate::mips_core::CyclesPtr,
     fasttick: Arc<AtomicU64>,
     rex3: Option<Arc<Rex3>>,
     hal2: Option<Arc<Hal2>>,
@@ -19,7 +23,7 @@ pub struct PerfMonitor {
 impl PerfMonitor {
     pub fn new(
         cpu_running: Arc<AtomicBool>,
-        cycles: Arc<AtomicU64>,
+        cycles: crate::mips_core::CyclesPtr,
         fasttick: Arc<AtomicU64>,
         rex3: Option<Arc<Rex3>>,
         hal2: Option<Arc<Hal2>>,
@@ -60,7 +64,7 @@ impl PerfMonitor {
             writer,
             "CPU running: {}  cycles: {}  fastticks: {}",
             self.cpu_running.load(Ordering::Relaxed),
-            self.cycles.load(Ordering::Relaxed),
+            self.cycles.get(),
             self.fasttick.load(Ordering::Relaxed),
         ).map_err(|e| e.to_string())?;
         writeln!(writer, "{}", crate::thread_affinity::status_line()).map_err(|e| e.to_string())?;

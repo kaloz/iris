@@ -261,7 +261,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     exec.step_lite();
                 }
                 let n = burst as u64;
-                exec.core.local_cycles += n;
+                exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
                 let advance = exec.core.count_step.wrapping_mul(n);
                 let prev = exec.core.cp0_count;
                 exec.core.cp0_count = prev.wrapping_add(advance);
@@ -269,7 +269,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                     exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
                 }
-                let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                 if pending != 0 {
                     use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
                     let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
@@ -442,7 +442,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
                                 exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                             }
-                            exec.core.local_cycles += instrs_before_fault;
+                            exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(instrs_before_fault);
                         }
                         exec.step();
                         total_interp_steps += 1;
@@ -663,15 +663,15 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                             exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Credit local_cycles so the stats display shows correct MHz
-                        exec.core.local_cycles += n;
+                        // Credit the shared cycle counter so the stats display shows correct MHz
+                        exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
 
                         // Merge external interrupt bits into cp0_cause so the
                         // interpreter sees them on its next step. Don't call exec.step()
                         // here — that would double-count cp0_count (the post-block
                         // advancement above already accounted for all block instructions,
                         // and step() would add yet another count_step tick per interrupt).
-                        let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                        let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                         if pending != 0 {
                             use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
                             let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
@@ -839,7 +839,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                     if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
                                         exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                                     }
-                                    exec.core.local_cycles += instrs_before_fault;
+                                    exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(instrs_before_fault);
                                 }
                                 exec.step();
                                 total_interp_steps += 1;
@@ -858,8 +858,8 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                                 exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
                             }
-                            exec.core.local_cycles += n;
-                            let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                            exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
+                            let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                             if pending != 0 {
                                 use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
                                 let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;

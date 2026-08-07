@@ -183,8 +183,10 @@ impl Machine {
         let prom_port = prom.get_port();
 
         // Shared atomics — created first so all devices and the display thread use the same Arc.
+        // (CPU cycle counter is no longer among these: it lives inline on
+        // MipsCore.hot.cycles now, wired into devices via set_cpu_cycles
+        // after the executor/CPU exist — see Hot::cycles's doc comment.)
         let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see Rex3::HB_*
-        let cycles        = Arc::new(AtomicU64::new(0)); // CPU cycle counter
         let fasttick_count = Arc::new(AtomicU64::new(0)); // CP0 Compare match counter
         let decoded_count = Arc::new(AtomicU64::new(0)); // pre-decoded instruction count
         let l1i_hit_count        = Arc::new(AtomicU64::new(0)); // L1-I hit counter
@@ -233,7 +235,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cycles.clone(), cfg.scsi_deferred_int);
+        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.scsi_deferred_int);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Attach SCSI devices from config (IDs 1–7).
@@ -347,7 +349,7 @@ impl Machine {
         let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat.clone(), cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
                 // Vertical retrace → L1 VERTICAL_RETRACE on Indy; on fullhouse the IOC
@@ -378,7 +380,7 @@ impl Machine {
         let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat, cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(heartbeat, fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
                 if guinness {
@@ -546,8 +548,8 @@ impl Machine {
             }
         }
 
-        // Inject the shared cycles and fasttick_count Arcs into the executor core before wrapping in MipsCpu.
-        executor.core.cycles = cycles;
+        // Inject the shared fasttick_count Arc into the executor core before wrapping in MipsCpu.
+        // (cycles has no equivalent here — it's inline on MipsCore.hot now.)
         executor.core.fasttick_count = fasttick_count;
         executor.decoded_count       = decoded_count;
         executor.uncached_fetch_count = Arc::clone(&uncached_fetch_count);
@@ -566,6 +568,15 @@ impl Machine {
         let cpu_device: Arc<dyn Device> = cpu.clone();
         mc.set_cpu(Arc::downgrade(&cpu_device));
         ioc.set_interrupts(cpu.interrupts_ptr());
+
+        // Wire up the CPU cycle counter for every device that reads it —
+        // Rex3::new/Wd33c93a::new run before the CPU exists, so this can't
+        // be a constructor parameter (see Hot::cycles's doc comment). Must
+        // happen before hpc3.scsi().start() (called later, from
+        // Machine::start) actually spawns the worker thread that reads it.
+        if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
@@ -586,7 +597,7 @@ impl Machine {
         monitor.register_device(Arc::new(phys.vino.clone()));
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
-            cpu.cycles_counter(),
+            cpu.cycles_ptr(),
             cpu.fasttick_count.clone(),
             phys.rex3.clone(),
             hpc3.hal2().cloned(),

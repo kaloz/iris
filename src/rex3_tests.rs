@@ -34,7 +34,6 @@ fn make_rex3() -> &'static Rex3 {
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
             )));
             unsafe {
                 (*rex.fb_rgb.get()).fill(0);
@@ -2453,7 +2452,6 @@ mod jit_tests {
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let rex = Box::leak(Box::new(Rex3::new(
-                    Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),

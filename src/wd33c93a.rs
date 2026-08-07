@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
 use std::sync::Arc;
@@ -272,6 +273,16 @@ pub trait ScsiCallback: Send + Sync {
     fn set_interrupt(&self, level: bool);
 }
 
+// Safety: `Cell<T>` is never `Sync` regardless of `T` (interior mutability
+// without synchronization) — needed here because `cpu_cycles` (a `Cell`,
+// deliberately: see that field's own doc comment) is set exactly once,
+// during single-threaded `Machine::new` setup, strictly before `start()`
+// spawns the only thread that ever reads it, so no *concurrent* access to
+// the `Cell` is actually possible despite `Wd33c93a` being shared behind
+// `Arc` across threads. Every other field is already genuinely `Sync` on
+// its own.
+unsafe impl Sync for Wd33c93a {}
+
 pub struct Wd33c93a {
     state: Arc<Mutex<Wd33c93aState>>,
     cond: Arc<Condvar>,
@@ -280,19 +291,26 @@ pub struct Wd33c93a {
     dma: Option<Arc<dyn DmaClient>>,
     /// Activity heartbeat shared with the display thread.
     heartbeat: Arc<AtomicU64>,
-    /// CPU cycle counter — used to pace interrupt delivery without wall-clock sleeping.
-    cpu_cycles: Arc<AtomicU64>,
+    /// Pointer into the CPU's `MipsCore.hot.cycles` word (see
+    /// `CyclesPtr`/`Hot::cycles`'s doc comments) — used to pace deferred
+    /// interrupt delivery (the OpenBSD/NetBSD workaround below) without
+    /// wall-clock sleeping. Set once via `set_cpu_cycles`, during
+    /// single-threaded `Machine::new` setup — after the CPU exists (this
+    /// device is constructed before it does, so this can't be a constructor
+    /// parameter) but strictly before `start()` spawns the worker thread
+    /// that actually reads it, so a plain `Cell` is enough.
+    cpu_cycles: Cell<crate::mips_core::CyclesPtr>,
     /// Defer SCSI status interrupts: clear CIP, spin 1000 cycles, then assert INT.
     /// Required for OpenBSD/NetBSD so wd33c93_loop exits before INT fires.
     deferred_int: Arc<AtomicBool>,
 }
 
 impl Wd33c93a {
-    pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>) -> Self {
-        Self::new_with_config(dma, callback, heartbeat, cpu_cycles, true)
+    pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>) -> Self {
+        Self::new_with_config(dma, callback, heartbeat, true)
     }
 
-    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>, deferred_int: bool) -> Self {
+    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
@@ -323,9 +341,17 @@ impl Wd33c93a {
             running: Arc::new(AtomicBool::new(false)),
             dma,
             heartbeat,
-            cpu_cycles,
+            cpu_cycles: Cell::new(crate::mips_core::CyclesPtr::dangling()),
             deferred_int: deferred_int_arc,
         }
+    }
+
+    /// Wire up the CPU cycle counter — called from `Machine::new` once
+    /// `MipsCpu` exists (this device is constructed before it does, so this
+    /// can't be a constructor parameter; see `MipsCpu::cycles_ptr`). Must be
+    /// called before `start()` — see `cpu_cycles`'s own doc comment.
+    pub fn set_cpu_cycles(&self, ptr: crate::mips_core::CyclesPtr) {
+        self.cpu_cycles.set(ptr);
     }
 
     /// Attach a SCSI device.
@@ -983,7 +1009,9 @@ impl Device for Wd33c93a {
         let cond = self.cond.clone();
         let running = self.running.clone();
         let dma = self.dma.clone();
-        let cpu_cycles = self.cpu_cycles.clone();
+        // CyclesPtr is Copy + Send + Sync — extracted once here, before the
+        // thread spawns (see that type's and cpu_cycles's own doc comments).
+        let cpu_cycles = self.cpu_cycles.get();
         let heartbeat = self.heartbeat.clone();
 
         *self.thread.lock() = Some(thread::Builder::new().name("WD33C93A".to_string()).spawn(move || {
@@ -1013,10 +1041,10 @@ impl Device for Wd33c93a {
                         // GET_SBIC_asr seeing INT=0 before we deliver the interrupt.
                         state_guard.update_asr(asr::CIP | asr::DBR, 0);
                         let deferred_int = state_guard.deferred_int.clone();
-                        let start = cpu_cycles.load(Ordering::Relaxed);
+                        let start = cpu_cycles.get();
                         drop(state_guard);
                         loop {
-                            let now = cpu_cycles.load(Ordering::Relaxed);
+                            let now = cpu_cycles.get();
                             if now.wrapping_sub(start) >= 10000 { break; }
                             // Re-check: if disabled at runtime, exit spin early
                             if !deferred_int.load(Ordering::Relaxed) { break; }
@@ -1291,7 +1319,7 @@ impl Device for Wd33c93a {
 
 impl Default for Wd33c93a {
     fn default() -> Self {
-        Self::new(None, None, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+        Self::new(None, None, Arc::new(AtomicU64::new(0)))
     }
 }
 
@@ -2188,7 +2216,7 @@ mod tests {
     use super::*;
 
     fn make_scsi() -> Wd33c93a {
-        Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+        Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
     }
 
     /// Phase 1.7 round-trip: a fresh SCSI controller loaded from a captured

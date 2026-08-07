@@ -669,14 +669,14 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub decoded_count: Arc<AtomicU64>,
     /// Count of instructions fetched from uncached address space.
     pub uncached_fetch_count: Arc<AtomicU64>,
-    /// Raw pointers into core.cycles/fasttick_count — avoids Arc::deref on every step.
-    /// Safety: these point into Arcs owned by MipsCore which outlive the executor.
-    /// `interrupts` has no equivalent cached pointer — it's an inline
-    /// `MipsCore` field now (see its doc comment), so `&self.core.interrupts`
-    /// is always current and just as cheap; a cached pointer would go stale
-    /// across any move of `self` (which `cycles`/`fasttick_count` can't,
-    /// since `Arc::as_ptr` points at their own separate heap allocation).
-    cycles_ptr:       *const AtomicU64,
+    /// Raw pointer into core.fasttick_count — avoids Arc::deref on every step.
+    /// Safety: points into an Arc owned by MipsCore which outlives the executor.
+    /// `cycles`/`interrupts` have no equivalent cached pointer — both live
+    /// inline on `MipsCore.hot` now (see `Hot`'s doc comment), so
+    /// `&self.core.hot.cycles`/`&self.core.hot.interrupts` are always current
+    /// and just as cheap; a cached pointer would go stale across any move of
+    /// `self` (which `fasttick_count` can't, since `Arc::as_ptr` points at
+    /// its own separate heap allocation).
     fasttick_ptr:     *const AtomicU64,
     local_fasttick:   u32,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
@@ -722,8 +722,8 @@ fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, a
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
 /// Rust does not allow `Self` inside a nested fn, so the generic trampoline lives here.
-// Safety: the raw pointers (cycles_ptr, fasttick_ptr) point into Arc allocations
-// owned by MipsCore which outlive the executor. The executor is only accessed from the CPU thread.
+// Safety: the raw pointer (fasttick_ptr) points into an Arc allocation
+// owned by MipsCore which outlives the executor. The executor is only accessed from the CPU thread.
 unsafe impl<T: Tlb, C: MipsCache> Send for MipsExecutor<T, C> {}
 unsafe impl<T: Tlb, C: MipsCache> Sync for MipsExecutor<T, C> {}
 
@@ -855,7 +855,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             ins: DecodedInstr::default(), // scratch slot for uncached fetches
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
-            cycles_ptr:     std::ptr::null(),
             fasttick_ptr:   std::ptr::null(),
             local_fasttick: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
@@ -880,9 +879,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     /// Re-sync raw atomic pointers after the shared Arcs are injected post-construction.
-    /// Must be called whenever core.cycles or core.fasttick_count are replaced.
+    /// Must be called whenever core.fasttick_count is replaced. (`cycles` has
+    /// no equivalent — it's an inline `MipsCore` field now, always current.)
     pub fn rebind_atomic_ptrs(&mut self) {
-        self.cycles_ptr     = Arc::as_ptr(&self.core.cycles);
         self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
         #[cfg(feature = "idle-pause")]
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
@@ -898,7 +897,16 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// which holds for the rest of the process, since the executor never
     /// moves again once there.
     pub fn interrupts_ptr(&self) -> *const AtomicU64 {
-        &self.core.interrupts as *const AtomicU64
+        &self.core.hot.interrupts as *const AtomicU64
+    }
+
+    /// Pointer to this executor's `MipsCore.hot.cycles` word, for readers on
+    /// other threads (status displays, perf monitoring, `Wd33c93a`'s
+    /// deferred-interrupt spin-wait) — see `CyclesPtr`/`Hot::cycles`'s doc
+    /// comments. Same "call once at final address, valid for the rest of the
+    /// process" contract as `interrupts_ptr` above.
+    pub fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr {
+        crate::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -1087,27 +1095,39 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// If `self.skip_breakpoints` is set, all breakpoint checks for this one
     /// step (PC, fetch, and all data memory accesses) are suppressed.
     /// It is cleared automatically after the instruction completes.
-    /// Flush local cycle counter to the shared atomic.
+    /// Flush the local fasttick counter to the shared atomic. `cycles` has
+    /// no equivalent flush anymore — it's incremented directly on its own
+    /// atomic every instruction (`step`'s own body), not batched locally.
     #[inline(always)]
     pub fn flush_cycles(&mut self) {
-        unsafe { &*self.cycles_ptr }.store(self.core.local_cycles, Ordering::Relaxed);
         unsafe { &*self.fasttick_ptr }.fetch_add(self.local_fasttick as u64, Ordering::Relaxed);
         self.local_fasttick = 0;
     }
 
     pub fn step(&mut self) -> ExecStatus {
-        // Increment local cycle counter (flushed to atomic by outer loop)
-        self.core.local_cycles = self.core.local_cycles.wrapping_add(1);
+        // Increment the real, shared cycle counter directly — no local
+        // shadow, no batching. See Hot::cycles's doc comment for why: a
+        // dispatch loop that stays entirely inside JIT-compiled code for a
+        // long stretch must still make this visible to other threads as it
+        // goes, not just whenever it happens to return to this outer loop.
+        // Volatile, not a plain field write: guarantees the compiler can't
+        // elide/hoist the write out of an unbounded loop, even though this
+        // isn't a synchronizing atomic RMW (readers only need eventual
+        // visibility of the count, not ordering against other memory).
+        unsafe {
+            let p = &mut self.core.hot.cycles as *mut u64;
+            std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
+        }
 
         /*
         // Reload external interrupt state every 16 instructions
-        if self.core.local_cycles & 0xF == 0 {
-            self.cached_pending = self.core.interrupts.load(Ordering::Relaxed);
+        if self.core.hot.cycles & 0xF == 0 {
+            self.cached_pending = self.core.hot.interrupts.load(Ordering::Relaxed);
         }
         let pending = self.cached_pending;
         */
         // this seems to be a wash or slightly better without a branch, relaxed atomic loads are essentially MOV
-        let pending = self.core.interrupts.load(Ordering::Relaxed);
+        let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
 
@@ -1195,12 +1215,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     /// Lightweight step for JIT interpreter bursts. Skips cp0_count
-    /// advancement and local_cycles — the JIT dispatch loop does those
-    /// in bulk after the burst. Keeps interrupt checking because the
+    /// advancement — the JIT dispatch loop credits `core.hot.cycles` and
+    /// advances `cp0_count` itself, in bulk, after the burst (still onto the
+    /// same real, shared field — see `Hot::cycles`'s doc comment; only the
+    /// batching of *when* it's added is bulk here, not a separate local
+    /// shadow that could go stale). Keeps interrupt checking because the
     /// kernel depends on per-instruction interrupt delivery.
     #[inline(always)]
     pub fn step_lite(&mut self) -> ExecStatus {
-        let pending = self.core.interrupts.load(Ordering::Relaxed);
+        let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
 
@@ -5330,7 +5353,10 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     executor: Arc<Mutex<MipsExecutor<T, C>>>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
-    cycles: Arc<AtomicU64>,
+    /// Pointer into the executor's `MipsCore.hot.cycles` — see
+    /// `CyclesPtr`/`Hot::cycles`'s doc comments. Same process-lifetime
+    /// validity argument as `interrupts_ptr` right below.
+    cycles_ptr: crate::mips_core::CyclesPtr,
     /// Raw pointer into the executor's `MipsCore.interrupts` (an inline
     /// field, not `Arc<AtomicU64>` — see that field's doc comment). Valid
     /// for the process lifetime: `executor` below is the only owner of the
@@ -5356,7 +5382,6 @@ unsafe impl<T: Tlb, C: MipsCache> Sync for MipsCpu<T, C> {}
 
 impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     pub fn new(executor: MipsExecutor<T, C>) -> Self {
-        let cycles = executor.core.cycles.clone();
         let fasttick_count = executor.core.fasttick_count.clone();
         #[cfg(feature = "idle-pause")]
         let idle_profile_on = executor.idle_profile_on.clone();
@@ -5366,14 +5391,15 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let executor_arc = Arc::new(Mutex::new(executor));
         executor_arc.lock().install_status_cb();
         // MipsCore is now at its final, stable address (inside the Arc) —
-        // safe to take a raw pointer into it that outlives this constructor.
+        // safe to take raw pointers into it that outlive this constructor.
         let interrupts_ptr = executor_arc.lock().interrupts_ptr();
+        let cycles_ptr = executor_arc.lock().cycles_ptr();
 
         Self {
             executor: executor_arc,
             running: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
-            cycles,
+            cycles_ptr,
             interrupts_ptr,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
@@ -5405,8 +5431,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn cycles_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.cycles)
+    /// Pointer to the executor's `MipsCore.hot.cycles` word — see
+    /// `CyclesPtr`/`Hot::cycles`'s doc comments (`cycles` lives inline on
+    /// `MipsCore` now, not `Arc<AtomicU64>`, so this can no longer hand out a
+    /// cloneable `Arc`). Same process-lifetime validity argument as
+    /// `interrupts_ptr` (fixed for the life of this `MipsCpu`, set once in
+    /// `new()` after the executor reached its final address).
+    pub fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr {
+        self.cycles_ptr
     }
 
     /// Raw pointer to the executor's `MipsCore.interrupts` word, for wiring
@@ -5669,7 +5701,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
 /// Deterministic-from-state CPU register snapshot. Excludes host wallclock
 /// anchors so two runs from the same starting state can be diffed cleanly.
-/// `local_cycles` is intentionally not included — it's a runtime perf counter
+/// `cycles` is intentionally not included — it's a runtime perf counter
 /// that's not part of save_state and stays stale across `load_snapshot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuStateDigest {
@@ -5799,7 +5831,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
 
             // --- perf sampling (comment out to disable) ---
-            //let mut last_cycles: u64 = guard.core.cycles.load(Ordering::Relaxed);
+            //let mut last_cycles: u64 = guard.core.hot.cycles;
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
 
@@ -5858,7 +5890,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
-                //let cycles = guard.core.cycles.load(Ordering::Relaxed);
+                //let cycles = guard.core.hot.cycles;
                 //if cycles.wrapping_sub(last_cycles) >= 100_000_000 {
                 //    let now = std::time::Instant::now();
                 //    let elapsed = now.duration_since(last_time).as_secs_f64();
@@ -5876,8 +5908,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         self.running.load(Ordering::SeqCst) 
     }
     
-    fn get_clock(&self) -> u64 { 
-        self.cycles.load(Ordering::Relaxed)
+    fn get_clock(&self) -> u64 {
+        self.cycles_ptr.get()
     }
 
     fn signal(&self, signal: Signal) {
