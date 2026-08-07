@@ -142,17 +142,80 @@ impl CyclesPtr {
     }
 }
 
-/// MIPS CPU Core with full register state
+/// MIPS CPU Core with full register state.
+///
+/// Field order is deliberately cache-conscious, not declaration-order or
+/// architectural-grouping: the fields every dispatch touches first
+/// (`hot`, then the timer trio, then PC/branch-delay state, then the
+/// register file) lead the struct; large, per-instruction-irrelevant CP0
+/// registers and the compare-calibration bookkeeping (only ever touched on
+/// a CP0 Compare write, not every dispatch) trail at the end.
 pub struct MipsCore {
+    /// Interrupt-pending word and instruction/cycle counter — the two
+    /// fields every other thread in the process might read on any given
+    /// tick, grouped into one cache-line-aligned struct (see [`Hot`]'s own
+    /// doc comment) rather than left to whatever the compiler's default
+    /// field layout happens to produce. `#[repr(align(64))]` on `Hot` itself
+    /// means it fills exactly one cache line on its own — placed first so
+    /// the timer trio and pc/branch-delay state right after it start a
+    /// fresh line of their own instead of splitting across `Hot`'s tail.
+    pub hot: Hot,
+
+    // Timer trio — consulted first on every dispatch's IP7/pending-interrupt
+    // preamble check.
+    pub cp0_count: u64,       // 9: Timer Count — bits[63:32]=hardware count, bits[31:0]=fraction (32.32 fp)
+    /// Per-instruction cp0_count increment in 32.32 fixed-point (same format as cp0_count).
+    /// Calibrated on every cp0_compare write to hit the programmed interval in real time.
+    /// Default 1<<31 = 0.5 hardware counts per instruction (R4400: Count runs at half CPU clock).
+    pub count_step: u64,
+    pub cp0_compare: u64,     // 11: Timer Compare — bits[63:32]=hardware compare, bits[31:0]=0 (32.32 fp)
+
+    // PC and branch-delay state — read/written together on every dispatch.
+    pub pc: u64,         // Program Counter
+    /// Whether the instruction about to execute is a branch/jump's delay
+    /// slot — set by `branch_delay` when the branch itself dispatches,
+    /// cleared by `handle_exec_complete` once the slot retires. Consulted by
+    /// `deliver_exception`/`handle_exception` to compute EPC/Cause.BD
+    /// correctly for an exception raised from within a delay slot (EPC must
+    /// point at the *branch*, not the slot). One field, one meaning, for
+    /// both the interpreter (which dispatches the slot as its own step) and
+    /// jitv2-compiled code (`emit_slot_semantics` sets/clears this directly
+    /// around a delay slot it inlines, since it has no separate dispatch
+    /// step of its own to hang the flag on) — there is no second,
+    /// JIT-specific copy of this state.
+    pub in_delay_slot: bool,
+    /// The real branch/jump target `handle_exec_complete` commits to `pc`
+    /// once the pending delay slot (`in_delay_slot`) retires — set by
+    /// `MipsExecutor::branch_delay` alongside `in_delay_slot = true`. Lives
+    /// on `MipsCore` for the same reason `in_delay_slot` does: one piece of
+    /// state, one owner, no separate executor-side copy to keep in sync.
+    pub delay_slot_target: u64,
+
     // General Purpose Registers (GPRs)
     pub gpr: [u64; 32],  // r0-r31, where r0 is always zero
-
-    // Special Registers
-    pub pc: u64,         // Program Counter
     pub hi: u64,         // Multiply/Divide HI result
     pub lo: u64,         // Multiply/Divide LO result
 
-    // CP0 - System Control Coprocessor Registers
+    // CP1 - Floating Point Unit Registers
+    pub fpr: [u64; 32],       // FPU data registers (64-bit, can be used as pairs for 32-bit)
+    pub fpu_fir: u32,         // 0: FP Implementation/Revision
+    pub fpu_fccr: u32,        // 25: FP Condition Codes
+    pub fpu_fexr: u32,        // 26: FP Exceptions
+    pub fpu_fenr: u32,        // 28: FP Enables
+    pub fpu_fcsr: u32,        // 31: FP Control/Status
+
+    /// Nano-TLB: 3-entry direct-mapped cache, one slot per access type (Fetch/Read/Write).
+    /// Indexed by AccessType discriminant (0=Fetch, 1=Read, 2=Write).
+    pub nanotlb: [NanoTlbEntry; 3],
+
+    /// Called whenever CP0 Status (reg 12) is written, with (old_value, new_value).
+    /// The first element is the callback function, the second is an opaque context pointer
+    /// (typically a type-erased `*mut MipsExecutor<T,C>` set by the executor after construction).
+    pub status_changed_cb: Option<(fn(*mut core::ffi::c_void, u32, u32), *mut core::ffi::c_void)>,
+
+    // --- everything below is cold: not touched on the common per-instruction path ---
+
+    // CP0 - System Control Coprocessor Registers (rest of the bank)
     pub cp0_index: u32,       // 0: TLB Index
     pub cp0_random: u32,      // 1: TLB Random
     pub cp0_entrylo0: u64,    // 2: TLB Entry Low 0 (64-bit, truncated in 32-bit mode)
@@ -161,13 +224,34 @@ pub struct MipsCore {
     pub cp0_pagemask: u64,    // 5: TLB Page Mask (64-bit, truncated in 32-bit mode)
     pub cp0_wired: u32,       // 6: TLB Wired boundary
     pub cp0_badvaddr: u64,    // 8: Bad Virtual Address
-    pub cp0_count: u64,       // 9: Timer Count — bits[63:32]=hardware count, bits[31:0]=fraction (32.32 fp)
     pub cp0_entryhi: u64,     // 10: TLB Entry High (64-bit, truncated in 32-bit mode)
-    pub cp0_compare: u64,     // 11: Timer Compare — bits[63:32]=hardware compare, bits[31:0]=0 (32.32 fp)
-    /// Per-instruction cp0_count increment in 32.32 fixed-point (same format as cp0_count).
-    /// Calibrated on every cp0_compare write to hit the programmed interval in real time.
-    /// Default 1<<31 = 0.5 hardware counts per instruction (R4400: Count runs at half CPU clock).
-    pub count_step: u64,
+    pub cp0_status: u32,      // 12: Status Register
+    pub cp0_cause: u32,       // 13: Cause Register
+    pub cp0_epc: u64,         // 14: Exception Program Counter
+    pub cp0_prid: u32,        // 15: Processor Revision ID
+    pub cp0_config: u32,      // 16: Configuration Register
+    pub cp0_lladdr: u32,      // 17: LLAddr (also mirrored on d_cache for invalidation)
+    pub cp0_watchlo: u32,     // 18: Watchpoint Low
+    pub cp0_watchhi: u32,     // 19: Watchpoint High
+    pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
+    pub cp0_ecc: u32,         // 26: ECC Register
+    pub cp0_cacheerr: u32,    // 27: Cache Error
+    pub cp0_taglo: u32,       // 28: Cache Tag Low
+    pub cp0_taghi: u32,       // 29: Cache Tag High
+    pub cp0_errorepc: u64,    // 30: Error Exception PC
+
+    pub tlb_entries: u32,     // Total TLB entries
+    pub cp0_random_cycle: u64, // Cycle count of last Random update
+
+    /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
+    pub fasttick_count: Arc<AtomicU64>,
+
+    // Execution state
+    pub running: bool,
+    pub halted: bool,
+
+    // Compare-calibration bookkeeping — touched only on a CP0 Compare write
+    // or an idle-park sleep, never on the common per-instruction path.
     /// Atomic shadow of `count_step` — updated whenever count_step changes.
     /// Shared with the display refresh thread for status bar display.
     pub count_step_atomic: Arc<AtomicU64>,
@@ -202,72 +286,6 @@ pub struct MipsCore {
     /// (which is only a bucket label, not a measured rate — see rules/perf/idle-pause-work.md).
     /// Zero = not yet calibrated.
     pub hw_per_ns: u64,
-    pub cp0_status: u32,      // 12: Status Register
-    pub cp0_cause: u32,       // 13: Cause Register
-    pub cp0_epc: u64,         // 14: Exception Program Counter
-    pub cp0_prid: u32,        // 15: Processor Revision ID
-    pub cp0_config: u32,      // 16: Configuration Register
-    pub cp0_lladdr: u32,      // 17: LLAddr (also mirrored on d_cache for invalidation)
-    pub cp0_watchlo: u32,     // 18: Watchpoint Low
-    pub cp0_watchhi: u32,     // 19: Watchpoint High
-    pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
-    pub cp0_ecc: u32,         // 26: ECC Register
-    pub cp0_cacheerr: u32,    // 27: Cache Error
-    pub cp0_taglo: u32,       // 28: Cache Tag Low
-    pub cp0_taghi: u32,       // 29: Cache Tag High
-    pub cp0_errorepc: u64,    // 30: Error Exception PC
-
-    pub tlb_entries: u32,     // Total TLB entries
-    pub cp0_random_cycle: u64, // Cycle count of last Random update
-
-    // CP1 - Floating Point Unit Registers
-    pub fpr: [u64; 32],       // FPU data registers (64-bit, can be used as pairs for 32-bit)
-    pub fpu_fir: u32,         // 0: FP Implementation/Revision
-    pub fpu_fccr: u32,        // 25: FP Condition Codes
-    pub fpu_fexr: u32,        // 26: FP Exceptions
-    pub fpu_fenr: u32,        // 28: FP Enables
-    pub fpu_fcsr: u32,        // 31: FP Control/Status
-
-    /// Interrupt-pending word and instruction/cycle counter — the two
-    /// fields every other thread in the process might read on any given
-    /// tick, grouped into one cache-line-aligned struct (see [`Hot`]'s own
-    /// doc comment) rather than left to whatever the compiler's default
-    /// field layout happens to produce.
-    pub hot: Hot,
-    /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
-    pub fasttick_count: Arc<AtomicU64>,
-
-    // Execution state
-    pub running: bool,
-    pub halted: bool,
-    /// Whether the instruction about to execute is a branch/jump's delay
-    /// slot — set by `branch_delay` when the branch itself dispatches,
-    /// cleared by `handle_exec_complete` once the slot retires. Consulted by
-    /// `deliver_exception`/`handle_exception` to compute EPC/Cause.BD
-    /// correctly for an exception raised from within a delay slot (EPC must
-    /// point at the *branch*, not the slot). One field, one meaning, for
-    /// both the interpreter (which dispatches the slot as its own step) and
-    /// jitv2-compiled code (`emit_slot_semantics` sets/clears this directly
-    /// around a delay slot it inlines, since it has no separate dispatch
-    /// step of its own to hang the flag on) — there is no second,
-    /// JIT-specific copy of this state.
-    pub in_delay_slot: bool,
-
-    /// The real branch/jump target `handle_exec_complete` commits to `pc`
-    /// once the pending delay slot (`in_delay_slot`) retires — set by
-    /// `MipsExecutor::branch_delay` alongside `in_delay_slot = true`. Lives
-    /// on `MipsCore` for the same reason `in_delay_slot` does: one piece of
-    /// state, one owner, no separate executor-side copy to keep in sync.
-    pub delay_slot_target: u64,
-
-    /// Called whenever CP0 Status (reg 12) is written, with (old_value, new_value).
-    /// The first element is the callback function, the second is an opaque context pointer
-    /// (typically a type-erased `*mut MipsExecutor<T,C>` set by the executor after construction).
-    pub status_changed_cb: Option<(fn(*mut core::ffi::c_void, u32, u32), *mut core::ffi::c_void)>,
-
-    /// Nano-TLB: 3-entry direct-mapped cache, one slot per access type (Fetch/Read/Write).
-    /// Indexed by AccessType discriminant (0=Fetch, 1=Read, 2=Write).
-    pub nanotlb: [NanoTlbEntry; 3],
 }
 
 /// Single nano-TLB entry.
@@ -345,10 +363,24 @@ impl MipsCore {
     /// Create a new MIPS core with reset state
     pub fn new() -> Self {
         let mut core = Self {
-            gpr: [0; 32],
+            hot: Hot::default(),
+            cp0_count: 0,
+            count_step: 1 << 31,
+            cp0_compare: 0,
             pc: 0,
+            in_delay_slot: false,
+            delay_slot_target: 0,
+            gpr: [0; 32],
             hi: 0,
             lo: 0,
+            fpr: [0; 32],
+            fpu_fir: 0,
+            fpu_fccr: 0,
+            fpu_fexr: 0,
+            fpu_fenr: 0,
+            fpu_fcsr: 0,
+            nanotlb: [NanoTlbEntry::default(); 3],
+            status_changed_cb: None,
             cp0_index: 0,
             cp0_random: 0,
             cp0_entrylo0: 0,
@@ -357,19 +389,7 @@ impl MipsCore {
             cp0_pagemask: 0,
             cp0_wired: 0,
             cp0_badvaddr: 0,
-            cp0_count: 0,
             cp0_entryhi: 0,
-            cp0_compare: 0,
-            count_step: 1 << 31,
-            count_step_atomic: Arc::new(AtomicU64::new(1 << 31)),
-            compare_last_cycles: 0,
-            compare_last_instant: std::time::Instant::now(),
-            #[cfg(feature = "developer_ip7")]
-            compare_delta_stats: std::collections::HashMap::new(),
-            compare_delta_slow: 0,
-            compare_delta_fast: 0,
-            compare_delta_prev: 0,
-            hw_per_ns: 0,
             cp0_status: 0,
             cp0_cause: 0,
             cp0_epc: 0,
@@ -386,20 +406,18 @@ impl MipsCore {
             cp0_errorepc: 0,
             tlb_entries: 48,
             cp0_random_cycle: 0,
-            fpr: [0; 32],
-            fpu_fir: 0,
-            fpu_fccr: 0,
-            fpu_fexr: 0,
-            fpu_fenr: 0,
-            fpu_fcsr: 0,
-            hot: Hot::default(),
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,
             halted: false,
-            in_delay_slot: false,
-            delay_slot_target: 0,
-            status_changed_cb: None,
-            nanotlb: [NanoTlbEntry::default(); 3],
+            count_step_atomic: Arc::new(AtomicU64::new(1 << 31)),
+            compare_last_cycles: 0,
+            compare_last_instant: std::time::Instant::now(),
+            #[cfg(feature = "developer_ip7")]
+            compare_delta_stats: std::collections::HashMap::new(),
+            compare_delta_slow: 0,
+            compare_delta_fast: 0,
+            compare_delta_prev: 0,
+            hw_per_ns: 0,
         };
         core.reset_registers(false);
         core
