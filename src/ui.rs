@@ -91,14 +91,43 @@ struct GlRenderer {
 unsafe impl Send for GlRenderer {}
 
 impl GlRenderer {
-    fn init_gl(&mut self) {
+    /// Idempotent GL setup + per-thread current-binding, called at the top
+    /// of every `present()`. Returns `false` if the context couldn't be
+    /// made current on this thread (caller should skip the frame).
+    ///
+    /// Splits into exactly two cases:
+    /// - `self.state.is_none()` (the true first call, ever): consumes
+    ///   `not_current_context` — a genuine one-shot resource; `take()`
+    ///   here plus this whole branch only ever running once per process is
+    ///   what guarantees it's never consumed twice — and does the full
+    ///   one-time setup (surface, shader compile, VAO/VBOs), ending with
+    ///   `self.state = Some(...)`.
+    /// - `self.state.is_some()` (every later call, including the first
+    ///   `present()` from every subsequent respawned refresh thread — REX3's
+    ///   refresh thread is respawned on every stop()/start() cycle,
+    ///   jitcheck's checkpoint capture/restore among the real callers):
+    ///   the one-time setup is never repeated (`not_current_context` is
+    ///   already `None` by then, so there's nothing left to consume even in
+    ///   principle), but the context's "current" binding is per-OS-thread —
+    ///   `state` surviving the respawn doesn't mean it's current on
+    ///   *this* thread, so `make_current` is called again here,
+    ///   unconditionally, every time. Making an already-current context
+    ///   current again is a well-defined no-op per the GL/EGL spec, so this
+    ///   costs nothing extra on the overwhelmingly common case (same thread,
+    ///   every frame).
+    fn ensure_init(&mut self) -> bool {
+        if let Some(state) = &self.state {
+            return state.context.make_current(&state.surface).is_ok();
+        }
+
         let gl_display = self.gl_config.display();
 
-        // The context itself was already created on the main thread in Ui::new()
-        // (see comment on not_current_context); here we only make it current on
-        // the refresh thread.
+        // The context itself was already created on the main thread in
+        // Ui::new() (see comment on not_current_context) — this is that
+        // context's one and only real consumption, guarded by the
+        // `self.state.is_none()` branch above never running a second time.
         let not_current_gl_context = self.not_current_context.take()
-            .expect("GL context missing — init_gl() called more than once");
+            .expect("GL context missing on the true first ensure_init() call — construction bug in Ui::new()");
 
         let size = self.window.inner_size();
         let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
@@ -283,6 +312,7 @@ impl GlRenderer {
             main_vbo,
             status_vbo,
         });
+        true
     }
 
     // Upload a quad covering pixel rect [x0..x1] × [y0..y1] (top-left origin, y down).
@@ -402,8 +432,25 @@ impl Renderer for GlRenderer {
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
     ) {
-        if self.state.is_none() {
-            self.init_gl();
+        // ensure_init(): runs the one-time GL setup (shader compile, VAO/
+        // VBO creation, etc.) on whichever thread's first `present()` call
+        // reaches it — the context genuinely does need to be created here
+        // rather than back in Ui::new(), since some drivers require the
+        // context to stay tied to the thread that will actually issue GL
+        // calls against it (see `not_current_context`'s field comment).
+        // Idempotent: safe to call on every `present()`, every frame — it
+        // does real setup work only the very first time (`self.state` still
+        // `None`), and on every other call just makes sure the context is
+        // current *on this OS thread* before any GL call below runs. REX3's
+        // refresh thread is respawned on every stop()/start() cycle
+        // (jitcheck's checkpoint capture/restore among the real callers) —
+        // a *different* OS thread each time — and a GL context's "current"
+        // binding is per-thread, so `state` surviving the respawn is not by
+        // itself enough; the context must be re-made-current on whichever
+        // new thread picks up rendering duty even though `ensure_init`'s
+        // own one-time setup must never run again.
+        if !self.ensure_init() {
+            return;
         }
 
         let width  = screen.width;
@@ -557,6 +604,27 @@ impl Renderer for GlRenderer {
     fn stop(&mut self) {
         if let Some(state) = self.state.take() {
             self.compositor.destroy(&state.gl);
+            // Hand the context back to `not_current_context` so the next
+            // `ensure_init()` call (on whatever thread REX3's next
+            // start() respawns) sees a genuine "first call ever since the
+            // last real teardown" and re-runs full setup — mirrors this
+            // same `stop()` having just destroyed the compositor and
+            // dropped every other GlState resource (surface, shaders,
+            // VAO/VBOs — all recreated by ensure_init()'s first-call
+            // branch). Without this, `self.state.take()` above makes the
+            // *next* `ensure_init()` call take the "must still have
+            // not_current_context to consume" branch — but that Option
+            // was already permanently emptied by the true first call, long
+            // before this `stop()` ever ran, so it would panic instead of
+            // re-initializing (found live: `jitcheck`'s repeated
+            // checkpoint capture/restore is real code that calls
+            // Rex3::stop()/start() — and therefore this GlRenderer::stop()
+            // — many times in one process run, unlike normal boot which
+            // only ever sees it once at shutdown).
+            match state.context.make_not_current() {
+                Ok(not_current) => self.not_current_context = Some(not_current),
+                Err(e) => eprintln!("iris: failed to release GL context on stop(): {e}"),
+            }
         }
         self.current_w     = 0;
         self.current_h     = 0;
@@ -641,7 +709,7 @@ impl Ui {
 
         // Create the GL context here on the main thread, i.e. the same thread
         // that created the window/display above. The refresh thread only
-        // makes it current later (in GlRenderer::init_gl); it never calls
+        // makes it current later (in GlRenderer::ensure_init); it never calls
         // create_context itself. See the not_current_context field comment.
         let raw_window_handle = window.raw_window_handle().expect("no raw window handle");
         let gl_display = gl_config.display();

@@ -1030,7 +1030,26 @@ impl GFifo {
         let next_head = head.wrapping_add(1) & GFIFO_MASK;
         self.local_head.set(next_head);
         // Publish every 64 entries to massively reduce cache line invalidations
-        if next_head & 63 == 0 {
+        // — but ALSO publish immediately whenever this consume just drained
+        // the queue to empty (next_head == tail), regardless of the
+        // batching boundary. External observers (is_empty/len — REX3's own
+        // `busy_or_val!` register-read gate among them) read `head` directly
+        // and have no way to know the consumer thread's private
+        // `local_head` is already caught up; without this, consuming the
+        // last entry of an otherwise-empty run (whenever that count isn't a
+        // multiple of 64 — the overwhelmingly common case) leaves `head`
+        // stale, so `is_empty()` keeps reporting "not empty" — and if the
+        // consumer thread then exits (register_processor's own `else`
+        // branch normally catches this on its *next* loop iteration via
+        // `flush_head()`, but a `stop()`-driven `GFIFO_EXIT` can end the
+        // loop before that next iteration ever runs) the stale `head` is
+        // permanent: nothing ever re-derives it, and every future
+        // busy_or_val!-gated register read reports busy forever even though
+        // the queue is, and has been, genuinely empty. (Found live: `rex
+        // status` showing `DRAW BUSY: no` with `GFIFO: 1/65536` — gfxbusy
+        // correctly cleared, but `head` never got the memo.)
+        let tail = self.tail.load(Ordering::Acquire);
+        if next_head & 63 == 0 || next_head == tail {
             self.head.store(next_head, Ordering::Release);
         }
     }
@@ -1044,6 +1063,21 @@ impl GFifo {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
+    /// Force the queue to the empty state, discarding any pending entries.
+    /// Only safe to call with the consumer thread stopped (checkpoint
+    /// restore's own contract — `restore_live_checkpoint` always calls
+    /// `self.stop()` first) — this bypasses the normal producer lock/
+    /// consumer head-ownership discipline entirely, so a live producer or
+    /// consumer racing this call would corrupt the ring buffer's invariants.
+    #[inline]
+    pub fn reset(&self) {
+        let tail = self.tail.load(Ordering::Relaxed);
+        self.head.store(tail, Ordering::Release);
+        self.local_head.set(tail);
+        self.shadow_tail.set(tail);
+        self.shadow_head.set(tail);
     }
 }
 
@@ -4425,6 +4459,26 @@ impl Device for Rex3 {
             writeln!(writer, "DRAW BUSY : {}  GFIFO : {}/{} entries used",
                 if gfxbusy { "YES" } else { "no" },
                 self.gfifo.len(), GFIFO_DEPTH).unwrap();
+            // `running` alone only proves start()/stop() were called in the
+            // expected order — it says nothing about whether the processor
+            // thread is actually alive right now (a panic inside
+            // register_processor, or a start()/stop() mismatch specific to
+            // some caller, would leave `running=true` with no thread ever
+            // spawned, or with a dead one). `processor_thread`/
+            // `refresh_thread`'s own `Option` presence is the more direct
+            // signal: `Some` iff `start()` actually spawned and hasn't been
+            // joined away by `stop()` yet. Surfaced here specifically
+            // because gfxbusy=false with a non-empty GFIFO (should be
+            // momentarily impossible while register_processor is alive and
+            // looping — it always sets gfxbusy=true before processing any
+            // entry it sees) is exactly the live signature of a GFIFO
+            // sitting un-drained because nothing is actually consuming it.
+            let processor_alive = self.processor_thread.lock().is_some();
+            let refresh_alive = self.refresh_thread.lock().is_some();
+            writeln!(writer, "THREADS   : running={} processor_thread={} refresh_thread={}",
+                self.is_running(),
+                if processor_alive { "alive" } else { "NOT RUNNING" },
+                if refresh_alive { "alive" } else { "NOT RUNNING" }).unwrap();
             let jit_go   = self.jit_go_count.load(Ordering::Relaxed);
             let interp_go = self.interp_go_count.load(Ordering::Relaxed);
             let total_go  = jit_go + interp_go;
@@ -5337,6 +5391,20 @@ impl Saveable for Rex3 {
         if let Some(cv) = get_field(v, "cmap0") { load_cmap(&mut self.cmap0.lock(), cv); }
         if let Some(cv) = get_field(v, "cmap1") { load_cmap(&mut self.cmap1.lock(), cv); }
         if let Some(dv) = get_field(v, "bt445") { load_bt445(&mut self.bt445.lock(), dv); }
+
+        // GFIFO is deliberately not part of the serialized snapshot at all
+        // (a live, in-flight draw-command queue has no meaningful
+        // "restore" — it's ephemeral producer/consumer state, not
+        // architectural). But `load_state` is always called with the
+        // processor thread stopped (every caller's contract —
+        // `restore_live_checkpoint`/`load_snapshot_paused`), and the FIFO's
+        // own head/tail are otherwise left exactly as whatever the pre-load
+        // live state happened to be — reset it explicitly here rather than
+        // relying on it having already drained to empty by coincidence.
+        // See `GFifo::reset`'s own doc comment for why this is only safe
+        // with the consumer stopped.
+        self.gfifo.reset();
+        self.gfxbusy.store(false, Ordering::Relaxed);
 
         Ok(())
     }
