@@ -253,6 +253,13 @@ pub struct MipsCore {
     /// JIT-specific copy of this state.
     pub in_delay_slot: bool,
 
+    /// The real branch/jump target `handle_exec_complete` commits to `pc`
+    /// once the pending delay slot (`in_delay_slot`) retires — set by
+    /// `MipsExecutor::branch_delay` alongside `in_delay_slot = true`. Lives
+    /// on `MipsCore` for the same reason `in_delay_slot` does: one piece of
+    /// state, one owner, no separate executor-side copy to keep in sync.
+    pub delay_slot_target: u64,
+
     /// Called whenever CP0 Status (reg 12) is written, with (old_value, new_value).
     /// The first element is the callback function, the second is an opaque context pointer
     /// (typically a type-erased `*mut MipsExecutor<T,C>` set by the executor after construction).
@@ -390,6 +397,7 @@ impl MipsCore {
             running: false,
             halted: false,
             in_delay_slot: false,
+            delay_slot_target: 0,
             status_changed_cb: None,
             nanotlb: [NanoTlbEntry::default(); 3],
         };

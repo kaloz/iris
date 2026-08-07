@@ -634,7 +634,6 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub sysad: Arc<dyn BusDevice>,
     pub tlb: T,
     pub cache: C,
-    pub delay_slot_target: u64,
     #[cfg(feature = "developer")]
     undo_buffer: UndoBuffer,
     #[cfg(feature = "developer")]
@@ -827,7 +826,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             sysad,
             tlb,
             cache,
-            delay_slot_target: 0,
             #[cfg(feature = "developer")]
             undo_buffer: UndoBuffer::new(),
             #[cfg(feature = "developer")]
@@ -1022,7 +1020,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// sets `core.pc` itself.
     #[inline(always)]
     fn branch_delay(&mut self, target: u64) -> ExecStatus {
-        self.delay_slot_target = target;
+        self.core.delay_slot_target = target;
         if !self.core.in_delay_slot {
             self.core.in_delay_slot = true;
         }
@@ -1037,7 +1035,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     #[inline(always)]
     fn handle_exec_complete(&mut self) -> ExecStatus {
         if self.core.in_delay_slot {
-            self.core.pc = self.delay_slot_target;
+            self.core.pc = self.core.delay_slot_target;
             self.core.in_delay_slot = false;
         } else {
             self.core.pc = self.core.pc.wrapping_add(4);
@@ -1164,7 +1162,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             if pending & SOFT_RESET_BIT != 0 {
                 self.core.reset(true); // clears interrupts word (including bit 63)
                 self.core.in_delay_slot = false;
-                self.delay_slot_target = 0;
+                self.core.delay_slot_target = 0;
                 return EXEC_COMPLETE;
             }
 
@@ -1231,7 +1229,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             if pending & SOFT_RESET_BIT != 0 {
                 self.core.reset(true);
                 self.core.in_delay_slot = false;
-                self.delay_slot_target = 0;
+                self.core.delay_slot_target = 0;
                 return EXEC_COMPLETE;
             }
             self.core.cp0_cause = (self.core.cp0_cause & !EXT_INT_MASK) | (pending as u32 & EXT_INT_MASK);
@@ -4773,7 +4771,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             running: self.core.running,
             halted: self.core.halted,
             in_delay_slot: self.core.in_delay_slot,
-            delay_slot_target: self.delay_slot_target,
+            delay_slot_target: self.core.delay_slot_target,
             memory_writes: Vec::new(), // Will be populated separately
         }
     }
@@ -4826,7 +4824,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.running = snapshot.running;
         self.core.halted = snapshot.halted;
         self.core.in_delay_slot = snapshot.in_delay_slot;
-        self.delay_slot_target = snapshot.delay_slot_target;
+        self.core.delay_slot_target = snapshot.delay_slot_target;
     }
 
     /// Track a memory write for potential undo
@@ -7143,7 +7141,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Resettable for Mips
         exec.tlb.power_on();
         exec.cache.power_on();
         exec.core.in_delay_slot = false;
-        exec.delay_slot_target = 0;
+        exec.core.delay_slot_target = 0;
         #[cfg(feature = "developer")]
         exec.undo_buffer.clear();
         exec.traceback = TracebackBuffer::new();
@@ -7206,7 +7204,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
 
         // Execution state
         tbl.insert("in_delay_slot".into(),     toml::Value::Boolean(c.in_delay_slot));
-        tbl.insert("delay_slot_target".into(), hex_u64(exec.delay_slot_target));
+        tbl.insert("delay_slot_target".into(), hex_u64(c.delay_slot_target));
 
         // TLB
         tbl.insert("tlb".into(), exec.tlb.save_state());
@@ -7271,7 +7269,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
         }
 
         if let Some(x) = get_field(v, "in_delay_slot")     { exec.core.in_delay_slot     = toml_bool(x).unwrap_or(false); }
-        if let Some(x) = get_field(v, "delay_slot_target") { exec.delay_slot_target = toml_u64(x).unwrap_or(0); }
+        if let Some(x) = get_field(v, "delay_slot_target") { exec.core.delay_slot_target = toml_u64(x).unwrap_or(0); }
 
         if let Some(tlb_v) = get_field(v, "tlb") {
             exec.tlb.load_state(tlb_v)?;

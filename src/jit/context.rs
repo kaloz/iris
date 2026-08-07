@@ -151,7 +151,7 @@ impl JitContext {
         self.cp0_badvaddr = exec.core.cp0_badvaddr;
         self.nanotlb = exec.core.nanotlb;
         self.in_delay_slot = exec.core.in_delay_slot;
-        self.delay_slot_target = exec.delay_slot_target;
+        self.delay_slot_target = exec.core.delay_slot_target;
         self.cached_pending = exec.cached_pending;
     }
 
@@ -175,7 +175,7 @@ impl JitContext {
         // Clear the interpreter's delay slot state so subsequent exec.step()
         // calls don't jump to a stale target.
         exec.core.in_delay_slot = false;
-        exec.delay_slot_target = 0;
+        exec.core.delay_slot_target = 0;
 
         // DO NOT write back: cp0_status, cp0_cause, cp0_epc, cp0_badvaddr,
         // cp0_count, cp0_compare, count_step, nanotlb, fpr, fpu_fcsr —
