@@ -1,6 +1,6 @@
 //! Block compiler: translates MIPS basic blocks to native code via Cranelift.
 
-use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlags, Value, FuncRef};
+use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlagsData, Value, FuncRef};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{self, Context};
@@ -163,7 +163,7 @@ impl BlockCompiler {
         builder.seal_block(entry_block);
 
         let ctx_ptr = builder.block_params(entry_block)[0];
-        let mem = MemFlags::trusted();
+        let mem = MemFlagsData::trusted();
 
         // Load executor pointer from JitContext
         let exec_ptr = builder.ins().load(
@@ -314,7 +314,7 @@ impl BlockCompiler {
 
         if compiled_count == 0 {
             builder.ins().return_(&[]);
-            builder.finalize();
+            builder.finalize(self.jit_module.target_config());
             self.ctx.clear();
             return None;
         }
@@ -350,7 +350,7 @@ impl BlockCompiler {
             ir::immediates::Offset32::new(JitContext::block_instrs_offset()));
 
         builder.ins().return_(&[]);
-        builder.finalize();
+        builder.finalize(self.jit_module.target_config());
 
         // Capture CLIF IR before define_function consumes it (for verify diagnostics)
         let clif_ir = if self.capture_ir {
@@ -888,7 +888,7 @@ fn emit_mult(builder: &mut FunctionBuilder, gpr: &[Value; 32], hi: &mut Value, l
     let product = builder.ins().imul(a, b);
     // lo = sign-extend low 32 bits; hi = sign-extend high 32 bits
     *lo = sext32(builder, product);
-    let shifted = builder.ins().sshr_imm(product, 32);
+    let shifted = builder.ins().sshr_imm_s(product, 32);
     *hi = sext32(builder, shifted);
 }
 
@@ -899,7 +899,7 @@ fn emit_multu(builder: &mut FunctionBuilder, gpr: &[Value; 32], hi: &mut Value, 
     let b = builder.ins().uextend(types::I64, b32);
     let product = builder.ins().imul(a, b);
     *lo = sext32(builder, product);
-    let shifted = builder.ins().ushr_imm(product, 32);
+    let shifted = builder.ins().ushr_imm_s(product, 32);
     *hi = sext32(builder, shifted);
 }
 
@@ -984,7 +984,7 @@ fn flush_modified_gprs(
     ctx_ptr: Value,
     modified: &mut u32,
 ) {
-    let mem = MemFlags::trusted();
+    let mem = MemFlagsData::trusted();
     for i in 1..32usize {
         if (*modified >> i) & 1 != 0 {
             builder.ins().store(
@@ -1001,7 +1001,7 @@ fn reload_all_gprs(
     gpr: &mut [Value; 32],
     ctx_ptr: Value,
 ) {
-    let mem = MemFlags::new();
+    let mem = MemFlagsData::new();
     for i in 1..32usize {
         gpr[i] = builder.ins().load(
             types::I64, mem, ctx_ptr,
@@ -1040,7 +1040,7 @@ fn emit_load(
     // Store faulting PC to ctx BEFORE the helper call, so the dispatch loop
     // knows which instruction caused the exception if one occurs.
     let instr_pc_val = builder.ins().iconst(types::I64, instr_pc as i64);
-    builder.ins().store(MemFlags::trusted(), instr_pc_val, ctx_ptr,
+    builder.ins().store(MemFlagsData::trusted(), instr_pc_val, ctx_ptr,
         ir::immediates::Offset32::new(JitContext::pc_offset()));
 
     // Call helper: result = helper(ctx_ptr, exec_ptr, virt_addr)
@@ -1048,8 +1048,8 @@ fn emit_load(
     let raw_val = builder.inst_results(call)[0];
 
     // Check ctx.exit_reason for exception.
-    // MUST use MemFlags::new() — helper may have written exit_reason through ctx_ptr.
-    let exit_reason = builder.ins().load(types::I32, MemFlags::new(), ctx_ptr,
+    // MUST use MemFlagsData::new() — helper may have written exit_reason through ctx_ptr.
+    let exit_reason = builder.ins().load(types::I32, MemFlagsData::new(), ctx_ptr,
         ir::immediates::Offset32::new(JitContext::exit_reason_offset()));
     let zero_i32 = builder.ins().iconst(types::I32, 0);
     let is_exception = builder.ins().icmp(IntCC::NotEqual, exit_reason, zero_i32);
@@ -1057,7 +1057,7 @@ fn emit_load(
     let ok_block = builder.create_block();
     builder.append_block_param(ok_block, types::I64);
     let exc_block = builder.create_block();
-    builder.ins().brif(is_exception, exc_block, &[], ok_block, &[raw_val]);
+    builder.ins().brif(is_exception, exc_block, &[], ok_block, &[ir::BlockArg::Value(raw_val)]);
 
     // Exception path: GPRs already flushed before the helper call — just return
     builder.switch_to_block(exc_block);
@@ -1120,13 +1120,13 @@ fn emit_store(
 
     // Store faulting PC before helper call
     let instr_pc_val = builder.ins().iconst(types::I64, instr_pc as i64);
-    builder.ins().store(MemFlags::trusted(), instr_pc_val, ctx_ptr,
+    builder.ins().store(MemFlagsData::trusted(), instr_pc_val, ctx_ptr,
         ir::immediates::Offset32::new(JitContext::pc_offset()));
 
     let _call = builder.ins().call(helper, &[ctx_ptr, exec_ptr, virt_addr, value]);
 
-    // Check ctx.exit_reason — MUST use MemFlags::new()
-    let exit_reason = builder.ins().load(types::I32, MemFlags::new(), ctx_ptr,
+    // Check ctx.exit_reason — MUST use MemFlagsData::new()
+    let exit_reason = builder.ins().load(types::I32, MemFlagsData::new(), ctx_ptr,
         ir::immediates::Offset32::new(JitContext::exit_reason_offset()));
     let zero = builder.ins().iconst(types::I32, 0);
     let is_exception = builder.ins().icmp(IntCC::NotEqual, exit_reason, zero);

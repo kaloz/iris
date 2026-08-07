@@ -16,13 +16,23 @@
 
 use std::mem::offset_of;
 
-use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlagsData, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+
+/// Wrap a plain-`Value` block-argument list as `BlockArg`s for `jump`/`brif`
+/// — cranelift 0.134 gave block arguments their own type (`ir::BlockArg`,
+/// supporting `try_call`'s multi-return/exception-payload args alongside
+/// plain SSA values) instead of accepting bare `Value`s directly. All our
+/// jump targets only ever pass ordinary values, never a `try_call` result,
+/// so this is always `BlockArg::Value(v)`.
+fn block_args(vals: &[Value]) -> Vec<ir::BlockArg> {
+    vals.iter().map(|&v| ir::BlockArg::Value(v)).collect()
+}
 
 use crate::rex3::{
     Rex3Context,
@@ -193,6 +203,7 @@ impl ShaderCompiler {
             Err(e) => { eprintln!("REX JIT: declare_function failed: {e}"); return None; }
         };
 
+        let target_config = self.jit_module.target_config();
         let result = if is_line {
             emit_draw_iline(
                 &mut self.ctx.func,
@@ -200,6 +211,7 @@ impl ShaderCompiler {
                 &dm0, &dm1,
                 clipmode_key,
                 ptr_type,
+                target_config,
             )
         } else {
             emit_shader(
@@ -209,6 +221,7 @@ impl ShaderCompiler {
                 is_scr2scr, is_hostw, is_hostr,
                 clipmode_key,
                 ptr_type,
+                target_config,
             )
         };
 
@@ -287,10 +300,10 @@ fn emit_calculate_src_address(
     c2048:      Value,
 ) -> Value { // src_px_ptr
     // Source: (x, y) + xywin — no xymove, no smask (matches calculate_src_address).
-    let xw_raw = b.ins().ushr_imm(pctx.xywin_v, 16);
+    let xw_raw = b.ins().ushr_imm_s(pctx.xywin_v, 16);
     let xw16   = b.ins().ireduce(types::I16, xw_raw);
     let xw32   = b.ins().sextend(types::I32, xw16);
-    let yw_raw = b.ins().band_imm(pctx.xywin_v, 0xFFFF_i64);
+    let yw_raw = b.ins().band_imm_s(pctx.xywin_v, 0xFFFF_i64);
     let yw16   = b.ins().ireduce(types::I16, yw_raw);
     let yw32   = b.ins().sextend(types::I32, yw16);
     let x_abs  = b.ins().iadd(x_v, xw32);
@@ -354,10 +367,10 @@ fn emit_calculate_fb_address(
     //    Mirrors: apply_xymove = is_scr2scr || ctx.drawmode0.xyoffset()
     let apply_xymove = is_scr2scr || dm0.xyoffset();
     let (x_curr, y_curr) = if apply_xymove {
-        let xm_raw = b.ins().ushr_imm(pctx.xymove_v, 16);
+        let xm_raw = b.ins().ushr_imm_s(pctx.xymove_v, 16);
         let xm16   = b.ins().ireduce(types::I16, xm_raw);
         let xm32   = b.ins().sextend(types::I32, xm16);
-        let ym_raw = b.ins().band_imm(pctx.xymove_v, 0xFFFF_i64);
+        let ym_raw = b.ins().band_imm_s(pctx.xymove_v, 0xFFFF_i64);
         let ym16   = b.ins().ireduce(types::I16, ym_raw);
         let ym32   = b.ins().sextend(types::I32, ym16);
         (b.ins().iadd(x_v, xm32), b.ins().iadd(y_v, ym32))
@@ -366,10 +379,10 @@ fn emit_calculate_fb_address(
     };
 
     // 2. Apply xywin to get screen-absolute coords
-    let xw_raw = b.ins().ushr_imm(pctx.xywin_v, 16);
+    let xw_raw = b.ins().ushr_imm_s(pctx.xywin_v, 16);
     let xw16   = b.ins().ireduce(types::I16, xw_raw);
     let xw32   = b.ins().sextend(types::I32, xw16);
-    let yw_raw = b.ins().band_imm(pctx.xywin_v, 0xFFFF_i64);
+    let yw_raw = b.ins().band_imm_s(pctx.xywin_v, 0xFFFF_i64);
     let yw16   = b.ins().ireduce(types::I16, yw_raw);
     let yw32   = b.ins().sextend(types::I32, yw16);
     let x_abs  = b.ins().iadd(x_curr, xw32);
@@ -380,19 +393,19 @@ fn emit_calculate_fb_address(
     {
         // smask0: window-relative clip rect (bit 0 of ensmask)
         if ensmask_key & 1 != 0 {
-            let sm0x_hi    = b.ins().ushr_imm(pctx.smask0x_v, 16);
+            let sm0x_hi    = b.ins().ushr_imm_s(pctx.smask0x_v, 16);
             let sm0x_hi16  = b.ins().ireduce(types::I16, sm0x_hi);
             let min_x0     = b.ins().sextend(types::I32, sm0x_hi16);
             let sm0x_lo16  = b.ins().ireduce(types::I16, pctx.smask0x_v);
             let max_x0     = b.ins().sextend(types::I32, sm0x_lo16);
-            let sm0y_hi    = b.ins().ushr_imm(pctx.smask0y_v, 16);
+            let sm0y_hi    = b.ins().ushr_imm_s(pctx.smask0y_v, 16);
             let sm0y_hi16  = b.ins().ireduce(types::I16, sm0y_hi);
             let min_y0     = b.ins().sextend(types::I32, sm0y_hi16);
             let sm0y_lo16  = b.ins().ireduce(types::I16, pctx.smask0y_v);
             let max_y0     = b.ins().sextend(types::I32, sm0y_lo16);
             let ok0 = and4_range(b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
             let pass0 = b.create_block();
-            b.ins().brif(ok0, pass0, &[], skip_block, skip_args);
+            b.ins().brif(ok0, pass0, &[], skip_block, &block_args(skip_args));
             b.switch_to_block(pass0); b.seal_block(pass0);
         }
 
@@ -407,12 +420,12 @@ fn emit_calculate_fb_address(
         if !enabled14.is_empty() {
             let mut inside_any: Value = b.ins().iconst(types::I8, 0);
             for (sx, sy, _) in &enabled14 {
-                let sx_hi   = b.ins().ushr_imm(*sx, 16);
+                let sx_hi   = b.ins().ushr_imm_s(*sx, 16);
                 let sx_hi16 = b.ins().ireduce(types::I16, sx_hi);
                 let min_x   = b.ins().sextend(types::I32, sx_hi16);
                 let sx_lo16 = b.ins().ireduce(types::I16, *sx);
                 let max_x   = b.ins().sextend(types::I32, sx_lo16);
-                let sy_hi   = b.ins().ushr_imm(*sy, 16);
+                let sy_hi   = b.ins().ushr_imm_s(*sy, 16);
                 let sy_hi16 = b.ins().ireduce(types::I16, sy_hi);
                 let min_y   = b.ins().sextend(types::I32, sy_hi16);
                 let sy_lo16 = b.ins().ireduce(types::I16, *sy);
@@ -420,8 +433,8 @@ fn emit_calculate_fb_address(
                 let in_range = and4_range(b, x_abs, y_abs, min_x, max_x, min_y, max_y);
                 inside_any   = b.ins().bor(inside_any, in_range);
             }
-            let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
-            b.ins().brif(inside, after_clip, &[], skip_block, skip_args);
+            let inside = b.ins().icmp_imm_s(IntCC::NotEqual, inside_any, 0);
+            b.ins().brif(inside, after_clip, &[], skip_block, &block_args(skip_args));
         } else {
             b.ins().jump(after_clip, &[]);
         }
@@ -450,7 +463,7 @@ fn emit_calculate_fb_address(
         b.ins().bor(ab, cd)
     };
     let in_bounds = b.create_block();
-    b.ins().brif(oob, skip_block, skip_args, in_bounds, &[]);
+    b.ins().brif(oob, skip_block, &block_args(skip_args), in_bounds, &[]);
     b.switch_to_block(in_bounds); b.seal_block(in_bounds);
 
     // Compute byte pointer into framebuffer
@@ -481,8 +494,8 @@ fn emit_pixel_write(
     y_bayer:     Value,
     src_color:   Value,
     pctx:        &PixelCtx,
-    mem:         &MemFlags,
-    memv:        &MemFlags,
+    mem:         &MemFlagsData,
+    memv:        &MemFlagsData,
     dm1:         &Dm1,
     is_hostw:    bool,
 ) {
@@ -507,13 +520,13 @@ fn emit_pixel_write(
     let dst_plane: Value = if needs_dst {
         if use_aux {
             let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
-            let extracted  = if read_shift > 0 { b.ins().ushr_imm(fb_px_raw, read_shift) } else { fb_px_raw };
-            b.ins().band_imm(extracted, aux_read_mask)
+            let extracted  = if read_shift > 0 { b.ins().ushr_imm_s(fb_px_raw, read_shift) } else { fb_px_raw };
+            b.ins().band_imm_s(extracted, aux_read_mask)
         } else if dm1.dblsrc() && dblsrc_shift > 0 {
-            let shifted = b.ins().ushr_imm(fb_px_raw, dblsrc_shift);
-            b.ins().band_imm(shifted, depth_mask)
+            let shifted = b.ins().ushr_imm_s(fb_px_raw, dblsrc_shift);
+            b.ins().band_imm_s(shifted, depth_mask)
         } else {
-            b.ins().band_imm(fb_px_raw, depth_mask)
+            b.ins().band_imm_s(fb_px_raw, depth_mask)
         }
     } else {
         b.ins().iconst(types::I32, 0)
@@ -525,40 +538,40 @@ fn emit_pixel_write(
         // fastclear_color: replicate colorvram nibble/byte/etc into all plane slots
         match dm1.drawdepth() {
             0 => {
-                let c   = b.ins().band_imm(pctx.colorvram_v, 0xf);
-                let c4  = b.ins().ishl_imm(c, 4);
-                let c8  = b.ins().ishl_imm(c, 8);
-                let c16 = b.ins().ishl_imm(c, 16);
+                let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xf);
+                let c4  = b.ins().ishl_imm_s(c, 4);
+                let c8  = b.ins().ishl_imm_s(c, 8);
+                let c16 = b.ins().ishl_imm_s(c, 16);
                 let r1 = b.ins().bor(c, c4);
                 let r2 = b.ins().bor(c8, c16);
                 b.ins().bor(r1, r2)
             }
             1 => {
-                let c   = b.ins().band_imm(pctx.colorvram_v, 0xff);
-                let c8  = b.ins().ishl_imm(c, 8);
-                let c16 = b.ins().ishl_imm(c, 16);
+                let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xff);
+                let c8  = b.ins().ishl_imm_s(c, 8);
+                let c16 = b.ins().ishl_imm_s(c, 16);
                 let r1 = b.ins().bor(c, c8);
                 b.ins().bor(r1, c16)
             }
             2 => {
                 if dm1.rgbmode() {
-                    let hi  = b.ins().band_imm(pctx.colorvram_v, 0xf00000i64);
-                    let his = b.ins().ushr_imm(hi, 12);
-                    let mid = b.ins().band_imm(pctx.colorvram_v, 0xf000i64);
-                    let mids= b.ins().ushr_imm(mid, 8);
-                    let lo  = b.ins().band_imm(pctx.colorvram_v, 0xf0i64);
-                    let los = b.ins().ushr_imm(lo, 4);
+                    let hi  = b.ins().band_imm_s(pctx.colorvram_v, 0xf00000i64);
+                    let his = b.ins().ushr_imm_s(hi, 12);
+                    let mid = b.ins().band_imm_s(pctx.colorvram_v, 0xf000i64);
+                    let mids= b.ins().ushr_imm_s(mid, 8);
+                    let lo  = b.ins().band_imm_s(pctx.colorvram_v, 0xf0i64);
+                    let los = b.ins().ushr_imm_s(lo, 4);
                     let r1  = b.ins().bor(his, mids);
                     let c   = b.ins().bor(r1, los);
-                    let c12 = b.ins().ishl_imm(c, 12);
+                    let c12 = b.ins().ishl_imm_s(c, 12);
                     b.ins().bor(c, c12)
                 } else {
-                    let c   = b.ins().band_imm(pctx.colorvram_v, 0xfffi64);
-                    let c12 = b.ins().ishl_imm(c, 12);
+                    let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xfffi64);
+                    let c12 = b.ins().ishl_imm_s(c, 12);
                     b.ins().bor(c, c12)
                 }
             }
-            _ => b.ins().band_imm(pctx.colorvram_v, 0xffffffi64),
+            _ => b.ins().band_imm_s(pctx.colorvram_v, 0xffffffi64),
         }
     } else if dm1.blend() {
         // blend path: expand dst → blend → compress + amplify
@@ -574,7 +587,7 @@ fn emit_pixel_write(
             emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
         } else { blended };
         if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
+            let shifted = b.ins().ishl_imm_s(compressed, dblsrc_shift);
             b.ins().bor(compressed, shifted)
         } else { compressed }
     } else {
@@ -586,13 +599,13 @@ fn emit_pixel_write(
         let amp_src = if use_aux {
             amplify_aux_ir(b, compressed, dm1.planes())
         } else if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
+            let shifted = b.ins().ishl_imm_s(compressed, dblsrc_shift);
             b.ins().bor(compressed, shifted)
         } else { compressed };
         let amp_dst = if use_aux {
             amplify_aux_ir(b, dst_plane, dm1.planes())
         } else if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(dst_plane, dblsrc_shift);
+            let shifted = b.ins().ishl_imm_s(dst_plane, dblsrc_shift);
             b.ins().bor(dst_plane, shifted)
         } else { dst_plane };
         emit_logic_op(b, dm1.logicop(), amp_src, amp_dst)
@@ -618,12 +631,13 @@ fn emit_shader(
     is_hostr: bool,    // READ opcode: pack fb pixels into ctx.hostrw
     clipmode_key: u32,
     ptr_type: ir::Type,
+    target_config: cranelift_codegen::isa::TargetFrontendConfig,
 ) -> bool {
     let ensmask_key = clipmode_key & 0x1F;
     let cidmatch    = (clipmode_key >> 9) & 0xF; // 0xF = disabled
     let mut b = FunctionBuilder::new(func, builder_ctx);
-    let mem  = MemFlags::trusted();
-    let memv = MemFlags::new(); // for potentially-aliased reads after stores
+    let mem  = MemFlagsData::trusted();
+    let memv = MemFlagsData::new(); // for potentially-aliased reads after stores
 
     // Entry block
     let entry = b.create_block();
@@ -681,16 +695,16 @@ fn emit_shader(
     // octant is read from ctx at runtime (direction changes per primitive)
     let bres_v   = ld32!(ctx_off!(bresoctinc1));
     let octant_v = {
-        let shifted = b.ins().ushr_imm(bres_v, 24);
-        b.ins().band_imm(shifted, 7)
+        let shifted = b.ins().ushr_imm_s(bres_v, 24);
+        b.ins().band_imm_s(shifted, 7)
     };
     let x_dec_v = {
-        let bit = b.ins().band_imm(octant_v, OCTANT_XDEC as i64);
-        b.ins().icmp_imm(IntCC::NotEqual, bit, 0)
+        let bit = b.ins().band_imm_s(octant_v, OCTANT_XDEC as i64);
+        b.ins().icmp_imm_s(IntCC::NotEqual, bit, 0)
     };
     let y_dec_v = {
-        let bit = b.ins().band_imm(octant_v, OCTANT_YDEC as i64);
-        b.ins().icmp_imm(IntCC::NotEqual, bit, 0)
+        let bit = b.ins().band_imm_s(octant_v, OCTANT_YDEC as i64);
+        b.ins().icmp_imm_s(IntCC::NotEqual, bit, 0)
     };
 
     // stepx = x_dec ? -(1<<11) : (1<<11)
@@ -757,10 +771,10 @@ fn emit_shader(
         let diff = b.ins().isub(xend_v, xstart_init);
         let diff_abs = {
             let neg = b.ins().ineg(diff);
-            let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, diff, 0);
+            let is_neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, diff, 0);
             b.ins().select(is_neg, neg, diff)
         };
-        let span_len_v = b.ins().ushr_imm(diff_abs, 11);
+        let span_len_v = b.ins().ushr_imm_s(diff_abs, 11);
         let c32i = b.ins().iconst(types::I32, 32);
         let long_enough = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, span_len_v, c32i);
         // If span < 32: use a sentinel that never triggers (xend ± 1 step beyond)
@@ -803,12 +817,12 @@ fn emit_shader(
                 emit_bswap64(&mut b, raw)
             } else {
                 // swap only the high 32-bit word (32-bit write lands in [63:32])
-                let hi32 = b.ins().ushr_imm(raw, 32);
+                let hi32 = b.ins().ushr_imm_s(raw, 32);
                 let hi32_i32 = b.ins().ireduce(types::I32, hi32);
                 let hi32_swap = emit_bswap32(&mut b, hi32_i32);
                 let hi32_ext = b.ins().uextend(types::I64, hi32_swap);
-                let lo32 = b.ins().band_imm(raw, 0xFFFF_FFFFi64);
-                let hi32_shifted = b.ins().ishl_imm(hi32_ext, 32);
+                let lo32 = b.ins().band_imm_s(raw, 0xFFFF_FFFFi64);
+                let hi32_shifted = b.ins().ishl_imm_s(hi32_ext, 32);
                 b.ins().bor(hi32_shifted, lo32)
             }
         } else { raw }
@@ -867,7 +881,7 @@ fn emit_shader(
         b.seal_block(done_block);
     }
 
-    b.ins().jump(loop_header, &init_args);
+    b.ins().jump(loop_header, &block_args(&init_args));
 
     // ── loop_header ───────────────────────────────────────────────────────────
     b.switch_to_block(loop_header);
@@ -932,20 +946,20 @@ fn emit_shader(
     // never entered at all — matching draw_span's `return` with no side effects.
     // That early-exit is emitted below for the span+lronly case.
     let do_pixel: Value = if dm0.skipfirst() && dm0.skiplast() {
-        let first_is_zero   = b.ins().icmp_imm(IntCC::Equal, first_v, 0);     // 1 if not-first
-        let not_x_end       = b.ins().icmp_imm(IntCC::Equal, x_end_reached, 0); // 1 if not-last
+        let first_is_zero   = b.ins().icmp_imm_s(IntCC::Equal, first_v, 0);     // 1 if not-first
+        let not_x_end       = b.ins().icmp_imm_s(IntCC::Equal, x_end_reached, 0); // 1 if not-last
         b.ins().band(first_is_zero, not_x_end)
     } else if dm0.skipfirst() {
-        b.ins().icmp_imm(IntCC::Equal, first_v, 0)    // 1 when first==0 (not the first pixel)
+        b.ins().icmp_imm_s(IntCC::Equal, first_v, 0)    // 1 when first==0 (not the first pixel)
     } else if dm0.skiplast() {
-        b.ins().icmp_imm(IntCC::Equal, x_end_reached, 0) // 1 when not at end
+        b.ins().icmp_imm_s(IntCC::Equal, x_end_reached, 0) // 1 when not at end
     } else {
         b.ins().iconst(types::I8, 1) // always draw
     };
 
     // LRONLY block mode: AND with !x_dec (skip pixel when x_dec=1, shade still runs).
     let do_pixel = if dm0.lronly() && is_block {
-        let not_x_dec = b.ins().icmp_imm(IntCC::Equal, x_dec_v, 0); // 1 when x_dec=0
+        let not_x_dec = b.ins().icmp_imm_s(IntCC::Equal, x_dec_v, 0); // 1 when x_dec=0
         b.ins().band(do_pixel, not_x_dec)
     } else {
         do_pixel
@@ -967,7 +981,7 @@ fn emit_shader(
     let skip_init_args: &[Value] = if is_hostw || is_hostr {
         &skip_init_args_buf[..]
     } else { &[] };
-    b.ins().brif(do_pixel, pixel_block, &[], skip_block, skip_init_args);
+    b.ins().brif(do_pixel, pixel_block, &[], skip_block, &block_args(skip_init_args));
 
     // ── pixel_block: fetch host pixel (if any), compute address, draw ─────────
     b.switch_to_block(pixel_block);
@@ -998,7 +1012,7 @@ fn emit_shader(
     let hostcnt_after_consume: Value = if is_hostw || is_hostr {
         let hc = dm1.host_count() as i64;
         let host_count_c = b.ins().iconst(types::I32, hc);
-        let is_fresh = b.ins().icmp_imm(IntCC::Equal, hostcnt_v, 0);
+        let is_fresh = b.ins().icmp_imm_s(IntCC::Equal, hostcnt_v, 0);
         let reloaded = b.ins().select(is_fresh, host_count_c, hostcnt_v);
         b.ins().isub(reloaded, c1)
     } else {
@@ -1031,11 +1045,11 @@ fn emit_shader(
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
-        let aux_lo4 = b.ins().band_imm(aux_raw, 0xF_i64);
-        let cid_matches = b.ins().icmp_imm(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let aux_lo4 = b.ins().band_imm_s(aux_raw, 0xF_i64);
+        let cid_matches = b.ins().icmp_imm_s(IntCC::Equal, aux_lo4, cidmatch as i64);
         let cid_ok = b.create_block();
         let cid_skip_args: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
-        b.ins().brif(cid_matches, cid_ok, &[], skip_block, cid_skip_args);
+        b.ins().brif(cid_matches, cid_ok, &[], skip_block, &block_args(cid_skip_args));
         b.switch_to_block(cid_ok); b.seal_block(cid_ok);
     }
 
@@ -1048,12 +1062,12 @@ fn emit_shader(
     let new_shifter_after_pixel: Value = if is_hostr {
         let fb_raw = b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0));
         let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
-        let masked = b.ins().band_imm(fb_raw, depth_mask_i);
+        let masked = b.ins().band_imm_s(fb_raw, depth_mask_i);
         let expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
             emit_expand_ir(&mut b, masked, dm1.drawdepth())
         } else { masked };
         let new_s = emit_pack_host_pixel_ir(&mut b, host_shifter_after_fetch, expanded, dm1);
-        b.ins().jump(skip_block, &[new_s, hostcnt_after_consume]);
+        b.ins().jump(skip_block, &[ir::BlockArg::Value(new_s), ir::BlockArg::Value(hostcnt_after_consume)]);
         new_s // unreachable but satisfies type checker
     } else {
         // ── Source color ──────────────────────────────────────────────────────
@@ -1079,19 +1093,19 @@ fn emit_shader(
             let src_expanded = if use_aux {
                 // Aux plane: extract the plane bits with shift+mask (mirrors rd_fn in interpreter).
                 let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
-                let extracted  = if read_shift > 0 { b.ins().ushr_imm(src_raw, read_shift) } else { src_raw };
-                b.ins().band_imm(extracted, aux_read_mask)
+                let extracted  = if read_shift > 0 { b.ins().ushr_imm_s(src_raw, read_shift) } else { src_raw };
+                b.ins().band_imm_s(extracted, aux_read_mask)
             } else {
                 // RGB plane: mask to depth bits then expand to 24-bit if needed.
-                let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
+                let src_masked = b.ins().band_imm_s(src_raw, depth_mask as i64);
                 if dm1.rgbmode() && dm1.drawdepth() != 3 {
                     emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
                 } else { src_masked }
             };
-            b.ins().jump(src_valid, &[src_expanded]);
+            b.ins().jump(src_valid, &[ir::BlockArg::Value(src_expanded)]);
             b.switch_to_block(src_oob); b.seal_block(src_oob);
             let zero = b.ins().iconst(types::I32, 0);
-            b.ins().jump(src_valid, &[zero]);
+            b.ins().jump(src_valid, &[ir::BlockArg::Value(zero)]);
             b.switch_to_block(src_valid); b.seal_block(src_valid);
             b.block_params(src_valid).to_vec()[0]
         } else {
@@ -1100,8 +1114,8 @@ fn emit_shader(
                 let r  = clamp_color_component(&mut b, colorred_v);
                 let g  = clamp_color_component(&mut b, colorgrn_v);
                 let bl = clamp_color_component(&mut b, colorblue_v);
-                let g8   = b.ins().ishl_imm(g, 8);
-                let bl16 = b.ins().ishl_imm(bl, 16);
+                let g8   = b.ins().ishl_imm_s(g, 8);
+                let bl16 = b.ins().ishl_imm_s(bl, 16);
                 let rb   = b.ins().bor(r, g8);
                 b.ins().bor(rb, bl16)
             } else if is_hostw && dm0.colorhost() {
@@ -1113,8 +1127,8 @@ fn emit_shader(
                 let r_c  = clamp_color_component(&mut b, r);
                 let g_c  = clamp_color_component(&mut b, g);
                 let b_c  = clamp_color_component(&mut b, bl);
-                let g8   = b.ins().ishl_imm(g_c, 8);
-                let bl16 = b.ins().ishl_imm(b_c, 16);
+                let g8   = b.ins().ishl_imm_s(g_c, 8);
+                let bl16 = b.ins().ishl_imm_s(b_c, 16);
                 let rb   = b.ins().bor(r_c, g8);
                 b.ins().bor(rb, bl16)
             } else {
@@ -1124,8 +1138,8 @@ fn emit_shader(
 
             // alphahost=1 (only): color from DDA, alpha from host_pixel bits[31:24]
             let raw_src = if is_hostw && dm0.alphahost() && !dm0.colorhost() && dm1.rgbmode() {
-                let alpha24 = b.ins().band_imm(host_pixel_v, 0xFF00_0000u64 as i64);
-                let color24 = b.ins().band_imm(raw_src, 0x00FF_FFFFi64);
+                let alpha24 = b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64);
+                let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
                 b.ins().bor(color24, alpha24)
             } else { raw_src };
 
@@ -1141,17 +1155,17 @@ fn emit_shader(
                 let zpattern_v   = ld32!(ctx_off!(zpattern));
                 let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
                 let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
-                let bit_v  = b.ins().band_imm(zpat_shifted, 1);
-                let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-                b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
+                let bit_v  = b.ins().band_imm_s(zpat_shifted, 1);
+                let bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, bit_v, 0);
+                b.ins().brif(bit_set, zp_pass, &[ir::BlockArg::Value(cur_use_bg)], zp_block, &[]);
                 b.switch_to_block(zp_block); b.seal_block(zp_block);
                 if dm0.zpopaque() {
                     let bg1 = b.ins().iconst(types::I8, 1);
-                    b.ins().jump(zp_pass, &[bg1]);
+                    b.ins().jump(zp_pass, &[ir::BlockArg::Value(bg1)]);
                 } else {
                     // Pattern miss, not opaque: skip without consuming host pixel.
                     let skip_args_here: &[Value] = if is_hostw { &no_fetch_skip_args_buf[..] } else { &[] };
-                    b.ins().jump(skip_block, skip_args_here);
+                    b.ins().jump(skip_block, &block_args(skip_args_here));
                 }
                 b.switch_to_block(zp_pass); b.seal_block(zp_pass);
                 cur_use_bg = b.block_params(zp_pass).to_vec()[0];
@@ -1164,26 +1178,26 @@ fn emit_shader(
                 let lspattern_v  = ld32!(ctx_off!(lspattern));
                 let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
                 let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
-                let bit_v  = b.ins().band_imm(lspat_shifted, 1);
-                let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-                b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
+                let bit_v  = b.ins().band_imm_s(lspat_shifted, 1);
+                let bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, bit_v, 0);
+                b.ins().brif(bit_set, ls_pass, &[ir::BlockArg::Value(cur_use_bg)], ls_block, &[]);
                 b.switch_to_block(ls_block); b.seal_block(ls_block);
                 if dm0.lsopaque() {
                     let bg1 = b.ins().iconst(types::I8, 1);
-                    b.ins().jump(ls_pass, &[bg1]);
+                    b.ins().jump(ls_pass, &[ir::BlockArg::Value(bg1)]);
                 } else {
                     // Pattern miss, not opaque: skip without consuming host pixel.
                     let skip_args_here: &[Value] = if is_hostw { &no_fetch_skip_args_buf[..] } else { &[] };
-                    b.ins().jump(skip_block, skip_args_here);
+                    b.ins().jump(skip_block, &block_args(skip_args_here));
                 }
                 b.switch_to_block(ls_pass); b.seal_block(ls_pass);
                 cur_use_bg = b.block_params(ls_pass).to_vec()[0];
             }
 
-            b.ins().jump(draw_block, &[cur_use_bg]);
+            b.ins().jump(draw_block, &[ir::BlockArg::Value(cur_use_bg)]);
             b.switch_to_block(draw_block); b.seal_block(draw_block);
             let use_bg_flag = b.block_params(draw_block).to_vec()[0];
-            let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+            let use_bg_bool = b.ins().icmp_imm_s(IntCC::NotEqual, use_bg_flag, 0);
             draw_use_bg_bool = use_bg_bool;
             b.ins().select(use_bg_bool, colorback_v, raw_src)
         };
@@ -1199,7 +1213,7 @@ fn emit_shader(
         };
         let final_shifter_buf: [Value; 2] = [final_shifter, final_hostcnt];
         let skip_args_after_write: &[Value] = if is_hostw { &final_shifter_buf[..] } else { &[] };
-        b.ins().jump(skip_block, skip_args_after_write);
+        b.ins().jump(skip_block, &block_args(skip_args_after_write));
         host_shifter_after_fetch
     };
     let _ = new_shifter_after_pixel; // value flows through skip_block param (current_shifter)
@@ -1235,13 +1249,13 @@ fn emit_shader(
         } else if dm0.ciclamp() {
             let depth = dm1.drawdepth();
             let ncr2 = if depth == 1 { // 8bpp: clamp colorred if bit 19 set
-                let overflow = b.ins().band_imm(ncr, 1 << 19);
-                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let overflow = b.ins().band_imm_s(ncr, 1 << 19);
+                let ov_set = b.ins().icmp_imm_s(IntCC::NotEqual, overflow, 0);
                 let max8 = b.ins().iconst(types::I32, 0x0007_FFFFi64);
                 b.ins().select(ov_set, max8, ncr)
             } else if depth == 2 { // 12bpp: clamp colorred if bit 21 set
-                let overflow = b.ins().band_imm(ncr, 1 << 21);
-                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let overflow = b.ins().band_imm_s(ncr, 1 << 21);
+                let ov_set = b.ins().icmp_imm_s(IntCC::NotEqual, overflow, 0);
                 let max12 = b.ins().iconst(types::I32, 0x001F_FFFFi64);
                 b.ins().select(ov_set, max12, ncr)
             } else { ncr };
@@ -1261,7 +1275,7 @@ fn emit_shader(
     let new_zpat_bit = if dm0.enzpattern() {
         let c1_i8 = b.ins().iconst(types::I8, 1);
         let dec = b.ins().isub(zpat_bit_v, c1_i8);
-        b.ins().band_imm(dec, 31)
+        b.ins().band_imm_s(dec, 31)
     } else {
         zpat_bit_v
     };
@@ -1269,31 +1283,31 @@ fn emit_shader(
     let (new_pat_bit, new_lsmode) = if dm0.enlspattern() {
         // Advance lspattern: decrement lsrcount; on zero, advance pat_bit and reload
         // lsrcount = lsmode[7:0], lsrepeat = lsmode[15:8], lsrcntsave = lsmode[23:16], lslength = lsmode[27:24]
-        let lsrcount = b.ins().band_imm(lsmode_v, 0xFF);
-        let lsm_shr8 = b.ins().ushr_imm(lsmode_v, 8);
-        let lsrepeat_raw = b.ins().band_imm(lsm_shr8, 0xFF);
+        let lsrcount = b.ins().band_imm_s(lsmode_v, 0xFF);
+        let lsm_shr8 = b.ins().ushr_imm_s(lsmode_v, 8);
+        let lsrepeat_raw = b.ins().band_imm_s(lsm_shr8, 0xFF);
         let lsrepeat = {
-            let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrepeat_raw, 0);
+            let is_zero = b.ins().icmp_imm_s(IntCC::Equal, lsrepeat_raw, 0);
             b.ins().select(is_zero, c1, lsrepeat_raw)
         };
-        let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrcount, 0);
+        let is_zero = b.ins().icmp_imm_s(IntCC::Equal, lsrcount, 0);
         let reload_count = b.ins().isub(lsrepeat, c1);
         let lsrcount_dec = b.ins().isub(lsrcount, c1);
         let new_count = b.ins().select(is_zero, reload_count, lsrcount_dec);
         // If lsrcount was 0: advance pat_bit
-        let lsm_shr24 = b.ins().ushr_imm(lsmode_v, 24);
-        let lslength = b.ins().band_imm(lsm_shr24, 0xF);
-        let length_bits = b.ins().iadd_imm(lslength, 17); // 17..=32
+        let lsm_shr24 = b.ins().ushr_imm_s(lsmode_v, 24);
+        let lslength = b.ins().band_imm_s(lsm_shr24, 0xF);
+        let length_bits = b.ins().iadd_imm_s(lslength, 17); // 17..=32
         let wrap_point = b.ins().isub(c32, length_bits);
         let pat_bit32 = b.ins().uextend(types::I32, pat_bit_v);
         let at_wrap = b.ins().icmp(IntCC::Equal, pat_bit32, wrap_point);
         let pat_dec = b.ins().isub(pat_bit32, c1);
-        let dec_pat = b.ins().band_imm(pat_dec, 31);
+        let dec_pat = b.ins().band_imm_s(pat_dec, 31);
         let new_pat32 = b.ins().select(at_wrap, c31, dec_pat);
         let new_pat32_masked = b.ins().select(is_zero, new_pat32, pat_bit32);
         let new_pb = b.ins().ireduce(types::I8, new_pat32_masked);
         // Update lsmode: set lsrcount field (bits 7:0)
-        let lsm_cleared = b.ins().band_imm(lsmode_v, !0xFF_i64);
+        let lsm_cleared = b.ins().band_imm_s(lsmode_v, !0xFF_i64);
         let new_lsm = b.ins().bor(lsm_cleared, new_count);
         (new_pb, new_lsm)
     } else {
@@ -1339,7 +1353,7 @@ fn emit_shader(
             return shifter;
         }
         let unfilled64 = b.ins().uextend(types::I64, current_hostcnt);
-        let pad_bits = b.ins().imul_imm(unfilled64, host_shift as i64);
+        let pad_bits = b.ins().imul_imm_s(unfilled64, host_shift as i64);
         b.ins().ishl(shifter, pad_bits)
     };
 
@@ -1393,7 +1407,7 @@ fn emit_shader(
             back_args.push(host_shifter_row_reset);
             back_args.push(hostcnt_row_reset);
         }
-        b.ins().jump(loop_header, &back_args);
+        b.ins().jump(loop_header, &block_args(&back_args));
     }
 
     // ── cont_x_block: not x_end — check stoponx / host_xstop ─────────────────
@@ -1441,7 +1455,7 @@ fn emit_shader(
         }
 
         if stop_checks.is_empty() {
-            b.ins().jump(loop_header, &back_args);
+            b.ins().jump(loop_header, &block_args(&back_args));
         } else {
             // Combine all stop conditions with OR
             let any_stop = stop_checks.into_iter().reduce(|a, c| b.ins().bor(a, c)).unwrap();
@@ -1463,7 +1477,7 @@ fn emit_shader(
             b.ins().jump(loop_end, &[]);
 
             b.switch_to_block(keep_going); b.seal_block(keep_going);
-            b.ins().jump(loop_header, &back_args);
+            b.ins().jump(loop_header, &block_args(&back_args));
         }
     }
 
@@ -1472,7 +1486,7 @@ fn emit_shader(
     b.seal_block(loop_end);
     b.seal_block(loop_header); // now all predecessors are known
     b.ins().return_(&[]);
-    b.finalize();
+    b.finalize(target_config);
 
     true
 }
@@ -1487,6 +1501,7 @@ fn emit_draw_iline(
     dm1:          &Dm1,
     clipmode_key: u32,
     ptr_type:     ir::Type,
+    target_config: cranelift_codegen::isa::TargetFrontendConfig,
 ) -> bool {
     let ensmask_key = clipmode_key & 0x1F;
     let cidmatch    = (clipmode_key >> 9) & 0xF;
@@ -1506,8 +1521,8 @@ fn emit_draw_iline(
     ];
 
     let mut b = FunctionBuilder::new(func, builder_ctx);
-    let mem  = MemFlags::trusted();
-    let memv = MemFlags::new();
+    let mem  = MemFlagsData::trusted();
+    let memv = MemFlagsData::new();
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1554,28 +1569,28 @@ fn emit_draw_iline(
 
     // octant = bresoctinc1[26:24]
     let octant_v = {
-        let shifted = b.ins().ushr_imm(bres_v, 24);
-        b.ins().band_imm(shifted, 7)
+        let shifted = b.ins().ushr_imm_s(bres_v, 24);
+        b.ins().band_imm_s(shifted, 7)
     };
 
     // incr1: 20-bit, always positive
-    let incr1_v = b.ins().band_imm(bres_v, 0xFFFFF);
+    let incr1_v = b.ins().band_imm_s(bres_v, 0xFFFFF);
 
     // incr2: 21-bit signed — sign-extend from bit 20
     let incr2_v = {
-        let raw = b.ins().band_imm(bres2_v, 0x1FFFFF);
-        let bit20 = b.ins().band_imm(raw, 1 << 20);
-        let is_neg = b.ins().icmp_imm(IntCC::NotEqual, bit20, 0);
-        let sign_ext = b.ins().bor_imm(raw, 0xFFE0_0000u64 as i64);
+        let raw = b.ins().band_imm_s(bres2_v, 0x1FFFFF);
+        let bit20 = b.ins().band_imm_s(raw, 1 << 20);
+        let is_neg = b.ins().icmp_imm_s(IntCC::NotEqual, bit20, 0);
+        let sign_ext = b.ins().bor_imm_s(raw, 0xFFE0_0000u64 as i64);
         b.ins().select(is_neg, sign_ext, raw)
     };
 
     // d: 27-bit signed — sign-extend from bit 26
     let d_init_v = {
-        let raw = b.ins().band_imm(bresd_raw, 0x7FF_FFFF);
-        let bit26 = b.ins().band_imm(raw, 1 << 26);
-        let is_neg = b.ins().icmp_imm(IntCC::NotEqual, bit26, 0);
-        let sign_ext = b.ins().bor_imm(raw, 0xF800_0000u64 as i64);
+        let raw = b.ins().band_imm_s(bresd_raw, 0x7FF_FFFF);
+        let bit26 = b.ins().band_imm_s(raw, 1 << 26);
+        let is_neg = b.ins().icmp_imm_s(IntCC::NotEqual, bit26, 0);
+        let sign_ext = b.ins().bor_imm_s(raw, 0xF800_0000u64 as i64);
         b.ins().select(is_neg, sign_ext, raw)
     };
 
@@ -1594,25 +1609,25 @@ fn emit_draw_iline(
     let y_init_v = b.ins().sshr(ystart_v, c11);
 
     // y_major = (octant & OCTANT_XMAJOR) == 0  (OCTANT_XMAJOR = 4)
-    let xmajor_bit = b.ins().band_imm(octant_v, OCTANT_XMAJOR as i64);
-    let y_major_v  = b.ins().icmp_imm(IntCC::Equal, xmajor_bit, 0);
+    let xmajor_bit = b.ins().band_imm_s(octant_v, OCTANT_XMAJOR as i64);
+    let y_major_v  = b.ins().icmp_imm_s(IntCC::Equal, xmajor_bit, 0);
 
     // major = max(|dx|,|dy|); pixel_count = major + 1 (mirrors draw_line_bresenham).
     let dx_abs = {
         let d = b.ins().isub(x2_v, x_init_v);
         let neg = b.ins().ineg(d);
-        let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, d, 0);
+        let is_neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0);
         b.ins().select(is_neg, neg, d)
     };
     let dy_abs = {
         let d = b.ins().isub(y2_v, y_init_v);
         let neg = b.ins().ineg(d);
-        let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, d, 0);
+        let is_neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0);
         b.ins().select(is_neg, neg, d)
     };
     let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
     let major_v = b.ins().select(dx_gt_dy, dx_abs, dy_abs);
-    let pixel_count_v = b.ins().iadd_imm(major_v, 1);
+    let pixel_count_v = b.ins().iadd_imm_s(major_v, 1);
 
     // iterate_one = !stoponx && !stopony (step-mode: always draw exactly 1 pixel)
     let iterate_one = !dm0.stoponx() && !dm0.stopony();
@@ -1670,7 +1685,7 @@ fn emit_draw_iline(
         init_args.push(ld32!(ctx_off!(lsmode)));
     }
 
-    b.ins().jump(loop_header, &init_args);
+    b.ins().jump(loop_header, &block_args(&init_args));
 
     // ── loop_header ───────────────────────────────────────────────────────────
     b.switch_to_block(loop_header);
@@ -1703,20 +1718,20 @@ fn emit_draw_iline(
     // is_last = (i == pixel_count - 1)
     let last_idx = b.ins().isub(pixel_count_v, c1);
     let is_last_v  = b.ins().icmp(IntCC::Equal, i_v, last_idx);
-    let is_first_v = b.ins().icmp_imm(IntCC::Equal, i_v, 0);
+    let is_first_v = b.ins().icmp_imm_s(IntCC::Equal, i_v, 0);
 
     // draw = (!is_first || !skipfirst) && (!is_last || !skiplast)
     // iterate_one overrides both skip flags (draws the single step unconditionally)
     let do_pixel: Value = if iterate_one {
         b.ins().iconst(types::I8, 1)
     } else if dm0.skipfirst() && dm0.skiplast() {
-        let not_first = b.ins().icmp_imm(IntCC::Equal, is_first_v, 0);
-        let not_last  = b.ins().icmp_imm(IntCC::Equal, is_last_v,  0);
+        let not_first = b.ins().icmp_imm_s(IntCC::Equal, is_first_v, 0);
+        let not_last  = b.ins().icmp_imm_s(IntCC::Equal, is_last_v,  0);
         b.ins().band(not_first, not_last)
     } else if dm0.skipfirst() {
-        b.ins().icmp_imm(IntCC::Equal, is_first_v, 0)
+        b.ins().icmp_imm_s(IntCC::Equal, is_first_v, 0)
     } else if dm0.skiplast() {
-        b.ins().icmp_imm(IntCC::Equal, is_last_v, 0)
+        b.ins().icmp_imm_s(IntCC::Equal, is_last_v, 0)
     } else {
         b.ins().iconst(types::I8, 1)
     };
@@ -1751,8 +1766,8 @@ fn emit_draw_iline(
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
-        let aux_lo4 = b.ins().band_imm(aux_raw, 0xF_i64);
-        let cid_matches = b.ins().icmp_imm(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let aux_lo4 = b.ins().band_imm_s(aux_raw, 0xF_i64);
+        let cid_matches = b.ins().icmp_imm_s(IntCC::Equal, aux_lo4, cidmatch as i64);
         let cid_ok = b.create_block();
         b.ins().brif(cid_matches, cid_ok, &[], skip_block, &[]);
         b.switch_to_block(cid_ok); b.seal_block(cid_ok);
@@ -1768,8 +1783,8 @@ fn emit_draw_iline(
             let r  = clamp_color_component(&mut b, colorred_v);
             let g  = clamp_color_component(&mut b, colorgrn_v);
             let bl = clamp_color_component(&mut b, colorblue_v);
-            let g8   = b.ins().ishl_imm(g, 8);
-            let bl16 = b.ins().ishl_imm(bl, 16);
+            let g8   = b.ins().ishl_imm_s(g, 8);
+            let bl16 = b.ins().ishl_imm_s(bl, 16);
             let rb   = b.ins().bor(r, g8);
             b.ins().bor(rb, bl16)
         } else {
@@ -1780,8 +1795,8 @@ fn emit_draw_iline(
                 let r_c  = clamp_color_component(&mut b, r);
                 let g_c  = clamp_color_component(&mut b, g);
                 let b_c  = clamp_color_component(&mut b, bl);
-                let g8   = b.ins().ishl_imm(g_c, 8);
-                let bl16 = b.ins().ishl_imm(b_c, 16);
+                let g8   = b.ins().ishl_imm_s(g_c, 8);
+                let bl16 = b.ins().ishl_imm_s(b_c, 16);
                 let rb   = b.ins().bor(r_c, g8);
                 b.ins().bor(rb, bl16)
             } else {
@@ -1801,13 +1816,13 @@ fn emit_draw_iline(
             let zpattern_v   = ld32!(ctx_off!(zpattern));
             let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
             let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
-            let bit_v  = b.ins().band_imm(zpat_shifted, 1);
-            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-            b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
+            let bit_v  = b.ins().band_imm_s(zpat_shifted, 1);
+            let bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, zp_pass, &[ir::BlockArg::Value(cur_use_bg)], zp_block, &[]);
             b.switch_to_block(zp_block); b.seal_block(zp_block);
             if dm0.zpopaque() {
                 let bg1 = b.ins().iconst(types::I8, 1);
-                b.ins().jump(zp_pass, &[bg1]);
+                b.ins().jump(zp_pass, &[ir::BlockArg::Value(bg1)]);
             } else {
                 b.ins().jump(skip_block, &[]);
             }
@@ -1822,13 +1837,13 @@ fn emit_draw_iline(
             let lspattern_v  = ld32!(ctx_off!(lspattern));
             let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
             let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
-            let bit_v  = b.ins().band_imm(lspat_shifted, 1);
-            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-            b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
+            let bit_v  = b.ins().band_imm_s(lspat_shifted, 1);
+            let bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, ls_pass, &[ir::BlockArg::Value(cur_use_bg)], ls_block, &[]);
             b.switch_to_block(ls_block); b.seal_block(ls_block);
             if dm0.lsopaque() {
                 let bg1 = b.ins().iconst(types::I8, 1);
-                b.ins().jump(ls_pass, &[bg1]);
+                b.ins().jump(ls_pass, &[ir::BlockArg::Value(bg1)]);
             } else {
                 b.ins().jump(skip_block, &[]);
             }
@@ -1836,10 +1851,10 @@ fn emit_draw_iline(
             cur_use_bg = b.block_params(ls_pass).to_vec()[0];
         }
 
-        b.ins().jump(draw_block2, &[cur_use_bg]);
+        b.ins().jump(draw_block2, &[ir::BlockArg::Value(cur_use_bg)]);
         b.switch_to_block(draw_block2); b.seal_block(draw_block2);
         let use_bg_flag = b.block_params(draw_block2).to_vec()[0];
-        let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+        let use_bg_bool = b.ins().icmp_imm_s(IntCC::NotEqual, use_bg_flag, 0);
         b.ins().select(use_bg_bool, colorback_v, raw_src)
     };
 
@@ -1866,13 +1881,13 @@ fn emit_draw_iline(
         } else if dm0.ciclamp() {
             let depth = dm1.drawdepth();
             let ncr2 = if depth == 1 {
-                let overflow = b.ins().band_imm(ncr, 1 << 19);
-                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let overflow = b.ins().band_imm_s(ncr, 1 << 19);
+                let ov_set = b.ins().icmp_imm_s(IntCC::NotEqual, overflow, 0);
                 let max8 = b.ins().iconst(types::I32, 0x0007_FFFFi64);
                 b.ins().select(ov_set, max8, ncr)
             } else if depth == 2 {
-                let overflow = b.ins().band_imm(ncr, 1 << 21);
-                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let overflow = b.ins().band_imm_s(ncr, 1 << 21);
+                let ov_set = b.ins().icmp_imm_s(IntCC::NotEqual, overflow, 0);
                 let max12 = b.ins().iconst(types::I32, 0x001F_FFFFi64);
                 b.ins().select(ov_set, max12, ncr)
             } else { ncr };
@@ -1888,33 +1903,33 @@ fn emit_draw_iline(
     let new_zpat_bit = if dm0.enzpattern() {
         let c1_i8 = b.ins().iconst(types::I8, 1);
         let dec = b.ins().isub(zpat_bit_v, c1_i8);
-        b.ins().band_imm(dec, 31)
+        b.ins().band_imm_s(dec, 31)
     } else { zpat_bit_v };
 
     let (new_pat_bit, new_lsmode) = if dm0.enlspattern() {
-        let lsrcount = b.ins().band_imm(lsmode_v, 0xFF);
-        let lsm_shr8 = b.ins().ushr_imm(lsmode_v, 8);
-        let lsrepeat_raw = b.ins().band_imm(lsm_shr8, 0xFF);
+        let lsrcount = b.ins().band_imm_s(lsmode_v, 0xFF);
+        let lsm_shr8 = b.ins().ushr_imm_s(lsmode_v, 8);
+        let lsrepeat_raw = b.ins().band_imm_s(lsm_shr8, 0xFF);
         let lsrepeat = {
-            let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrepeat_raw, 0);
+            let is_zero = b.ins().icmp_imm_s(IntCC::Equal, lsrepeat_raw, 0);
             b.ins().select(is_zero, c1, lsrepeat_raw)
         };
-        let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrcount, 0);
+        let is_zero = b.ins().icmp_imm_s(IntCC::Equal, lsrcount, 0);
         let reload_count = b.ins().isub(lsrepeat, c1);
         let lsrcount_dec = b.ins().isub(lsrcount, c1);
         let new_count = b.ins().select(is_zero, reload_count, lsrcount_dec);
-        let lsm_shr24 = b.ins().ushr_imm(lsmode_v, 24);
-        let lslength = b.ins().band_imm(lsm_shr24, 0xF);
-        let length_bits = b.ins().iadd_imm(lslength, 17);
+        let lsm_shr24 = b.ins().ushr_imm_s(lsmode_v, 24);
+        let lslength = b.ins().band_imm_s(lsm_shr24, 0xF);
+        let length_bits = b.ins().iadd_imm_s(lslength, 17);
         let wrap_point = b.ins().isub(c32, length_bits);
         let pat_bit32 = b.ins().uextend(types::I32, pat_bit_v);
         let at_wrap = b.ins().icmp(IntCC::Equal, pat_bit32, wrap_point);
         let pat_dec = b.ins().isub(pat_bit32, c1);
-        let dec_pat = b.ins().band_imm(pat_dec, 31);
+        let dec_pat = b.ins().band_imm_s(pat_dec, 31);
         let new_pat32 = b.ins().select(at_wrap, c31, dec_pat);
         let new_pat32_masked = b.ins().select(is_zero, new_pat32, pat_bit32);
         let new_pb = b.ins().ireduce(types::I8, new_pat32_masked);
-        let lsm_cleared = b.ins().band_imm(lsmode_v, !0xFF_i64);
+        let lsm_cleared = b.ins().band_imm_s(lsmode_v, !0xFF_i64);
         let new_lsm = b.ins().bor(lsm_cleared, new_count);
         (new_pb, new_lsm)
     } else { (pat_bit_v, lsmode_v) };
@@ -1978,13 +1993,13 @@ fn emit_draw_iline(
         let c0i  = b.ins().iconst(types::I32,  0i64);
 
         // XMAJOR bit (bit 2)
-        let xmajor_v = b.ins().icmp_imm(IntCC::NotEqual, xmajor_bit, 0);
+        let xmajor_v = b.ins().icmp_imm_s(IntCC::NotEqual, xmajor_bit, 0);
         // XDEC bit (bit 1)
-        let xdec_bit = b.ins().band_imm(octant_v, OCTANT_XDEC as i64);
-        let xdec_v   = b.ins().icmp_imm(IntCC::NotEqual, xdec_bit, 0);
+        let xdec_bit = b.ins().band_imm_s(octant_v, OCTANT_XDEC as i64);
+        let xdec_v   = b.ins().icmp_imm_s(IntCC::NotEqual, xdec_bit, 0);
         // YDEC bit (bit 0)
-        let ydec_bit = b.ins().band_imm(octant_v, OCTANT_YDEC as i64);
-        let ydec_v   = b.ins().icmp_imm(IntCC::NotEqual, ydec_bit, 0);
+        let ydec_bit = b.ins().band_imm_s(octant_v, OCTANT_YDEC as i64);
+        let ydec_v   = b.ins().icmp_imm_s(IntCC::NotEqual, ydec_bit, 0);
 
         // incrx1: 0 for y-major, ±1 for x-major (sign = XDEC)
         let incrx1_xmaj = b.ins().select(xdec_v, cm1i, cp1i);
@@ -2004,7 +2019,7 @@ fn emit_draw_iline(
         let incry2 = b.ins().select(ydec_v, cp1i, cm1i);
 
         // Choose step 1 or step 2 based on d < 0
-        let d_neg   = b.ins().icmp_imm(IntCC::SignedLessThan, d_v, 0);
+        let d_neg   = b.ins().icmp_imm_s(IntCC::SignedLessThan, d_v, 0);
         let dx_step = b.ins().select(d_neg, incrx1, incrx2);
         let dy_step = b.ins().select(d_neg, incry1, incry2);
         let d_incr  = b.ins().select(d_neg, incr1_v, incr2_v);
@@ -2015,13 +2030,13 @@ fn emit_draw_iline(
         let y_new = b.ins().iadd(y_v, y_neg_step);
         let d_new = b.ins().iadd(d_v, d_incr);
 
-        b.ins().jump(after_step, &[x_new, y_new, d_new]);
+        b.ins().jump(after_step, &[ir::BlockArg::Value(x_new), ir::BlockArg::Value(y_new), ir::BlockArg::Value(d_new)]);
     }
 
     // noste_block: no step (last pixel, full-line mode) — pass x,y,d unchanged
     if !iterate_one {
         b.switch_to_block(noste_block); b.seal_block(noste_block);
-        b.ins().jump(after_step, &[x_v, y_v, d_v]);
+        b.ins().jump(after_step, &[ir::BlockArg::Value(x_v), ir::BlockArg::Value(y_v), ir::BlockArg::Value(d_v)]);
     }
 
     // after_step: write back ctx and check if done
@@ -2031,7 +2046,7 @@ fn emit_draw_iline(
     let d_new = b.block_params(after_step)[2];
 
     // i_next = i + 1; done = (i_next >= pixel_count)
-    let i_next = b.ins().iadd_imm(i_v, 1);
+    let i_next = b.ins().iadd_imm_s(i_v, 1);
     let done_v = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i_next, pixel_count_v);
 
     let cont_block = b.create_block();
@@ -2043,7 +2058,7 @@ fn emit_draw_iline(
     if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
     if dm0.enzpattern() { back_args.push(new_zpat_bit); }
     if dm0.enlspattern() { back_args.push(new_pat_bit); back_args.push(new_lsmode); }
-    b.ins().jump(loop_header, &back_args);
+    b.ins().jump(loop_header, &block_args(&back_args));
 
     // ── loop_end: write back ctx state ───────────────────────────────────────
     b.switch_to_block(loop_end);
@@ -2062,7 +2077,7 @@ fn emit_draw_iline(
     let c11_wb   = b.ins().iconst(types::I32, 11);
     let xstart_wb = b.ins().ishl(x_new, c11_wb);
     let ystart_wb = b.ins().ishl(y_new, c11_wb);
-    let bresd_wb  = b.ins().band_imm(d_new, 0x7FF_FFFFi64);
+    let bresd_wb  = b.ins().band_imm_s(d_new, 0x7FF_FFFFi64);
     st32e!(ctx_off!(xstart), xstart_wb);
     st32e!(ctx_off!(ystart), ystart_wb);
     st32e!(ctx_off!(bresd),  bresd_wb);
@@ -2081,7 +2096,7 @@ fn emit_draw_iline(
     }
 
     b.ins().return_(&[]);
-    b.finalize();
+    b.finalize(target_config);
     true
 }
 
@@ -2089,44 +2104,44 @@ fn emit_draw_iline(
 
 /// Emit `bayer_pack(color, x, y)`: pack bayer index into bits 27:24 of color.
 fn bayer_pack_ir(b: &mut FunctionBuilder, color: Value, x: Value, y: Value) -> Value {
-    let x3       = b.ins().band_imm(x, 3);
-    let y3       = b.ins().band_imm(y, 3);
-    let y3_shift = b.ins().ishl_imm(y3, 2);
+    let x3       = b.ins().band_imm_s(x, 3);
+    let y3       = b.ins().band_imm_s(y, 3);
+    let y3_shift = b.ins().ishl_imm_s(y3, 2);
     let idx      = b.ins().bor(y3_shift, x3);
-    let color24  = b.ins().band_imm(color, 0x00FF_FFFFi64);
-    let idx_shifted = b.ins().ishl_imm(idx, 24);
+    let color24  = b.ins().band_imm_s(color, 0x00FF_FFFFi64);
+    let idx_shifted = b.ins().ishl_imm_s(idx, 24);
     b.ins().bor(color24, idx_shifted)
 }
 
 /// clamp_color_component for shade output: extract bits[22:11] (integer), return 8-bit value.
 fn clamp_color_component(b: &mut FunctionBuilder, c: Value) -> Value {
     // integer part = (c >> 11) & 0x1FF
-    let c_shr11 = b.ins().ushr_imm(c, 11);
-    let val = b.ins().band_imm(c_shr11, 0x1FF);
+    let c_shr11 = b.ins().ushr_imm_s(c, 11);
+    let val = b.ins().band_imm_s(c_shr11, 0x1FF);
     // if bit31 set or val >= 0x180: 0
     // if val > 0xFF: 0xFF
     // else: val & 0xFF
-    let bit31 = b.ins().band_imm(c, 1i64 << 31);
-    let neg = b.ins().icmp_imm(IntCC::NotEqual, bit31, 0);
-    let overflow = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, val, 0x180);
+    let bit31 = b.ins().band_imm_s(c, 1i64 << 31);
+    let neg = b.ins().icmp_imm_s(IntCC::NotEqual, bit31, 0);
+    let overflow = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, val, 0x180);
     let clamped_zero = b.ins().bor(neg, overflow);
-    let max_255 = b.ins().icmp_imm(IntCC::UnsignedGreaterThan, val, 0xFF);
+    let max_255 = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, val, 0xFF);
     let c255 = b.ins().iconst(types::I32, 0xFF);
     let c0   = b.ins().iconst(types::I32, 0);
-    let val_masked = b.ins().band_imm(val, 0xFF);
+    let val_masked = b.ins().band_imm_s(val, 0xFF);
     let clamped_255 = b.ins().select(max_255, c255, val_masked);
     b.ins().select(clamped_zero, c0, clamped_255)
 }
 
 /// Clamp a shade DDA value (o12.11): keep as-is for unclamped, or apply RGB clamp.
 fn clamp_shade(b: &mut FunctionBuilder, c: Value) -> Value {
-    let c_shr11 = b.ins().ushr_imm(c, 11);
-    let val = b.ins().band_imm(c_shr11, 0x1FF);
-    let bit31 = b.ins().band_imm(c, 1i64 << 31);
-    let neg = b.ins().icmp_imm(IntCC::NotEqual, bit31, 0);
-    let overflow = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, val, 0x180);
+    let c_shr11 = b.ins().ushr_imm_s(c, 11);
+    let val = b.ins().band_imm_s(c_shr11, 0x1FF);
+    let bit31 = b.ins().band_imm_s(c, 1i64 << 31);
+    let neg = b.ins().icmp_imm_s(IntCC::NotEqual, bit31, 0);
+    let overflow = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, val, 0x180);
     let clamped_zero = b.ins().bor(neg, overflow);
-    let max_7ffff = b.ins().icmp_imm(IntCC::UnsignedGreaterThan, val, 0xFF);
+    let max_7ffff = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, val, 0xFF);
     let c7ffff = b.ins().iconst(types::I32, 0x0007_FFFFi64);
     let c0     = b.ins().iconst(types::I32, 0);
     let clamped_max = b.ins().select(max_7ffff, c7ffff, c);
@@ -2155,17 +2170,17 @@ fn and4_range(b: &mut FunctionBuilder, x: Value, y: Value,
 fn amplify_aux_ir(b: &mut FunctionBuilder, val: Value, planes: u32) -> Value {
     match planes {
         p if p == DRAWMODE1_PLANES_OLAY => {
-            let v8  = b.ins().ishl_imm(val, 8);
-            let v16 = b.ins().ishl_imm(val, 16);
+            let v8  = b.ins().ishl_imm_s(val, 8);
+            let v16 = b.ins().ishl_imm_s(val, 16);
             b.ins().bor(v8, v16)
         }
         p if p == DRAWMODE1_PLANES_CID => {
-            let v4 = b.ins().ishl_imm(val, 4);
+            let v4 = b.ins().ishl_imm_s(val, 4);
             b.ins().bor(val, v4)
         }
         p if p == DRAWMODE1_PLANES_PUP => {
-            let v2 = b.ins().ishl_imm(val, 2);
-            let v6 = b.ins().ishl_imm(val, 6);
+            let v2 = b.ins().ishl_imm_s(val, 2);
+            let v6 = b.ins().ishl_imm_s(val, 6);
             b.ins().bor(v2, v6)
         }
         _ => val,
@@ -2199,7 +2214,7 @@ fn emit_logic_op(b: &mut FunctionBuilder, logicop: u32, src: Value, dst: Value) 
 fn emit_writeback(
     b: &mut FunctionBuilder,
     ctx_ptr: Value,
-    mem: &MemFlags,
+    mem: &MemFlagsData,
     xstart_new: Value,
     ystart_new: Value,
     dm0: &Dm0,
@@ -2245,44 +2260,44 @@ fn emit_bayer_lookup_ir(b: &mut FunctionBuilder, idx: Value) -> Value {
     const BAYER_PACKED: i64 = 0x5D7F91B36E4CA280_u64 as i64;
     let packed  = b.ins().iconst(types::I64, BAYER_PACKED);
     let idx64   = b.ins().uextend(types::I64, idx);
-    let shift   = b.ins().ishl_imm(idx64, 2); // idx * 4
+    let shift   = b.ins().ishl_imm_s(idx64, 2); // idx * 4
     let shifted = b.ins().ushr(packed, shift);
-    let nibble  = b.ins().band_imm(shifted, 0xF);
+    let nibble  = b.ins().band_imm_s(shifted, 0xF);
     b.ins().ireduce(types::I32, nibble)
 }
 
 fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither: bool) -> Value {
     if dither {
         // Bayer threshold: val bits[31:24] is the raw bayer index, look it up in the table
-        let idx   = b.ins().ushr_imm(val, 24);
+        let idx   = b.ins().ushr_imm_s(val, 24);
         let bayer = emit_bayer_lookup_ir(b, idx);
         // Extract r/g/bv channels (bits[7:0], [15:8], [23:16])
-        let r = b.ins().band_imm(val, 0xFF);
-        let t8  = b.ins().ushr_imm(val, 8);
-        let g   = b.ins().band_imm(t8, 0xFF);
-        let t16 = b.ins().ushr_imm(val, 16);
-        let bv  = b.ins().band_imm(t16, 0xFF);
+        let r = b.ins().band_imm_s(val, 0xFF);
+        let t8  = b.ins().ushr_imm_s(val, 8);
+        let g   = b.ins().band_imm_s(t8, 0xFF);
+        let t16 = b.ins().ushr_imm_s(val, 16);
+        let bv  = b.ins().band_imm_s(t16, 0xFF);
         match drawdepth {
             0 => {
                 // rgb24→rgb4 dither: sr = (r>>3)-(r>>4), etc.
-                let r3 = b.ins().ushr_imm(r, 3);
-                let r4 = b.ins().ushr_imm(r, 4);
+                let r3 = b.ins().ushr_imm_s(r, 3);
+                let r4 = b.ins().ushr_imm_s(r, 4);
                 let sr = b.ins().isub(r3, r4);
-                let g2 = b.ins().ushr_imm(g, 2);
-                let g4 = b.ins().ushr_imm(g, 4);
+                let g2 = b.ins().ushr_imm_s(g, 2);
+                let g4 = b.ins().ushr_imm_s(g, 4);
                 let sg = b.ins().isub(g2, g4);
-                let b3 = b.ins().ushr_imm(bv, 3);
-                let b4 = b.ins().ushr_imm(bv, 4);
+                let b3 = b.ins().ushr_imm_s(bv, 3);
+                let b4 = b.ins().ushr_imm_s(bv, 4);
                 let sb = b.ins().isub(b3, b4);
-                let sr4_v = b.ins().ushr_imm(sr, 4);
-                let sg4_v = b.ins().ushr_imm(sg, 4);
-                let sb4_v = b.ins().ushr_imm(sb, 4);
-                let mut dr = b.ins().band_imm(sr4_v, 1);
-                let mut dg = b.ins().band_imm(sg4_v, 3);
-                let mut db = b.ins().band_imm(sb4_v, 1);
-                let sr_lo = b.ins().band_imm(sr, 0xF);
-                let sg_lo = b.ins().band_imm(sg, 0xF);
-                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let sr4_v = b.ins().ushr_imm_s(sr, 4);
+                let sg4_v = b.ins().ushr_imm_s(sg, 4);
+                let sb4_v = b.ins().ushr_imm_s(sb, 4);
+                let mut dr = b.ins().band_imm_s(sr4_v, 1);
+                let mut dg = b.ins().band_imm_s(sg4_v, 3);
+                let mut db = b.ins().band_imm_s(sb4_v, 1);
+                let sr_lo = b.ins().band_imm_s(sr, 0xF);
+                let sg_lo = b.ins().band_imm_s(sg, 0xF);
+                let sb_lo = b.ins().band_imm_s(sb, 0xF);
                 let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
                 let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
                 let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
@@ -2297,31 +2312,31 @@ fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither:
                 dr = b.ins().select(cond_r, dr1_min, dr);
                 dg = b.ins().select(cond_g, dg1_min, dg);
                 db = b.ins().select(cond_b, db1_min, db);
-                let db3s = b.ins().ishl_imm(db, 3);
-                let dg1s = b.ins().ishl_imm(dg, 1);
+                let db3s = b.ins().ishl_imm_s(db, 3);
+                let dg1s = b.ins().ishl_imm_s(dg, 1);
                 let t = b.ins().bor(db3s, dg1s);
                 b.ins().bor(t, dr)
             }
             1 => {
                 // rgb24→rgb8 dither: sr = (r>>1)-(r>>4), etc.
-                let r1 = b.ins().ushr_imm(r, 1);
-                let r4 = b.ins().ushr_imm(r, 4);
+                let r1 = b.ins().ushr_imm_s(r, 1);
+                let r4 = b.ins().ushr_imm_s(r, 4);
                 let sr = b.ins().isub(r1, r4);
-                let g1 = b.ins().ushr_imm(g, 1);
-                let g4 = b.ins().ushr_imm(g, 4);
+                let g1 = b.ins().ushr_imm_s(g, 1);
+                let g4 = b.ins().ushr_imm_s(g, 4);
                 let sg = b.ins().isub(g1, g4);
-                let b2 = b.ins().ushr_imm(bv, 2);
-                let b4 = b.ins().ushr_imm(bv, 4);
+                let b2 = b.ins().ushr_imm_s(bv, 2);
+                let b4 = b.ins().ushr_imm_s(bv, 4);
                 let sb = b.ins().isub(b2, b4);
-                let sr4_v = b.ins().ushr_imm(sr, 4);
-                let sg4_v = b.ins().ushr_imm(sg, 4);
-                let sb4_v = b.ins().ushr_imm(sb, 4);
-                let mut dr = b.ins().band_imm(sr4_v, 7);
-                let mut dg = b.ins().band_imm(sg4_v, 7);
-                let mut db = b.ins().band_imm(sb4_v, 3);
-                let sr_lo = b.ins().band_imm(sr, 0xF);
-                let sg_lo = b.ins().band_imm(sg, 0xF);
-                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let sr4_v = b.ins().ushr_imm_s(sr, 4);
+                let sg4_v = b.ins().ushr_imm_s(sg, 4);
+                let sb4_v = b.ins().ushr_imm_s(sb, 4);
+                let mut dr = b.ins().band_imm_s(sr4_v, 7);
+                let mut dg = b.ins().band_imm_s(sg4_v, 7);
+                let mut db = b.ins().band_imm_s(sb4_v, 3);
+                let sr_lo = b.ins().band_imm_s(sr, 0xF);
+                let sg_lo = b.ins().band_imm_s(sg, 0xF);
+                let sb_lo = b.ins().band_imm_s(sb, 0xF);
                 let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
                 let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
                 let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
@@ -2337,28 +2352,28 @@ fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither:
                 dr = b.ins().select(cond_r, dr1_min, dr);
                 dg = b.ins().select(cond_g, dg1_min, dg);
                 db = b.ins().select(cond_b, db1_min, db);
-                let db6 = b.ins().ishl_imm(db, 6);
-                let dg3 = b.ins().ishl_imm(dg, 3);
+                let db6 = b.ins().ishl_imm_s(db, 6);
+                let dg3 = b.ins().ishl_imm_s(dg, 3);
                 let t = b.ins().bor(db6, dg3);
                 b.ins().bor(t, dr)
             }
             _ => {
                 // rgb24→rgb12 dither: sr = r - (r>>4), etc.
-                let r4 = b.ins().ushr_imm(r, 4);
+                let r4 = b.ins().ushr_imm_s(r, 4);
                 let sr = b.ins().isub(r, r4);
-                let g4 = b.ins().ushr_imm(g, 4);
+                let g4 = b.ins().ushr_imm_s(g, 4);
                 let sg = b.ins().isub(g, g4);
-                let b4 = b.ins().ushr_imm(bv, 4);
+                let b4 = b.ins().ushr_imm_s(bv, 4);
                 let sb = b.ins().isub(bv, b4);
-                let sr4_v = b.ins().ushr_imm(sr, 4);
-                let sg4_v = b.ins().ushr_imm(sg, 4);
-                let sb4_v = b.ins().ushr_imm(sb, 4);
-                let mut dr = b.ins().band_imm(sr4_v, 15);
-                let mut dg = b.ins().band_imm(sg4_v, 15);
-                let mut db = b.ins().band_imm(sb4_v, 15);
-                let sr_lo = b.ins().band_imm(sr, 0xF);
-                let sg_lo = b.ins().band_imm(sg, 0xF);
-                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let sr4_v = b.ins().ushr_imm_s(sr, 4);
+                let sg4_v = b.ins().ushr_imm_s(sg, 4);
+                let sb4_v = b.ins().ushr_imm_s(sb, 4);
+                let mut dr = b.ins().band_imm_s(sr4_v, 15);
+                let mut dg = b.ins().band_imm_s(sg4_v, 15);
+                let mut db = b.ins().band_imm_s(sb4_v, 15);
+                let sr_lo = b.ins().band_imm_s(sr, 0xF);
+                let sg_lo = b.ins().band_imm_s(sg, 0xF);
+                let sb_lo = b.ins().band_imm_s(sb, 0xF);
                 let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
                 let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
                 let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
@@ -2373,8 +2388,8 @@ fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither:
                 dr = b.ins().select(cond_r, dr1_min, dr);
                 dg = b.ins().select(cond_g, dg1_min, dg);
                 db = b.ins().select(cond_b, db1_min, db);
-                let db8 = b.ins().ishl_imm(db, 8);
-                let dg4 = b.ins().ishl_imm(dg, 4);
+                let db8 = b.ins().ishl_imm_s(db, 8);
+                let dg4 = b.ins().ishl_imm_s(dg, 4);
                 let t = b.ins().bor(db8, dg4);
                 b.ins().bor(t, dr)
             }
@@ -2384,40 +2399,40 @@ fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither:
         match drawdepth {
             0 => {
                 // rgb24→rgb4: r=bit7, g=bits[15:14], b=bit23
-                let rs = b.ins().ushr_imm(val,  7);
-                let r  = b.ins().band_imm(rs, 1);
-                let gs = b.ins().ushr_imm(val, 14);
-                let g  = b.ins().band_imm(gs, 3);
-                let bs = b.ins().ushr_imm(val, 23);
-                let bv = b.ins().band_imm(bs, 1);
-                let b3 = b.ins().ishl_imm(bv, 3);
-                let g1 = b.ins().ishl_imm(g,  1);
+                let rs = b.ins().ushr_imm_s(val,  7);
+                let r  = b.ins().band_imm_s(rs, 1);
+                let gs = b.ins().ushr_imm_s(val, 14);
+                let g  = b.ins().band_imm_s(gs, 3);
+                let bs = b.ins().ushr_imm_s(val, 23);
+                let bv = b.ins().band_imm_s(bs, 1);
+                let b3 = b.ins().ishl_imm_s(bv, 3);
+                let g1 = b.ins().ishl_imm_s(g,  1);
                 let t  = b.ins().bor(b3, g1);
                 b.ins().bor(t, r)
             }
             1 => {
                 // rgb24→rgb8: r=bits[7:5], g=bits[15:13], b=bits[23:22]
-                let rs = b.ins().ushr_imm(val,  5);
-                let r  = b.ins().band_imm(rs, 7);
-                let gs = b.ins().ushr_imm(val, 13);
-                let g  = b.ins().band_imm(gs, 7);
-                let bs = b.ins().ushr_imm(val, 22);
-                let bv = b.ins().band_imm(bs, 3);
-                let b6 = b.ins().ishl_imm(bv, 6);
-                let g3 = b.ins().ishl_imm(g,  3);
+                let rs = b.ins().ushr_imm_s(val,  5);
+                let r  = b.ins().band_imm_s(rs, 7);
+                let gs = b.ins().ushr_imm_s(val, 13);
+                let g  = b.ins().band_imm_s(gs, 7);
+                let bs = b.ins().ushr_imm_s(val, 22);
+                let bv = b.ins().band_imm_s(bs, 3);
+                let b6 = b.ins().ishl_imm_s(bv, 6);
+                let g3 = b.ins().ishl_imm_s(g,  3);
                 let t  = b.ins().bor(b6, g3);
                 b.ins().bor(t, r)
             }
             _ => {
                 // rgb24→rgb12: r=bits[7:4], g=bits[15:12], b=bits[23:20]
-                let rs = b.ins().ushr_imm(val,  4);
-                let r  = b.ins().band_imm(rs, 0xF);
-                let gs = b.ins().ushr_imm(val, 12);
-                let g  = b.ins().band_imm(gs, 0xF);
-                let bs = b.ins().ushr_imm(val, 20);
-                let bv = b.ins().band_imm(bs, 0xF);
-                let b8 = b.ins().ishl_imm(bv, 8);
-                let g4 = b.ins().ishl_imm(g,  4);
+                let rs = b.ins().ushr_imm_s(val,  4);
+                let r  = b.ins().band_imm_s(rs, 0xF);
+                let gs = b.ins().ushr_imm_s(val, 12);
+                let g  = b.ins().band_imm_s(gs, 0xF);
+                let bs = b.ins().ushr_imm_s(val, 20);
+                let bv = b.ins().band_imm_s(bs, 0xF);
+                let b8 = b.ins().ishl_imm_s(bv, 8);
+                let g4 = b.ins().ishl_imm_s(g,  4);
                 let t  = b.ins().bor(b8, g4);
                 b.ins().bor(t, r)
             }
@@ -2431,71 +2446,71 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
     match drawdepth {
         0 => {
             // rgb4→rgb24: r=bit0 → 0 or 0xFF; g=bits[2:1] → replicated; b=bit3 → 0 or 0xFF
-            let r_bit  = b.ins().band_imm(val, 1);
-            let r_set  = b.ins().icmp_imm(IntCC::NotEqual, r_bit, 0);
+            let r_bit  = b.ins().band_imm_s(val, 1);
+            let r_set  = b.ins().icmp_imm_s(IntCC::NotEqual, r_bit, 0);
             let c255   = b.ins().iconst(types::I32, 0xFF);
             let c0     = b.ins().iconst(types::I32, 0);
             let r      = b.ins().select(r_set, c255, c0);
-            let gs     = b.ins().ushr_imm(val, 1);
-            let g_raw  = b.ins().band_imm(gs, 3);
-            let g6 = b.ins().ishl_imm(g_raw, 6);
-            let g4 = b.ins().ishl_imm(g_raw, 4);
-            let g2 = b.ins().ishl_imm(g_raw, 2);
+            let gs     = b.ins().ushr_imm_s(val, 1);
+            let g_raw  = b.ins().band_imm_s(gs, 3);
+            let g6 = b.ins().ishl_imm_s(g_raw, 6);
+            let g4 = b.ins().ishl_imm_s(g_raw, 4);
+            let g2 = b.ins().ishl_imm_s(g_raw, 2);
             let t1 = b.ins().bor(g6, g4);
             let t2 = b.ins().bor(g2, g_raw);
             let g  = b.ins().bor(t1, t2);
-            let b_shr  = b.ins().ushr_imm(val, 3);
-            let b_bit  = b.ins().band_imm(b_shr, 1);
-            let b_set  = b.ins().icmp_imm(IntCC::NotEqual, b_bit, 0);
+            let b_shr  = b.ins().ushr_imm_s(val, 3);
+            let b_bit  = b.ins().band_imm_s(b_shr, 1);
+            let b_set  = b.ins().icmp_imm_s(IntCC::NotEqual, b_bit, 0);
             let bv     = b.ins().select(b_set, c255, c0);
-            let g8  = b.ins().ishl_imm(g,  8);
-            let b16 = b.ins().ishl_imm(bv, 16);
+            let g8  = b.ins().ishl_imm_s(g,  8);
+            let b16 = b.ins().ishl_imm_s(bv, 16);
             let t   = b.ins().bor(b16, g8);
             b.ins().bor(t, r)
         }
         1 => {
             // rgb8→rgb24: r=bits[2:0], g=bits[5:3], b=bits[7:6]
-            let r_raw = b.ins().band_imm(val, 7);
-            let r5 = b.ins().ishl_imm(r_raw, 5);
-            let r2 = b.ins().ishl_imm(r_raw, 2);
-            let r1 = b.ins().ushr_imm(r_raw, 1);
+            let r_raw = b.ins().band_imm_s(val, 7);
+            let r5 = b.ins().ishl_imm_s(r_raw, 5);
+            let r2 = b.ins().ishl_imm_s(r_raw, 2);
+            let r1 = b.ins().ushr_imm_s(r_raw, 1);
             let t1 = b.ins().bor(r5, r2);
             let r  = b.ins().bor(t1, r1);
-            let gs    = b.ins().ushr_imm(val, 3);
-            let g_raw = b.ins().band_imm(gs, 7);
-            let g5 = b.ins().ishl_imm(g_raw, 5);
-            let g2 = b.ins().ishl_imm(g_raw, 2);
-            let g1 = b.ins().ushr_imm(g_raw, 1);
+            let gs    = b.ins().ushr_imm_s(val, 3);
+            let g_raw = b.ins().band_imm_s(gs, 7);
+            let g5 = b.ins().ishl_imm_s(g_raw, 5);
+            let g2 = b.ins().ishl_imm_s(g_raw, 2);
+            let g1 = b.ins().ushr_imm_s(g_raw, 1);
             let t2 = b.ins().bor(g5, g2);
             let g  = b.ins().bor(t2, g1);
-            let bs    = b.ins().ushr_imm(val, 6);
-            let b_raw = b.ins().band_imm(bs, 3);
-            let b6 = b.ins().ishl_imm(b_raw, 6);
-            let b4 = b.ins().ishl_imm(b_raw, 4);
-            let b2 = b.ins().ishl_imm(b_raw, 2);
+            let bs    = b.ins().ushr_imm_s(val, 6);
+            let b_raw = b.ins().band_imm_s(bs, 3);
+            let b6 = b.ins().ishl_imm_s(b_raw, 6);
+            let b4 = b.ins().ishl_imm_s(b_raw, 4);
+            let b2 = b.ins().ishl_imm_s(b_raw, 2);
             let t3 = b.ins().bor(b6, b4);
             let t4 = b.ins().bor(b2, b_raw);
             let bv = b.ins().bor(t3, t4);
-            let g8  = b.ins().ishl_imm(g,  8);
-            let b16 = b.ins().ishl_imm(bv, 16);
+            let g8  = b.ins().ishl_imm_s(g,  8);
+            let b16 = b.ins().ishl_imm_s(bv, 16);
             let t   = b.ins().bor(b16, g8);
             b.ins().bor(t, r)
         }
         _ => {
             // rgb12→rgb24: r=bits[3:0], g=bits[7:4], b=bits[11:8]
-            let r_raw = b.ins().band_imm(val, 0xF);
-            let r4  = b.ins().ishl_imm(r_raw, 4);
+            let r_raw = b.ins().band_imm_s(val, 0xF);
+            let r4  = b.ins().ishl_imm_s(r_raw, 4);
             let r   = b.ins().bor(r4, r_raw);
-            let gs    = b.ins().ushr_imm(val, 4);
-            let g_raw = b.ins().band_imm(gs, 0xF);
-            let g4  = b.ins().ishl_imm(g_raw, 4);
+            let gs    = b.ins().ushr_imm_s(val, 4);
+            let g_raw = b.ins().band_imm_s(gs, 0xF);
+            let g4  = b.ins().ishl_imm_s(g_raw, 4);
             let g   = b.ins().bor(g4, g_raw);
-            let bs    = b.ins().ushr_imm(val, 8);
-            let b_raw = b.ins().band_imm(bs, 0xF);
-            let bb4 = b.ins().ishl_imm(b_raw, 4);
+            let bs    = b.ins().ushr_imm_s(val, 8);
+            let b_raw = b.ins().band_imm_s(bs, 0xF);
+            let bb4 = b.ins().ishl_imm_s(b_raw, 4);
             let bv  = b.ins().bor(bb4, b_raw);
-            let g8  = b.ins().ishl_imm(g,  8);
-            let b16 = b.ins().ishl_imm(bv, 16);
+            let g8  = b.ins().ishl_imm_s(g,  8);
+            let b16 = b.ins().ishl_imm_s(bv, 16);
             let t   = b.ins().bor(b16, g8);
             b.ins().bor(t, r)
         }
@@ -2507,22 +2522,22 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
 /// Mirrors helper_blend but specialized — constant sfactor/dfactor let Cranelift
 /// fold all the factor-selection branches away.
 fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, dfactor: u32) -> Value {
-    let sa   = b.ins().ushr_imm(src, 24); // alpha from src bits[31:24]
+    let sa   = b.ins().ushr_imm_s(src, 24); // alpha from src bits[31:24]
     let c255 = b.ins().iconst(types::I32, 255);
 
     // Extract each 8-bit channel (no nesting)
-    let sr   = b.ins().band_imm(src, 0xFF);
-    let src8 = b.ins().ushr_imm(src,  8);
-    let sg   = b.ins().band_imm(src8, 0xFF);
-    let src16= b.ins().ushr_imm(src, 16);
-    let sb   = b.ins().band_imm(src16, 0xFF);
-    let dr   = b.ins().band_imm(dst, 0xFF);
-    let dst8 = b.ins().ushr_imm(dst,  8);
-    let dg   = b.ins().band_imm(dst8, 0xFF);
-    let dst16= b.ins().ushr_imm(dst, 16);
-    let db   = b.ins().band_imm(dst16, 0xFF);
-    let dst24= b.ins().ushr_imm(dst, 24);
-    let da   = b.ins().band_imm(dst24, 0xFF);
+    let sr   = b.ins().band_imm_s(src, 0xFF);
+    let src8 = b.ins().ushr_imm_s(src,  8);
+    let sg   = b.ins().band_imm_s(src8, 0xFF);
+    let src16= b.ins().ushr_imm_s(src, 16);
+    let sb   = b.ins().band_imm_s(src16, 0xFF);
+    let dr   = b.ins().band_imm_s(dst, 0xFF);
+    let dst8 = b.ins().ushr_imm_s(dst,  8);
+    let dg   = b.ins().band_imm_s(dst8, 0xFF);
+    let dst16= b.ins().ushr_imm_s(dst, 16);
+    let db   = b.ins().band_imm_s(dst16, 0xFF);
+    let dst24= b.ins().ushr_imm_s(dst, 24);
+    let da   = b.ins().band_imm_s(dst24, 0xFF);
 
     // get_factor_ir: sel is compile-time constant; comp_other and alpha are runtime Values
     // Returns IR Value for the factor (0..255).
@@ -2548,7 +2563,7 @@ fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, 
             let num   = b.ins().iadd(sc_sf, dc_df);
             let val   = b.ins().udiv(num, c255);
             let cl    = b.ins().umin(val, c255);
-            b.ins().ishl_imm(cl, $shift)
+            b.ins().ishl_imm_s(cl, $shift)
         }}
     }
 
@@ -2569,16 +2584,16 @@ fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, 
 fn emit_bswap32(b: &mut FunctionBuilder, val: Value) -> Value {
     // Swap: byte0 and byte3, byte1 and byte2.
     // result = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF)
-    let b0   = b.ins().band_imm(val, 0xFF);
-    let b0s  = b.ins().ishl_imm(b0, 24);
-    let b1   = b.ins().ushr_imm(val, 8);
-    let b1m  = b.ins().band_imm(b1, 0xFF);
-    let b1s  = b.ins().ishl_imm(b1m, 16);
-    let b2   = b.ins().ushr_imm(val, 16);
-    let b2m  = b.ins().band_imm(b2, 0xFF);
-    let b2s  = b.ins().ishl_imm(b2m, 8);
-    let b3   = b.ins().ushr_imm(val, 24);
-    let b3m  = b.ins().band_imm(b3, 0xFF);
+    let b0   = b.ins().band_imm_s(val, 0xFF);
+    let b0s  = b.ins().ishl_imm_s(b0, 24);
+    let b1   = b.ins().ushr_imm_s(val, 8);
+    let b1m  = b.ins().band_imm_s(b1, 0xFF);
+    let b1s  = b.ins().ishl_imm_s(b1m, 16);
+    let b2   = b.ins().ushr_imm_s(val, 16);
+    let b2m  = b.ins().band_imm_s(b2, 0xFF);
+    let b2s  = b.ins().ishl_imm_s(b2m, 8);
+    let b3   = b.ins().ushr_imm_s(val, 24);
+    let b3m  = b.ins().band_imm_s(b3, 0xFF);
     let r1   = b.ins().bor(b0s, b1s);
     let r2   = b.ins().bor(b2s, b3m);
     b.ins().bor(r1, r2)
@@ -2591,14 +2606,14 @@ fn emit_bswap64(b: &mut FunctionBuilder, val: Value) -> Value {
     let mask = b.ins().iconst(types::I64, 0xFF);
     let mut bytes = [b.ins().iconst(types::I64, 0); 8];
     for i in 0u32..8 {
-        let shifted = if i == 0 { val } else { b.ins().ushr_imm(val, (i * 8) as i64) };
+        let shifted = if i == 0 { val } else { b.ins().ushr_imm_s(val, (i * 8) as i64) };
         bytes[i as usize] = b.ins().band(shifted, mask);
     }
     // Reassemble in reversed order
     let mut result = bytes[7]; // byte7 → position 0 (shift 0)
     for i in (0u32..7).rev() {
         let dest_shift = (7 - i) * 8;
-        let placed = b.ins().ishl_imm(bytes[i as usize], dest_shift as i64);
+        let placed = b.ins().ishl_imm_s(bytes[i as usize], dest_shift as i64);
         result = b.ins().bor(result, placed);
     }
     result
@@ -2637,50 +2652,50 @@ fn emit_fetch_host_pixel_ir(
         // Non-packed: extract pixel from the top of the shifter using same logic as packed.
         let pixel_raw: Value = match hostdepth {
             0 => {
-                let hi = b.ins().ushr_imm(shifter, 56);
+                let hi = b.ins().ushr_imm_s(shifter, 56);
                 let r  = b.ins().ireduce(types::I32, hi);
-                b.ins().band_imm(r, 0xF)
+                b.ins().band_imm_s(r, 0xF)
             }
             1 => {
-                let hi = b.ins().ushr_imm(shifter, 56);
+                let hi = b.ins().ushr_imm_s(shifter, 56);
                 let r  = b.ins().ireduce(types::I32, hi);
-                b.ins().band_imm(r, 0xFF)
+                b.ins().band_imm_s(r, 0xFF)
             }
             2 => {
-                let hi = b.ins().ushr_imm(shifter, 48);
+                let hi = b.ins().ushr_imm_s(shifter, 48);
                 let r  = b.ins().ireduce(types::I32, hi);
-                b.ins().band_imm(r, 0xFFF)
+                b.ins().band_imm_s(r, 0xFFF)
             }
             _ => {
                 // 32bpp: full top 32 bits
-                let hi = b.ins().ushr_imm(shifter, 32);
+                let hi = b.ins().ushr_imm_s(shifter, 32);
                 b.ins().ireduce(types::I32, hi)
             }
         };
         // Shifter is reloaded each GO in non-packed mode; advance is a no-op placeholder.
-        let shifted = b.ins().ishl_imm(shifter, 32);
+        let shifted = b.ins().ishl_imm_s(shifter, 32);
         (pixel_raw, shifted)
     } else {
         let pixel_raw: Value = match hostdepth {
             0 => {
                 // 4bpp: bits[63:60] → 4-bit value
-                let hi = b.ins().ushr_imm(shifter, 60);
+                let hi = b.ins().ushr_imm_s(shifter, 60);
                 b.ins().ireduce(types::I32, hi)
             }
             1 => {
                 // 8bpp: bits[63:56] → 8-bit value
-                let hi = b.ins().ushr_imm(shifter, 56);
+                let hi = b.ins().ushr_imm_s(shifter, 56);
                 b.ins().ireduce(types::I32, hi)
             }
             2 => {
                 // 12bpp: bits[63:48] → 12-bit value
-                let hi = b.ins().ushr_imm(shifter, 48);
+                let hi = b.ins().ushr_imm_s(shifter, 48);
                 let r  = b.ins().ireduce(types::I32, hi);
-                b.ins().band_imm(r, 0xFFF)
+                b.ins().band_imm_s(r, 0xFFF)
             }
             _ => {
                 // 32bpp: bits[63:32]
-                let hi = b.ins().ushr_imm(shifter, 32);
+                let hi = b.ins().ushr_imm_s(shifter, 32);
                 b.ins().ireduce(types::I32, hi)
             }
         };
@@ -2725,12 +2740,12 @@ fn emit_pack_host_pixel_ir(
             0 => emit_compress_ir(b, pixel, 0, false),  // 24bit → 4bpp (no dither for host)
             1 => emit_compress_ir(b, pixel, 1, false),  // 24bit → 8bpp
             2 => emit_compress_ir(b, pixel, 2, false),  // 24bit → 12bpp
-            _ => b.ins().bor_imm(pixel, 0xFF000000u32 as i64), // 32bpp: set alpha=0xFF (compress_32_rgb)
+            _ => b.ins().bor_imm_s(pixel, 0xFF000000u32 as i64), // 32bpp: set alpha=0xFF (compress_32_rgb)
         }
     } else {
         // CI mode: mask to depth
         let mask: i64 = match hostdepth { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFFFF };
-        b.ins().band_imm(pixel, mask)
+        b.ins().band_imm_s(pixel, mask)
     };
 
     // Pack: acc = (acc << shift) | compressed
@@ -2751,7 +2766,7 @@ fn emit_pack_host_pixel_ir(
 fn emit_store_hostrw(
     b:       &mut FunctionBuilder,
     ctx_ptr: Value,
-    mem:     &MemFlags,
+    mem:     &MemFlagsData,
     shifter: Value, // I64: accumulated packed pixels
     dm1:     &Dm1,
 ) {
@@ -2759,7 +2774,7 @@ fn emit_store_hostrw(
         emit_bswap64(b, shifter)
     } else if !dm1.rwdouble() {
         // 32-bit mode: shift left 32 to align data to high half
-        b.ins().ishl_imm(shifter, 32)
+        b.ins().ishl_imm_s(shifter, 32)
     } else {
         shifter
     };
