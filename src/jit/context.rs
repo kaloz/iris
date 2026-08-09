@@ -56,7 +56,6 @@ pub struct JitContext {
     pub cp0_epc: u64,
     pub cp0_count: u64,
     pub cp0_compare: u64,
-    pub count_step: u64,
     pub cp0_badvaddr: u64,
 
     // Nano-TLB (3 entries: Fetch/Read/Write)
@@ -101,7 +100,6 @@ impl JitContext {
             cp0_epc: 0,
             cp0_count: 0,
             cp0_compare: 0,
-            count_step: 0,
             cp0_badvaddr: 0,
             nanotlb: [NanoTlbEntry::default(); 3],
             in_delay_slot: false,
@@ -147,7 +145,6 @@ impl JitContext {
         self.cp0_epc = exec.core.cp0_epc;
         self.cp0_count = exec.core.cp0_count;
         self.cp0_compare = exec.core.cp0_compare;
-        self.count_step = exec.core.count_step;
         self.cp0_badvaddr = exec.core.cp0_badvaddr;
         self.nanotlb = exec.core.nanotlb;
         self.in_delay_slot = exec.core.in_delay_slot;
@@ -178,7 +175,7 @@ impl JitContext {
         exec.core.delay_slot_target = 0;
 
         // DO NOT write back: cp0_status, cp0_cause, cp0_epc, cp0_badvaddr,
-        // cp0_count, cp0_compare, count_step, nanotlb, fpr, fpu_fcsr —
+        // cp0_count, cp0_compare, nanotlb, fpr, fpu_fcsr —
         // these are managed by the interpreter and memory helpers directly
         // on the executor. Writing them back would clobber changes made by
         // exception handlers and TLB fill operations.

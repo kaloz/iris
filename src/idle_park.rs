@@ -6,12 +6,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::mips_core::{CAUSE_IP_MASK, CAUSE_IP7, STATUS_IM_MASK};
+use crate::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
 use crate::mips_core::MipsCore;
 
 const IDLE_RING: usize = 32;
 const SLICE_NS: u64 = 1_000_000;
-const MIN_SLICE_NS: u64 = 50_000;
 
 /// Tracks recent architectural-state hashes to detect polling idle loops.
 #[derive(Default)]
@@ -60,30 +59,25 @@ impl IdleParkState {
         false
     }
 
-    /// Park in ≤1 ms slices until an interrupt is due or pending.
+    /// Park in ≤1 ms slices until an interrupt is pending or the CPU stops.
+    ///
+    /// The Count==Compare interrupt needs no special handling here anymore:
+    /// the compare timer fires on the hptimer thread and ORs IP7 into
+    /// `hot.interrupts` exactly like a device line, and CP0 Count itself is
+    /// virtual (materialized from the wall clock on read), so nothing has to
+    /// advance it during the sleep. Only `hot.cycles` is advanced — at a
+    /// nominal ~100 MIPS — so cross-thread cycle readers (Wd33c93a's
+    /// deferred-interrupt spin-wait, CP0 Random) keep seeing progress.
     pub fn park(&self, core: &mut MipsCore, running: &AtomicBool) {
-        // hw_per_ns is measured directly from the last Compare interval's real
-        // elapsed time (see mips_core.rs write_cp0), unlike compare_delta_slow
-        // which is only a fuzzy-matched bucket label that *assumes* 100 Hz on
-        // its first sample. Using the bucket instead of the measured rate here
-        // silently mis-paces cp0_count advancement whenever the guest's actual
-        // first Compare interval isn't really 10ms (rules/perf/idle-pause-work.md).
-        let hw_per_ns = core.hw_per_ns;
-        let cs = core.count_step;
-        if hw_per_ns == 0 || cs == 0 {
+        // Only park once the guest has a recognized periodic tick: before
+        // that (PROM), Compare use is ad-hoc and there may be nothing armed
+        // to wake us.
+        if core.compare_delta_slow == 0 {
             return;
         }
 
         loop {
             if !running.load(Ordering::Relaxed) {
-                break;
-            }
-            let cnt = core.cp0_count;
-            let cmp = core.cp0_compare;
-            let diff = cmp.wrapping_sub(cnt);
-            if (diff >> 63) != 0 || (diff >> 32) == 0 {
-                core.cp0_count = cmp;
-                core.cp0_cause |= CAUSE_IP7;
                 break;
             }
             let pending = core.hot.interrupts.load(Ordering::Relaxed) as u32;
@@ -92,23 +86,17 @@ impl IdleParkState {
             if (ip & im) != 0 {
                 break;
             }
-
-            let rem_hw = diff >> 32;
-            let ns_to_tick = ((rem_hw as u128) << 32) / hw_per_ns as u128;
-            let slice_ns = (ns_to_tick.min(SLICE_NS as u128)) as u64;
-            if slice_ns < MIN_SLICE_NS {
-                core.cp0_count = cmp;
-                core.cp0_cause |= CAUSE_IP7;
+            // ci_clock has no hptimer — the fire point is a cycles threshold
+            // checked in step()'s preamble, so stop parking once we cross it.
+            #[cfg(feature = "ci_clock")]
+            if core.hot.cycles >= core.count_fire_cycle {
                 break;
             }
 
             let t0 = Instant::now();
-            std::thread::sleep(Duration::from_nanos(slice_ns));
+            std::thread::sleep(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            let adv_hw = ((elapsed_ns as u128 * hw_per_ns as u128) >> 32) as u64;
-            core.cp0_count = core.cp0_count.wrapping_add(adv_hw << 32);
-            let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
-            core.hot.cycles = core.hot.cycles.wrapping_add(adv_instrs);
+            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
         }
     }
 }

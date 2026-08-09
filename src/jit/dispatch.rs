@@ -262,17 +262,10 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
                 let n = burst as u64;
                 exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
-                let advance = exec.core.count_step.wrapping_mul(n);
-                let prev = exec.core.cp0_count;
-                exec.core.cp0_count = prev.wrapping_add(advance);
-                if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
-                    exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                    exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
-                }
                 let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                 if pending != 0 {
-                    use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
-                    let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                    use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6, CAUSE_IP7};
+                    let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6 | CAUSE_IP7;
                     exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
                         | (pending as u32 & ext_mask);
                 }
@@ -432,16 +425,10 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 snap.restore(exec);
                             }
                         }
-                        // Advance cp0_count for instructions that executed before the fault.
+                        // Credit cycles for instructions that executed before the fault.
                         // ctx.pc was set to the faulting instruction by the load/store emitter.
                         let instrs_before_fault = ctx.pc.wrapping_sub(pc) / 4;
                         if instrs_before_fault > 0 {
-                            let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
-                            let prev = exec.core.cp0_count;
-                            exec.core.cp0_count = prev.wrapping_add(advance);
-                            if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
-                                exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                            }
                             exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(instrs_before_fault);
                         }
                         exec.step();
@@ -649,32 +636,22 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         }
                     }
 
-                    // Advance cp0_count and check interrupts for the N instructions
-                    // the JIT block executed. The interpreter's step() does this per-
-                    // instruction; we must do it in bulk here or timing drifts and
-                    // the kernel panics from missed timer interrupts.
+                    // Bulk bookkeeping for the N instructions the JIT block
+                    // executed. cp0_count needs nothing (it's virtual,
+                    // materialized from the wall clock on read; IP7 arrives
+                    // through hot.interrupts from the hptimer thread), but
+                    // cycles must be credited and pending interrupt bits
+                    // merged into cp0_cause so the interpreter sees them on
+                    // its next step.
                     {
                         let n = block_len as u64;
-                        // Advance cp0_count by block_len * count_step
-                        let count_advance = exec.core.count_step.wrapping_mul(n);
-                        let prev = exec.core.cp0_count;
-                        exec.core.cp0_count = prev.wrapping_add(count_advance);
-                        if exec.core.cp0_compare.wrapping_sub(prev) <= count_advance {
-                            exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                            exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
-                        }
                         // Credit the shared cycle counter so the stats display shows correct MHz
                         exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
 
-                        // Merge external interrupt bits into cp0_cause so the
-                        // interpreter sees them on its next step. Don't call exec.step()
-                        // here — that would double-count cp0_count (the post-block
-                        // advancement above already accounted for all block instructions,
-                        // and step() would add yet another count_step tick per interrupt).
                         let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                         if pending != 0 {
-                            use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
-                            let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                            use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6, CAUSE_IP7};
+                            let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6 | CAUSE_IP7;
                             exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
                                 | (pending as u32 & ext_mask);
                         }
@@ -800,7 +777,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             if ctx.exit_reason == EXIT_EXCEPTION {
                                 // Exception in chained block. Speculative: roll
                                 // back and update demotion tracking. Either way:
-                                // advance cp0_count for instructions before the
+                                // credit cycles for instructions before the
                                 // fault, step the interpreter once, break chain.
                                 if let Some(snap) = &next_snapshot {
                                     if next_is_speculative {
@@ -833,12 +810,6 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 }
                                 let instrs_before_fault = ctx.pc.wrapping_sub(next_pc) / 4;
                                 if instrs_before_fault > 0 {
-                                    let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
-                                    let prev = exec.core.cp0_count;
-                                    exec.core.cp0_count = prev.wrapping_add(advance);
-                                    if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
-                                        exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                                    }
                                     exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(instrs_before_fault);
                                 }
                                 exec.step();
@@ -849,20 +820,13 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             }
 
                             // Normal exit: post-block bookkeeping (identical to
-                            // the main path's cp0_count advance + interrupt merge).
+                            // the main path's cycles credit + interrupt merge).
                             let n = next_block_len as u64;
-                            let count_advance = exec.core.count_step.wrapping_mul(n);
-                            let prev = exec.core.cp0_count;
-                            exec.core.cp0_count = prev.wrapping_add(count_advance);
-                            if exec.core.cp0_compare.wrapping_sub(prev) <= count_advance {
-                                exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-                                exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
-                            }
                             exec.core.hot.cycles = exec.core.hot.cycles.wrapping_add(n);
                             let pending = exec.core.hot.interrupts.load(Ordering::Relaxed);
                             if pending != 0 {
-                                use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
-                                let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                                use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6, CAUSE_IP7};
+                                let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6 | CAUSE_IP7;
                                 exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
                                     | (pending as u32 & ext_mask);
                             }
@@ -937,11 +901,6 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             }
         }
 
-        {
-            let exec = unsafe { &mut *exec_ptr };
-            exec.flush_cycles();
-        }
-
         #[cfg(feature = "idle-pause")]
         if crate::idle_park::idle_park_enabled() {
             let exec = unsafe { &mut *exec_ptr };
@@ -1005,10 +964,6 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         }
     }
 
-    {
-        let exec = unsafe { &mut *exec_ptr };
-        exec.flush_cycles();
-    }
     let total = total_interp_steps + total_jit_instrs;
     let jit_pct = if total > 0 { total_jit_instrs as f64 / total as f64 * 100.0 } else { 0.0 };
     eprintln!("JIT: shutdown. {} blocks, {} jit / {} interp / {} total ({:.1}% jit), {}↑ {}↓ {}⟲, final_probe={}",
@@ -1078,7 +1033,6 @@ fn interpreter_loop<T: Tlb, C: MipsCache>(
             }
         }
         total_steps += 10000;
-        exec.flush_cycles();
 
         if let Some(tw) = &mut trace_writer {
             let prev = total_steps.saturating_sub(10000);

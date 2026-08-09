@@ -107,13 +107,9 @@ fn touches_memory(raw: u32) -> bool {
 /// compiled function should never actually dereference memory.
 fn seed_core(state: &CoreState) -> MipsCore {
     let mut core = MipsCore::new();
-    // MipsCore::new()'s defaults (cp0_count=0, cp0_compare=0) look like an
-    // already-expired timer to emit_ip7_preamble's `(cp0_compare - cp0_count)
-    // <= count_step` check — it would bail out of the compiled region before
-    // the instruction's own semantics ever ran. Same fix equiv_test.rs's
-    // seeded_executor uses: force the timer to never fire.
-    core.count_step = 0;
-    core.cp0_compare = u64::MAX;
+    // No timer to silence anymore: the Count==Compare interrupt is an
+    // hptimer-thread bit in hot.interrupts now, and no timer manager is
+    // wired in this harness, so the pending-interrupt preamble never bails.
     core.gpr = state.gpr;
     core.pc = state.pc;
     core.hi = state.hi;

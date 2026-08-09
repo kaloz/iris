@@ -350,8 +350,13 @@ mod undo_buffer_tests {
     }
 }
 
-// External interrupt mask (IP6..IP2)
-const EXT_INT_MASK: u32 = crate::mips_core::CAUSE_IP6 |
+// Externally-raised interrupt mask (IP7..IP2): the IP bits that other
+// threads deliver through `hot.interrupts` and the step() preamble mirrors
+// into Cause. IP7 (CP0 Count==Compare) is included since the compare timer
+// fires on the hptimer thread and raises it exactly like a device line;
+// writing Compare clears the pending bit again (mips_core.rs write_cp0).
+const EXT_INT_MASK: u32 = crate::mips_core::CAUSE_IP7 |
+                          crate::mips_core::CAUSE_IP6 |
                           crate::mips_core::CAUSE_IP5 |
                           crate::mips_core::CAUSE_IP4 |
                           crate::mips_core::CAUSE_IP3 |
@@ -781,16 +786,6 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub decoded_count: Arc<AtomicU64>,
     /// Count of instructions fetched from uncached address space.
     pub uncached_fetch_count: Arc<AtomicU64>,
-    /// Raw pointer into core.fasttick_count — avoids Arc::deref on every step.
-    /// Safety: points into an Arc owned by MipsCore which outlives the executor.
-    /// `cycles`/`interrupts` have no equivalent cached pointer — both live
-    /// inline on `MipsCore.hot` now (see `Hot`'s doc comment), so
-    /// `&self.core.hot.cycles`/`&self.core.hot.interrupts` are always current
-    /// and just as cheap; a cached pointer would go stale across any move of
-    /// `self` (which `fasttick_count` can't, since `Arc::as_ptr` points at
-    /// its own separate heap allocation).
-    fasttick_ptr:     *const AtomicU64,
-    local_fasttick:   u32,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
@@ -1018,8 +1013,8 @@ fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, a
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
 /// Rust does not allow `Self` inside a nested fn, so the generic trampoline lives here.
-// Safety: the raw pointer (fasttick_ptr) points into an Arc allocation
-// owned by MipsCore which outlives the executor. The executor is only accessed from the CPU thread.
+// Safety: the executor's raw pointers point into allocations owned by
+// MipsCore which outlive the executor. The executor is only accessed from the CPU thread.
 unsafe impl<T: Tlb, C: MipsCache> Send for MipsExecutor<T, C> {}
 unsafe impl<T: Tlb, C: MipsCache> Sync for MipsExecutor<T, C> {}
 
@@ -1499,8 +1494,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             ins: DecodedInstr::default(), // scratch slot for uncached fetches
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
-            fasttick_ptr:   std::ptr::null(),
-            local_fasttick: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
             // Placeholder — overwritten immediately by update_fpr_mode below.
@@ -1567,10 +1560,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     /// Re-sync raw atomic pointers after the shared Arcs are injected post-construction.
-    /// Must be called whenever core.fasttick_count is replaced. (`cycles` has
-    /// no equivalent — it's an inline `MipsCore` field now, always current.)
+    /// (`cycles` has no equivalent — it's an inline `MipsCore` field now, always current.)
     pub fn rebind_atomic_ptrs(&mut self) {
-        self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
         #[cfg(feature = "idle-pause")]
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
     }
@@ -1921,19 +1912,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
     }
 
-    /// Step one instruction (fetch and execute).
-    /// If `self.skip_breakpoints` is set, all breakpoint checks for this one
-    /// step (PC, fetch, and all data memory accesses) are suppressed.
-    /// It is cleared automatically after the instruction completes.
-    /// Flush the local fasttick counter to the shared atomic. `cycles` has
-    /// no equivalent flush anymore — it's incremented directly on its own
-    /// atomic every instruction (`step`'s own body), not batched locally.
-    #[inline(always)]
-    pub fn flush_cycles(&mut self) {
-        unsafe { &*self.fasttick_ptr }.fetch_add(self.local_fasttick as u64, Ordering::Relaxed);
-        self.local_fasttick = 0;
-    }
-
     /// `lightning`'s decode-skip fast path: check whether jitv2 already has
     /// a valid compiled entry for `self.core.pc` and, if so, call straight
     /// into it — WITHOUT decoding the raw instruction word first. Only ever
@@ -1993,6 +1971,20 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
         }
 
+        // ci_clock: the compare "timer" is a deterministic hot.cycles
+        // threshold instead of an hptimer thread — check it here, before the
+        // pending load below, so the fire is delivered within this same step.
+        #[cfg(feature = "ci_clock")]
+        if self.core.hot.cycles >= self.core.count_fire_cycle {
+            // Next architectural match is a full 32-bit Count wrap away;
+            // normally a Compare write re-arms much sooner.
+            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.core.count_hz as u128;
+            self.core.count_fire_cycle = self.core.hot.cycles
+                .saturating_add(wrap_ns as u64 / crate::mips_core::NS_PER_GUEST_CYCLE);
+            self.core.hot.interrupts.fetch_or(crate::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
+            self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
+        }
+
         /*
         // Reload external interrupt state every 16 instructions
         if self.core.hot.cycles & 0xF == 0 {
@@ -2023,15 +2015,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return EXEC_BREAKPOINT;
         }
 
-        // Advance cp0_count at calibrated wall-clock rate.
-        // cp0_count bits[63:32] are the hardware 32-bit count; bits[31:0] are the fraction (32.32 fp).
-        // count_step is the per-instruction increment in the same 32.32 representation.
-        // Plain wrapping_add gives free 32-bit wrap of the hardware count portion.
-        let prev = self.core.cp0_count;
-        self.core.cp0_count = prev.wrapping_add(self.core.count_step);
-        let timer_fired = (self.core.cp0_compare.wrapping_sub(prev) <= self.core.count_step) as u32;
-        self.core.cp0_cause |= crate::mips_core::CAUSE_IP7.wrapping_mul(timer_fired);
-        self.local_fasttick = self.local_fasttick.wrapping_add(timer_fired);
+        // No per-instruction CP0 Count work: Count is virtual (materialized
+        // lazily on read from the wall-clock anchor in mips_core.rs), and the
+        // Count==Compare interrupt arrives through `pending` like any device
+        // line — armed as an hptimer one-shot on each Compare write.
         // Fast path: skip all signal/interrupt handling when nothing is pending
         if (pending | self.core.cp0_cause as u64) != 0 {
             // Soft reset (bit 63)
@@ -2141,13 +2128,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.trace_writer.is_some()
     }
 
-    /// Lightweight step for JIT interpreter bursts. Skips cp0_count
-    /// advancement — the JIT dispatch loop credits `core.hot.cycles` and
-    /// advances `cp0_count` itself, in bulk, after the burst (still onto the
-    /// same real, shared field — see `Hot::cycles`'s doc comment; only the
-    /// batching of *when* it's added is bulk here, not a separate local
-    /// shadow that could go stale). Keeps interrupt checking because the
-    /// kernel depends on per-instruction interrupt delivery.
+    /// Lightweight step for JIT interpreter bursts. Skips the breakpoint /
+    /// idle-profiler preamble — the JIT dispatch loop credits
+    /// `core.hot.cycles` itself, in bulk, after the burst (still onto the
+    /// same real, shared field — see `Hot::cycles`'s doc comment). Keeps
+    /// interrupt checking because the kernel depends on per-instruction
+    /// interrupt delivery.
     #[inline(always)]
     pub fn step_lite(&mut self) -> ExecStatus {
         let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
@@ -4581,8 +4567,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_mfc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
-        // CP0 Random (reg 1) derives from cycle count — flush local counter first
-        if rd_val == 1 { self.flush_cycles(); }
         let value = self.core.read_cp0(rd_val);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
@@ -4593,7 +4577,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_dmfc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
-        if rd_val == 1 { self.flush_cycles(); }
         let value = self.core.read_cp0(rd_val);
         self.core.write_gpr(rt_reg, value);
         self.handle_exec_complete()
@@ -4708,8 +4691,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to a random TLB entry
     // The random index is determined by CP0.Random register
     fn exec_tlbwr(&mut self) -> ExecStatus {
-        // Flush local cycle counter so update_random sees accurate cycle count
-        self.flush_cycles();
         self.core.update_random();
         let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
@@ -5895,6 +5876,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.halted = snapshot.halted;
         self.core.in_delay_slot = snapshot.in_delay_slot;
         self.core.delay_slot_target = snapshot.delay_slot_target;
+        // cp0_count/cp0_compare were restored as raw fields above — re-anchor
+        // the virtual count at the restored value and re-arm the compare
+        // timer, exactly as a snapshot-file load does.
+        self.core.reanchor_count_and_reschedule();
         // self.pcp (jitv2's tracked PhysicalCodePage for the current fetch)
         // and the nanotlb are both keyed off whatever PC/ASID was live
         // before this restore — neither one has any way to notice pc just
@@ -7731,6 +7716,15 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             // than assuming the platform default matches.
             crate::platform::set_fpu_mode((exec.core.fpu_fcsr & 0x3) as u8);
 
+            // The CPU counts as running for the duration of this loop: resume
+            // the virtual CP0 Count and compare timer (latched by the stop()
+            // above), and re-latch on the way out. For a long `run` this
+            // gives the guest live timer ticks; for a single `step` the
+            // running window is microseconds, so Count stays effectively
+            // frozen between steps and IP7 never fires mid-inspection (use
+            // the `ip7` command to inject one deliberately).
+            exec.core.on_cpu_start();
+
             if !wait {
                 let _ = writeln!(writer, "Running...");
             }
@@ -7855,7 +7849,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 steps_since_yield += 1;
                 if steps_since_yield >= 500000 {
                     steps_since_yield = 0;
-                    exec.flush_cycles();
                     drop(exec);
                     thread::sleep(Duration::from_millis(1));
                     exec = executor.lock();
@@ -7866,7 +7859,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     }
                 }
             }
-            exec.flush_cycles();
             #[cfg(feature = "developer")]
             { exec.skip_interrupts = false; }
             if let Some(ref mut f) = *trace_file.lock() { let _ = f.flush(); }
@@ -7888,6 +7880,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             // Clear temporary breakpoint (used by run/finish)
             exec.clear_temp_breakpoint();
 
+            exec.core.on_cpu_stop();
             drop(exec);
             running.store(false, Ordering::SeqCst);
         };
@@ -7928,7 +7921,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             // Don't break on exceptions — they're part of normal CPU
             // operation and a deterministic run should re-enter and continue.
         }
-        exec.flush_cycles();
         Ok(executed)
     }
 
@@ -7991,8 +7983,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     }
 
     /// Snapshot the deterministic-from-state CPU registers. Excludes host
-    /// wallclock anchors like `compare_last_instant` (they're meaningless
-    /// across runs) but includes their calibrated equivalents (count_step,
+    /// wallclock anchors like `count_anchor_instant` (they're meaningless
+    /// across runs) but includes their calibrated equivalents (count_hz,
     /// compare_delta_*).
     ///
     /// Also drains `hw_read_fixup_recorded` (see that field's doc comment)
@@ -8028,7 +8020,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             cp0_epc: c.cp0_epc,
             cp0_badvaddr: c.cp0_badvaddr,
             cp0_entryhi: c.cp0_entryhi,
-            count_step: c.count_step,
+            count_hz: c.count_hz,
             in_delay_slot: c.in_delay_slot,
             hw_reads,
             step_status,
@@ -8058,13 +8050,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         exec.core.cp0_epc = digest.cp0_epc;
         exec.core.cp0_badvaddr = digest.cp0_badvaddr;
         exec.core.cp0_entryhi = digest.cp0_entryhi;
-        exec.core.count_step = digest.count_step;
+        exec.core.count_hz = digest.count_hz;
         exec.core.in_delay_slot = digest.in_delay_slot;
+        exec.core.reanchor_count_and_reschedule();
         exec.on_cp0_status_changed(0, digest.cp0_status);
         Ok(())
     }
 
-    /// Force `cp0_count`/`count_step` to a reference digest's values —
+    /// Force `cp0_count`/`count_hz` to a reference digest's values —
     /// narrower than `restore_state_digest`, and unconditional rather than
     /// reserved for a detected divergence: `validate::validate_jit_determinism`
     /// calls this after *every* replay-pass step, not just when these fields
@@ -8083,7 +8076,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     pub fn fixup_cp0_count(&self, digest: &CpuStateDigest) -> Result<(), String> {
         let mut exec = self.try_lock_executor()?;
         exec.core.cp0_count = digest.cp0_count;
-        exec.core.count_step = digest.count_step;
+        exec.core.count_hz = digest.count_hz;
+        exec.core.reanchor_count_and_reschedule();
         Ok(())
     }
 }
@@ -8105,7 +8099,7 @@ pub struct CpuStateDigest {
     pub cp0_epc: u64,
     pub cp0_badvaddr: u64,
     pub cp0_entryhi: u64,
-    pub count_step: u64,
+    pub count_hz: u64,
     pub in_delay_slot: bool,
     /// `jitcheck`'s hardware-read fixup: `(phys_addr, size, value)` for every
     /// real bus read this step made from an address in `HW_READ_FIXUP_ADDRS`
@@ -8152,7 +8146,7 @@ impl CpuStateDigest {
         cmp!(cp0_epc,      "0x{:016x}");
         cmp!(cp0_badvaddr, "0x{:016x}");
         cmp!(cp0_entryhi,  "0x{:016x}");
-        cmp!(count_step,   "{}");
+        cmp!(count_hz,     "{}");
         cmp!(in_delay_slot, "{}");
         cmp!(step_status,  "0x{:08x}");
         out
@@ -8181,7 +8175,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         for _ in 0..cycles {
             exec.step();
         }
-        exec.flush_cycles();
     }
 
     fn stop(&self) {
@@ -8189,6 +8182,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
+        // Latch the virtual CP0 Count and silence the compare timer while
+        // stopped — debugger stepping must not see Count advance or IP7
+        // fire underneath it (mips_core.rs on_cpu_stop's doc comment).
+        self.executor.lock().core.on_cpu_stop();
         #[cfg(feature = "tlbstats")]
         self.executor.lock().tlb.stats_print();
         #[cfg(feature = "instr_stats")]
@@ -8243,6 +8240,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 
     fn start(&self) {
         if self.is_running() { return; }
+
+        // Resume the virtual CP0 Count from its latched value and re-arm
+        // the compare timer, before the CPU thread spawns and can execute.
+        self.executor.lock().core.on_cpu_start();
 
         self.running.store(true, Ordering::SeqCst);
         let executor = self.executor.clone();
@@ -8324,12 +8325,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         _ => {}
                     }
                 }
-                // Flush local cycle counter to shared atomic once per batch
-                guard.flush_cycles();
-
                 #[cfg(feature = "idle-pause")]
                 if crate::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
-                    guard.flush_cycles();
                     drop(guard);
                     {
                         let mut guard = executor.lock();
@@ -8394,6 +8391,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("start".to_string(), "Start CPU execution thread".to_string()),
             ("stop".to_string(), "Stop CPU execution thread".to_string()),
             ("status".to_string(), "Show CPU running status and current PC".to_string()),
+            ("ip7".to_string(), "Set pending IP7 (CP0 Compare timer) interrupt — simulate a timer fire while stopped".to_string()),
             ("exception".to_string(), "Control exception breaks: exception <class|code|all> <on|off>".to_string()),
             ("run".to_string(), "Run instructions until exception or breakpoint: run [addr]".to_string()),
             ("step".to_string(), "Step n instructions or until address: step [count|addr]".to_string()),
@@ -8764,14 +8762,23 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 let symbols = exec.symbols.lock();
                 let sym_str = format_pc_symbol(pc, &symbols);
                 writeln!(writer, "{} pc={:016x}{}", if running { "running" } else { "stopped" }, pc, sym_str).unwrap();
-                let cs = exec.core.count_step;
+                let hz = exec.core.count_hz;
                 let slow = exec.core.compare_delta_slow;
                 let fast = exec.core.compare_delta_fast;
-                let prev = exec.core.compare_delta_prev;
-                writeln!(writer, "  count_step={:#018x} ({:.4} hw/instr)",
-                    cs, cs as f64 / (1u64 << 32) as f64).unwrap();
-                writeln!(writer, "  compare_delta_slow={:#018x} ({} hw-counts)  compare_delta_fast={:#018x} ({} hw-counts)  compare_delta_prev={:#018x} ({} hw-counts)",
-                    slow, slow >> 32, fast, fast >> 32, prev, prev >> 32).unwrap();
+                writeln!(writer, "  count_hz={} ({:.3} MHz)  count={:#010x} compare={:#010x}",
+                    hz, hz as f64 / 1e6, exec.core.count_peek(), exec.core.cp0_compare as u32).unwrap();
+                writeln!(writer, "  compare_delta_slow={} hw-counts  compare_delta_fast={} hw-counts",
+                    slow, fast).unwrap();
+                Ok(())
+            }
+            "ip7" => {
+                // The compare timer is silenced while the CPU is stopped
+                // (on_cpu_stop) — this injects the interrupt it would have
+                // raised, through the same pending word, for debugging
+                // interrupt delivery under manual stepping.
+                let exec = self.try_lock_executor()?;
+                exec.core.set_interrupt(7);
+                writeln!(writer, "IP7 set pending (delivered on next executed instruction, mask permitting)").unwrap();
                 Ok(())
             }
             "run" | "c" | "cont" => {
@@ -8915,6 +8922,17 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         writeln!(writer).unwrap();
                     }
                 }
+                let c = &exec.core;
+                // count_hz is derived purely from which pattern bucket the
+                // Compare deltas fall into (assumed 100Hz slow / 1kHz fast —
+                // see infer_count_hz's doc comment for why real elapsed time
+                // can't be used: it would be circular with our own hptimer's
+                // fire time).
+                writeln!(writer, "  IP7 timer: count_hz={} ({:.3} MHz)  fired={}",
+                    c.count_hz, c.count_hz as f64 / 1e6,
+                    c.fasttick_count.load(Ordering::Relaxed)).unwrap();
+                writeln!(writer, "    slow_delta={} hw-counts  fast_delta={} hw-counts",
+                    c.compare_delta_slow, c.compare_delta_fast).unwrap();
                 Ok(())
             }
             "cop1" => {
@@ -10151,12 +10169,12 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
         cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
         cp0u64!(cp0_count); cp0u64!(cp0_compare);
         // Timer calibration state. Without these, restore loses the kernel's
-        // learned tick rate and runs at the default count_step until IRIX
+        // inferred count frequency and runs at the default 33 MHz until IRIX
         // touches Compare again — guest scheduler drifts noticeably for the
-        // first few seconds after every restore. compare_last_cycles and
-        // compare_last_instant are intentionally not saved: they're host-wall
-        // anchors, not calibrated state, and must be reset on load.
-        cp0u64!(count_step); cp0u64!(compare_delta_prev);
+        // first few seconds after every restore. count_anchor_instant is
+        // intentionally not saved: it's a host-wall anchor, not calibrated
+        // state, and must be reset on load.
+        cp0u64!(count_hz);
         cp0u64!(compare_delta_slow); cp0u64!(compare_delta_fast);
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
@@ -10212,25 +10230,31 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             }}
             ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
             ld64!(cp0_count); ld64!(cp0_compare);
-            ld64!(count_step); ld64!(compare_delta_prev);
+            ld64!(count_hz);
             ld64!(compare_delta_slow); ld64!(compare_delta_fast);
-            // Mirror count_step into its atomic shadow (read by the display
+            // Compat shim: pre-timer-based snapshots stored cp0_count/
+            // cp0_compare and the learned deltas in 32.32 fixed-point
+            // (hardware count in the high word). Values above u32::MAX can
+            // only be that old format — shift down to plain hardware counts.
+            // (Such snapshots carry count_step, not count_hz, so count_hz
+            // stays at its default until the guest's tick is re-recognized.)
+            if c.cp0_count > u32::MAX as u64 { c.cp0_count >>= 32; }
+            if c.cp0_compare > u32::MAX as u64 { c.cp0_compare >>= 32; }
+            if c.compare_delta_slow > u32::MAX as u64 { c.compare_delta_slow >>= 32; }
+            if c.compare_delta_fast > u32::MAX as u64 { c.compare_delta_fast >>= 32; }
+            // Mirror count_hz into its atomic shadow (read by the display
             // thread) so the live UI matches the restored core state.
-            c.count_step_atomic.store(c.count_step, std::sync::atomic::Ordering::Relaxed);
-            // Re-anchor the host-wall calibration timer. Setting cycles to 0
-            // forces the next CP0 Compare write to take the "first write"
-            // path (no calibration), which is what we want — dt_ns measured
-            // against an Instant from the previous run would be garbage. The
-            // saved count_step keeps the rate steady until calibration catches
-            // up over the next few Compare writes.
-            c.compare_last_cycles = 0;
-            c.compare_last_instant = std::time::Instant::now();
+            c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
+            // Restart the virtual count from the restored value and re-arm
+            // the compare timer — Instants from the previous run are
+            // meaningless here.
+            c.reanchor_count_and_reschedule();
         }
 
         if let Some(fpu) = get_field(v, "fpu") {
@@ -10343,7 +10367,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
         } else {
             StopReason::DoneStep
         };
-        exec.flush_cycles();
         drop(exec);
         self.stop_state.set(reason);
         reason

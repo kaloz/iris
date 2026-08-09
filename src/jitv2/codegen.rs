@@ -892,13 +892,18 @@ impl Codegen {
             // itself normally, or in the separate entry_word_body_block
             // when skip_entry_preamble is set, with entry_word_block
             // reduced to just "run the preamble, then jump there".
-            emit_ip7_preamble(&mut ctx, exit_block, word);
+            //
+            // A single preamble suffices now: the CP0 Compare timer fires on
+            // the hptimer thread and raises IP7 through `hot.interrupts`
+            // like every device line, so the pending-interrupt check *is*
+            // the timer check — there's no per-instruction cp0_count advance
+            // to mirror anymore (Count is virtual, materialized on read).
             emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
-            // Past both preambles: this instruction is actually going to
-            // execute (neither preamble bailed to the interpreter for this
+            // Past the preamble: this instruction is actually going to
+            // execute (the preamble didn't bail to the interpreter for this
             // word), matching step()'s per-instruction cycle count exactly —
             // see emit_increment_cycles's doc comment for why this
-            // can't go before the preambles (a bail here falls through to
+            // can't go before the preamble (a bail here falls through to
             // the interpreter's step() re-entering at this same PC within
             // the *same* step() call, which already incremented once at its
             // own entry; incrementing here too would double-count).
@@ -1137,74 +1142,6 @@ impl Codegen {
             })
             .collect()
     }
-}
-
-/// Emit the IP7 (CP0 Compare timer) preamble every compiled unit needs
-/// before its own semantics (§3.2 — mirror the interpreter's own checks,
-/// verbatim, at every unit boundary). Mirrors `step()`'s
-/// (`src/mips_exec.rs`) timer-advance sequence exactly:
-///
-/// ```ignore
-/// let prev = core.cp0_count;
-/// core.cp0_count = prev.wrapping_add(core.count_step);
-/// let timer_fired = (core.cp0_compare.wrapping_sub(prev) <= core.count_step);
-/// ```
-///
-/// If `timer_fired`, this function does **not** commit the `cp0_count`
-/// update — it writes `core.pc = vbase | (word_offset * 4)` (this
-/// instruction's own address; nothing has executed yet at this point) and
-/// returns `EXEC_COMPLETE` immediately, so the interpreter's `step()`
-/// re-enters at the top and redoes this exact check as the authoritative
-/// implementation (single-implementation delivery, §3.2/§7a) — it will
-/// either deliver the interrupt or, if conditions changed, proceed to
-/// actually execute the instruction. `vbase` is derived from `core.pc & !0xFFF`
-/// (already live in the struct) rather than threaded as a separate runtime
-/// parameter — §2.2's vbase and this instruction's own current page base are
-/// the same value by construction, since the whole region is one page.
-///
-/// Must be called with `builder` positioned in the block that will hold this
-/// instruction's preamble; leaves `builder` positioned in a new block (the
-/// "not fired" continuation) where the instruction's real semantics should
-/// be emitted next. That continuation block is sealed here since its only
-/// predecessor is the preamble check just emitted. `exit_block` is the
-/// function's shared exit-to-interpreter block (`BlockSkeleton::exit_block`)
-/// — the fired path jumps there via [`emit_bail`] instead of emitting its
-/// own copy of the exit sequence.
-fn emit_ip7_preamble(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
-    let mem = MemFlagsData::trusted();
-    let i64t = ir::types::I64;
-
-    let cp0_count_off = ir::immediates::Offset32::new(core_offset_of_cp0_count());
-    let count_step_off = ir::immediates::Offset32::new(core_offset_of_count_step());
-    let cp0_compare_off = ir::immediates::Offset32::new(core_offset_of_cp0_compare());
-
-    let prev = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, cp0_count_off);
-    let count_step = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, count_step_off);
-    let new_count = ctx.builder.ins().iadd(prev, count_step);
-    let cp0_compare = ctx.builder.ins().load(i64t, mem, ctx.core_ptr, cp0_compare_off);
-    // timer_fired = (cp0_compare - prev) <= count_step, wrapping/unsigned —
-    // matches step()'s wrapping_sub + unsigned <= exactly.
-    let delta = ctx.builder.ins().isub(cp0_compare, prev);
-    let timer_fired = ctx.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, delta, count_step);
-
-    let fired_block = ctx.builder.create_block();
-    let continue_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(timer_fired, fired_block, &[], continue_block, &[]);
-
-    // Fired: abandon the cp0_count update, exit to the interpreter
-    // immediately. Cold: the timer firing within this exact instruction's
-    // count_step window is the rare case on every single dispatch this
-    // preamble runs before.
-    ctx.builder.switch_to_block(fired_block);
-    ctx.builder.set_cold_block(fired_block);
-    ctx.builder.seal_block(fired_block);
-    emit_bail(ctx, exit_block, word_offset);
-
-    // Not fired: commit the cp0_count advance and fall through into the
-    // instruction's real semantics, emitted by the caller after this returns.
-    ctx.builder.switch_to_block(continue_block);
-    ctx.builder.seal_block(continue_block);
-    ctx.builder.ins().store(mem, new_count, ctx.core_ptr, cp0_count_off);
 }
 
 /// Emit the pending-interrupt preamble every compiled unit needs before its
@@ -1515,9 +1452,6 @@ fn emit_set_jit_trigger(ctx: &mut EmitCtx) {
     let one = ctx.builder.ins().iconst(ir::types::I8, 1);
     ctx.builder.ins().store(mem, one, ctx.core_ptr, off);
 }
-fn core_offset_of_cp0_count() -> i32 { std::mem::offset_of!(MipsCore, cp0_count) as i32 }
-fn core_offset_of_cp0_compare() -> i32 { std::mem::offset_of!(MipsCore, cp0_compare) as i32 }
-fn core_offset_of_count_step() -> i32 { std::mem::offset_of!(MipsCore, count_step) as i32 }
 fn core_offset_of_cycles() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, cycles)) as i32
 }
@@ -5568,8 +5502,8 @@ mod tests {
             let exit_word_offset = builder.append_block_param(exit_block, ir::types::I64);
 
             // Shared exception-exit machinery: constructed for EmitCtx's sake
-            // (both preamble emitters this harness exercises, emit_ip7_preamble
-            // and emit_pending_interrupt_preamble, only ever call emit_bail,
+            // (the preamble emitter this harness exercises,
+            // emit_pending_interrupt_preamble, only ever calls emit_bail,
             // never emit_exception_exit) but never actually jumped to here —
             // still needs real, sealed blocks with valid bodies or the
             // verifier rejects the dangling references at finalize() time.
@@ -5632,47 +5566,6 @@ mod tests {
         // the compile thread's whole run).
         std::mem::forget(codegen.module);
         unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }
-    }
-
-    #[test]
-    fn ip7_preamble_advances_count_when_not_fired() {
-        let jit_fn = compile_preamble_only("test_ip7_not_fired", emit_ip7_preamble, 5);
-        let mut core = MipsCore::new();
-        core.pc = 0xFFFFFFFF_80001000; // vbase = 0x...81000... masked to page
-        core.cp0_count = 1000;
-        core.count_step = 100;
-        core.cp0_compare = 1_000_000; // far away — won't fire
-        let orig_pc = core.pc;
-
-        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
-
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
-        assert_eq!(core.cp0_count, 1100, "count_step must be committed when the timer doesn't fire");
-        assert_eq!(core.pc, orig_pc, "pc must be untouched on the not-fired path");
-    }
-
-    #[test]
-    fn ip7_preamble_exits_with_retry_pc_when_fired() {
-        let word_offset: WordOffset = 5;
-        let jit_fn = compile_preamble_only("test_ip7_fired", emit_ip7_preamble, word_offset);
-        let mut core = MipsCore::new();
-        core.pc = 0xFFFFFFFF_80001000;
-        core.cp0_count = 1000;
-        core.count_step = 100;
-        core.cp0_compare = 1050; // cp0_compare - prev (50) <= count_step (100) -> fires
-
-        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
-
-        assert_eq!(status, EXEC_COMPLETE);
-        assert_eq!(core.cp0_count, 1000, "cp0_count update must be abandoned when the timer fires");
-        let expected_vbase = core.pc & !(PAGE_SIZE as u64 - 1);
-        // core.pc was overwritten by the JIT call; recompute vbase from the
-        // ORIGINAL page (0x80001000's page) since that's what should have
-        // been used — re-derive independently for the assertion.
-        let orig_vbase = 0xFFFFFFFF_80001000u64 & !(PAGE_SIZE as u64 - 1);
-        assert_eq!(expected_vbase, orig_vbase);
-        assert_eq!(core.pc, orig_vbase | ((word_offset as u64) * 4),
-            "pc must be set to this instruction's own address for the interpreter to retry");
     }
 
     #[test]

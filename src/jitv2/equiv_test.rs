@@ -229,26 +229,24 @@ mod tests {
     }
 
     /// Seed a fresh `MipsCore` with the given GPR contents (r0 forced to 0,
-    /// matching architecture) and pc, timer fields set far from firing so
-    /// neither preamble bails during the test (that's a separate concern,
-    /// already covered by `codegen.rs`'s preamble tests) — an equivalence
-    /// test wants the instruction's own semantics exercised, not a preamble
-    /// bail path.
+    /// matching architecture) and pc, with nothing pending so the
+    /// pending-interrupt preamble never bails during the test — an
+    /// equivalence test wants the instruction's own semantics exercised,
+    /// not a preamble bail path. (No timer fields to silence: the compare
+    /// timer is an hptimer-thread interrupt now and no manager is wired in
+    /// tests.)
     fn seeded_core(gpr: [u64; 32], pc: u64) -> MipsCore {
         let mut core = MipsCore::new();
         core.gpr = gpr;
         core.gpr[0] = 0;
         core.pc = pc;
-        core.cp0_count = 0;
-        core.count_step = 0; // no timer advance -> IP7 preamble never fires
-        core.cp0_compare = u64::MAX;
         core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
         core
     }
 
     /// Build a fresh `MipsExecutor` over its own `MockMemory`, seeded
-    /// identically for both engines: gpr/pc as given, timer fields set far
-    /// from firing so neither preamble bails during the test (that's a
+    /// identically for both engines: gpr/pc as given, nothing pending so
+    /// the pending-interrupt preamble never bails during the test (that's a
     /// separate concern, already covered by `codegen.rs`'s preamble tests —
     /// an equivalence test wants the instruction's own semantics exercised,
     /// not a preamble bail path).
@@ -268,9 +266,6 @@ mod tests {
         exec.core.gpr = gpr;
         exec.core.gpr[0] = 0;
         exec.core.pc = pc;
-        exec.core.cp0_count = 0;
-        exec.core.count_step = 0;
-        exec.core.cp0_compare = u64::MAX;
         exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
         // no_jitv2 (MockMemory::new_not_compilable's doc comment): pre-claim
         // pc's own physical page and denylist every offset on it right here,

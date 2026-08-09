@@ -41,6 +41,25 @@ pub const CAUSE_IP4: u32 = 1 << 12;
 pub const CAUSE_IP5: u32 = 1 << 13;
 pub const CAUSE_IP6: u32 = 1 << 14;
 pub const CAUSE_IP7: u32 = 1 << 15;            // Timer interrupt (IP7)
+
+/// Default virtual CP0 Count frequency until a recognized periodic tick lets
+/// `infer_count_hz` measure the real rate the guest believes in.
+pub const DEFAULT_COUNT_HZ: u64 = 33_000_000;
+
+/// ci_clock: synthetic nanoseconds per retired instruction (~100 MIPS R4400).
+/// Virtual time is derived from `hot.cycles` instead of the wall clock so the
+/// snapshot determinism validator stays reproducible at any host speed.
+#[cfg(feature = "ci_clock")]
+pub const NS_PER_GUEST_CYCLE: u64 = 10;
+
+/// Raw pointer to a `MipsCore`'s `hot.interrupts` word, captured by the armed
+/// compare-timer callback so the hptimer thread can raise IP7. Same
+/// process-lifetime validity argument as `CyclesPtr` above and
+/// `Ioc::set_interrupts`'s stored pointer: it points into the core owned by
+/// the executor's top-level `Arc<Mutex<..>>`, and `Drop for MipsCore` removes
+/// the timer before the core goes away.
+struct TimerIrqPtr(*const AtomicU64);
+unsafe impl Send for TimerIrqPtr {}
 pub const CAUSE_CE_MASK: u32 = 0x3 << 28;      // Coprocessor Error mask
 pub const CAUSE_CE_SHIFT: u32 = 28;            // Coprocessor Error shift
 pub const CAUSE_BD: u32 = 1 << 31;             // Branch Delay
@@ -170,14 +189,16 @@ pub struct MipsCore {
     /// fresh line of their own instead of splitting across `Hot`'s tail.
     pub hot: Hot,
 
-    // Timer trio — consulted first on every dispatch's IP7/pending-interrupt
-    // preamble check.
-    pub cp0_count: u64,       // 9: Timer Count — bits[63:32]=hardware count, bits[31:0]=fraction (32.32 fp)
-    /// Per-instruction cp0_count increment in 32.32 fixed-point (same format as cp0_count).
-    /// Calibrated on every cp0_compare write to hit the programmed interval in real time.
-    /// Default 1<<31 = 0.5 hardware counts per instruction (R4400: Count runs at half CPU clock).
-    pub count_step: u64,
-    pub cp0_compare: u64,     // 11: Timer Compare — bits[63:32]=hardware compare, bits[31:0]=0 (32.32 fp)
+    // Timer pair — CP0 Count is *virtual*: nothing increments it per
+    // instruction. `cp0_count` holds the value last materialized by
+    // `count_now()` (plain hardware counts in the low 32 bits), advanced
+    // lazily from the wall-clock anchor (`count_anchor_instant` ×
+    // `count_hz`) whenever the guest reads Count or writes Compare. The
+    // Count==Compare interrupt is delivered by an hptimer one-shot armed on
+    // every Compare write, whose callback just sets IP7 in `hot.interrupts`
+    // — the step() preamble's existing pending-interrupt merge does the rest.
+    pub cp0_count: u64,       // 9: Timer Count at last materialization (plain hw counts, low 32 bits)
+    pub cp0_compare: u64,     // 11: Timer Compare (plain hw counts, low 32 bits)
 
     // PC and branch-delay state — read/written together on every dispatch.
     pub pc: u64,         // Program Counter
@@ -480,38 +501,69 @@ pub struct MipsCore {
     pub running: bool,
     pub halted: bool,
 
-    // Compare-calibration bookkeeping — touched only on a CP0 Compare write
-    // or an idle-park sleep, never on the common per-instruction path.
-    /// Atomic shadow of `count_step` — updated whenever count_step changes.
-    /// Shared with the display refresh thread for status bar display.
-    pub count_step_atomic: Arc<AtomicU64>,
-    /// Cycle count when cp0_compare was last written (0 = never written yet).
-    /// `pub(crate)` so snapshot load in `mips_exec.rs` can re-anchor the
-    /// calibration after restoring CP0 fields.
-    pub(crate) compare_last_cycles: u64,
-    /// Wall-clock instant when cp0_compare was last written. Reset to
+    // Timer bookkeeping — touched only on a CP0 Count/Compare access or a
+    // timer (re)schedule, never on the common per-instruction path.
+    /// Atomic shadow of `count_hz` — updated whenever the inferred frequency
+    /// changes. Shared with the display refresh thread for status bar display
+    /// (watch it to see how stable the inference is).
+    pub count_hz_atomic: Arc<AtomicU64>,
+    /// Wall-clock instant `cp0_count` was last materialized at. Advanced by
+    /// exactly the whole-tick duration consumed on each materialization so
+    /// the sub-tick remainder is never rounded away. Reset to
     /// `Instant::now()` on snapshot load — Instants from a previous run are
     /// meaningless across a restore.
-    pub(crate) compare_last_instant: std::time::Instant,
-    /// Learned slow-tick CP0 delta in hardware counts (32.32 fixed-point, >> 32 = integer counts).
+    pub(crate) count_anchor_instant: std::time::Instant,
+    /// `hot.cycles` at the last `count_now()` materialization. Memo key: a
+    /// second read within the same instruction returns the identical value
+    /// (jitv2_lockstep re-executes an instruction on both engines and must
+    /// see the same Count both times).
+    pub(crate) count_read_cycle: u64,
+    /// Inferred CP0 Count frequency in Hz. Default 33 MHz (user-facing
+    /// assumption for an uncalibrated core); replaced as soon as a Compare
+    /// delta matches a recognized slow (100 Hz) or fast (1 kHz) tick.
+    pub count_hz: u64,
+    /// True while the CPU thread is stopped (`on_cpu_stop`): the virtual
+    /// count is latched at `cp0_count` (reads don't advance it) and the
+    /// compare timer is silenced, so monitor `cpu stop` / debugger stepping
+    /// sees a frozen Count and no IP7 firing underneath it. Cleared by
+    /// `on_cpu_start`, which re-anchors and re-arms. Ignored under ci_clock
+    /// (count follows `hot.cycles` there — debug steps advancing it is the
+    /// deterministic behavior CI wants).
+    pub(crate) count_paused: bool,
+    /// Learned slow-tick Compare delta in hardware counts.
     /// Initialised to 0 (unknown). First delta seen is assumed to be the 100 Hz (slow) tick.
     pub compare_delta_slow: u64,
-    /// Learned fast-tick CP0 delta in hardware counts (32.32 fixed-point).
+    /// Learned fast-tick Compare delta in hardware counts.
     /// Initialised to 0 (unknown). Set once we see a delta ~10x smaller than delta_slow.
     pub compare_delta_fast: u64,
-    /// The raw 32.32 fixed-point delta programmed in the *previous* Compare write.
-    /// Used for calibration: dt_ns/dc measure the old interval, so count_step must be
-    /// computed against the old delta, not the new one.  Zero = no previous write yet.
-    pub compare_delta_prev: u64,
-    /// Calibrated hardware-count units per real nanosecond (32.32 fixed-point),
-    /// measured directly from `prev_delta / dt_ns` on each Compare write — i.e.
-    /// the same real-world measurement `count_step` is derived from, but expressed
-    /// as a wall-clock rate instead of a per-instruction step. Used by
-    /// `idle_park::park()` to advance `cp0_count` at the true calibrated rate
-    /// during a sleep, instead of assuming `compare_delta_slow` is exactly 10ms
-    /// (which is only a bucket label, not a measured rate — see rules/perf/idle-pause-work.md).
-    /// Zero = not yet calibrated.
-    pub hw_per_ns: u64,
+    /// Last Compare delta that matched neither learned bucket. If the next
+    /// unrecognized delta fuzzy-matches this one, the guest has genuinely
+    /// switched its periodic tick — re-seed the slow bucket from it.
+    pub(crate) compare_delta_unrecognized: u64,
+    /// The Compare-minus-Count delta computed on the *previous* Compare
+    /// write, carried forward one write — matches the pre-hptimer
+    /// calibration's own `compare_delta_prev` exactly. `infer_count_hz`
+    /// classifies this deferred value, not the current write's own fresh
+    /// delta: at the time a write happens, its own delta hasn't been
+    /// "lived through" yet, whereas `compare_delta_prev` is the interval the
+    /// guest just finished actually waiting out. Zero = no previous write
+    /// yet (skip classification).
+    pub(crate) compare_delta_prev: u64,
+    /// hptimer that delivers the Count==Compare interrupt: its callback sets
+    /// IP7 in `hot.interrupts` and bumps `fasttick_count`. Re-armed
+    /// (remove + add_one_shot) on every Compare or Count write. None until
+    /// `set_timer_manager` is wired (unit tests, ci_clock builds).
+    pub(crate) timer_mgr: Option<Arc<crate::hptimer::TimerManager>>,
+    pub(crate) timer_id: Option<crate::hptimer::TimerId>,
+    /// ci_clock: `hot.cycles` value the virtual count is anchored at
+    /// (synthetic 10 ns per instruction instead of wall clock, so CI runs
+    /// stay deterministic).
+    #[cfg(feature = "ci_clock")]
+    pub(crate) count_anchor_cycle: u64,
+    /// ci_clock: `hot.cycles` value at which IP7 fires (checked in step()'s
+    /// preamble instead of an hptimer). u64::MAX = disarmed.
+    #[cfg(feature = "ci_clock")]
+    pub count_fire_cycle: u64,
     /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences. Debug-only
     /// bookkeeping the JIT never touches — kept at the tail, out of the way of the
@@ -653,13 +705,21 @@ unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::
 // SAFETY: The raw pointer in status_changed_cb is only accessed from the CPU thread.
 unsafe impl Send for MipsCore {}
 
+impl Drop for MipsCore {
+    fn drop(&mut self) {
+        // The armed compare timer's callback holds a raw pointer into this
+        // core (`TimerIrqPtr`) — take it out of the manager before the
+        // pointee goes away.
+        self.disarm_compare_timer();
+    }
+}
+
 impl MipsCore {
     /// Create a new MIPS core with reset state
     pub fn new() -> Self {
         let mut core = Self {
             hot: Hot::default(),
             cp0_count: 0,
-            count_step: 1 << 31,
             cp0_compare: 0,
             pc: 0,
             in_delay_slot: false,
@@ -747,13 +807,21 @@ impl MipsCore {
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,
             halted: false,
-            count_step_atomic: Arc::new(AtomicU64::new(1 << 31)),
-            compare_last_cycles: 0,
-            compare_last_instant: std::time::Instant::now(),
+            count_hz_atomic: Arc::new(AtomicU64::new(DEFAULT_COUNT_HZ)),
+            count_anchor_instant: std::time::Instant::now(),
+            count_read_cycle: 0,
+            count_hz: DEFAULT_COUNT_HZ,
+            count_paused: false,
             compare_delta_slow: 0,
             compare_delta_fast: 0,
+            compare_delta_unrecognized: 0,
             compare_delta_prev: 0,
-            hw_per_ns: 0,
+            timer_mgr: None,
+            timer_id: None,
+            #[cfg(feature = "ci_clock")]
+            count_anchor_cycle: 0,
+            #[cfg(feature = "ci_clock")]
+            count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             compare_delta_stats: std::collections::HashMap::new(),
         };
@@ -779,11 +847,20 @@ impl MipsCore {
             self.cp0_count = 0;
             self.cp0_entryhi = 0;
             self.cp0_compare = 0;
-            self.count_step = 1 << 31;
-            self.count_step_atomic.store(1 << 31, Ordering::Relaxed);
             self.hot.cycles = 0;
-            self.compare_last_cycles = 0;
-            self.compare_last_instant = std::time::Instant::now();
+            self.count_read_cycle = 0;
+            self.count_anchor_instant = std::time::Instant::now();
+            #[cfg(feature = "ci_clock")]
+            {
+                self.count_anchor_cycle = 0;
+                self.count_fire_cycle = u64::MAX;
+            }
+            // compare_delta_slow/fast/unrecognized/prev deliberately NOT
+            // cleared here, matching the pre-hptimer calibration's own
+            // behavior: they're cheap-to-recheck learned state about the
+            // guest's tick rate, not per-boot state, and get re-verified (or
+            // replaced) on the next real Compare write regardless.
+            self.disarm_compare_timer();
             self.cp0_random = self.tlb_entries - 1;
             self.cp0_random_cycle = 0;
             #[cfg(not(feature = "r5k"))]
@@ -897,9 +974,9 @@ impl MipsCore {
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
             6 => self.cp0_wired as u64,
             8 => self.cp0_badvaddr,
-            9 => self.cp0_count >> 32,
+            9 => self.count_now() as u64,
             10 => self.cp0_entryhi,
-            11 => self.cp0_compare >> 32,
+            11 => self.cp0_compare,
             12 => self.cp0_status as u64,
             13 => self.cp0_cause as u64,
             14 => self.cp0_epc,
@@ -929,9 +1006,9 @@ impl MipsCore {
             5 => self.cp0_pagemask & 0x01FFE000,
             6 => self.cp0_wired as u64,
             8 => self.cp0_badvaddr,
-            9 => self.cp0_count >> 32,
+            9 => self.count_peek() as u64,
             10 => self.cp0_entryhi,
-            11 => self.cp0_compare >> 32,
+            11 => self.cp0_compare,
             12 => self.cp0_status as u64,
             13 => self.cp0_cause as u64,
             14 => self.cp0_epc,
@@ -950,53 +1027,308 @@ impl MipsCore {
         }
     }
 
-    /// Bin a CP0 Compare delta into a target tick period in nanoseconds
-    /// (1_000_000 for 1 kHz, 10_000_000 for 100 Hz).
+    /// Materialize the virtual CP0 Count: advance `cp0_count` by the whole
+    /// hardware ticks elapsed since the anchor at `count_hz`, move the anchor
+    /// forward by exactly the duration those ticks consumed (the sub-tick
+    /// remainder is preserved, so frequent reads don't drift the count slow),
+    /// and return the current 32-bit count.
     ///
-    /// `delta` may be in any consistent unit (e.g. raw 32.32 fixed-point) — only the
-    /// ratios between slow and fast buckets matter.  Maintains two learned buckets:
-    /// `compare_delta_slow` (100 Hz, seeded on first call) and `compare_delta_fast`
-    /// (~10x smaller, 1 kHz).  All comparisons use ±5% fuzzy equality.
-    /// Returns `Some(target_ns)` or `None` for a zero/degenerate delta.
-    fn bin_compare_delta(&mut self, d: u64) -> Option<u64> {
-        if d == 0 {
-            return None;
+    /// Memoized on `hot.cycles`: called twice within the same instruction it
+    /// returns the identical value (jitv2_lockstep runs the same instruction
+    /// on both engines and compares the resulting GPR state).
+    pub fn count_now(&mut self) -> u32 {
+        #[cfg(not(feature = "ci_clock"))]
+        if self.count_paused {
+            return self.cp0_count as u32;
         }
+        let cycles = self.hot.cycles;
+        if cycles == self.count_read_cycle {
+            return self.cp0_count as u32;
+        }
+        #[cfg(feature = "ci_clock")]
+        let elapsed_ns = cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
+        #[cfg(not(feature = "ci_clock"))]
+        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
+        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        if ticks != 0 {
+            let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
+            #[cfg(feature = "ci_clock")]
+            { self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE); }
+            #[cfg(not(feature = "ci_clock"))]
+            { self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns); }
+            self.cp0_count = (self.cp0_count as u32).wrapping_add(ticks as u32) as u64;
+        }
+        self.count_read_cycle = cycles;
+        self.cp0_count as u32
+    }
+
+    /// Non-mutating variant of `count_now` for debugger/monitor reads: same
+    /// computation, but neither the anchor nor the memo state moves.
+    pub fn count_peek(&self) -> u32 {
+        #[cfg(not(feature = "ci_clock"))]
+        if self.count_paused {
+            return self.cp0_count as u32;
+        }
+        #[cfg(feature = "ci_clock")]
+        let elapsed_ns = self.hot.cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
+        #[cfg(not(feature = "ci_clock"))]
+        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
+        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        (self.cp0_count as u32).wrapping_add(ticks as u32)
+    }
+
+    /// Infer `count_hz` from a Compare delta (hardware counts to the next
+    /// interrupt) by pattern only — never from real elapsed time. Real time
+    /// can't be used here: `count_hz` determines *when our own hptimer
+    /// fires* (`schedule_compare_timer`), which is what raises IP7, which is
+    /// what prompts the guest's clock handler to write the next Compare —
+    /// so measuring `count_hz` from the real interval between two Compare
+    /// writes would be measuring the effect of our own previous `count_hz`
+    /// guess, a circular dependency that can compound instead of converge
+    /// (a bad first guess skews the fire time, which skews the "measured"
+    /// interval, which re-skews count_hz). Same two-bucket model as the
+    /// pre-hptimer `bin_compare_delta`: a recognized slow tick is *assumed*
+    /// to mean 100 Hz, a recognized fast tick (~slow/10) 1 kHz, both with
+    /// ±5% fuzzy matching — `d` hw-counts spanning the bucket's assumed
+    /// period directly gives `count_hz = d / period`. An unrecognized delta
+    /// leaves `count_hz` alone unless it repeats (fuzzy-equal twice in a
+    /// row), which means the guest genuinely retuned its periodic tick, so
+    /// the slow bucket is re-seeded from it.
+    fn infer_count_hz(&mut self, d: u64) {
+        // A real 100 Hz/1 kHz periodic tick, at any plausible guest CPU
+        // clock (tens of MHz, Count = clock/2), spans at least tens of
+        // thousands of hardware counts even for the 1 kHz case. PROM runs
+        // short one-shot Compare writes before IRIX's own clock handler
+        // ever starts (diagnostic delays, early watchdogs, e.g. a live
+        // 58-count delta observed at boot) — trusting one of those as the
+        // *seed* for compare_delta_slow poisons every later classification
+        // (everything else gets fuzzy-matched against that bad baseline)
+        // until two future one-shots coincidentally match each other
+        // closely enough to force a re-seed. A rejected mid-stream (already
+        // seeded) delta isn't this fragile — it just falls through to
+        // compare_delta_unrecognized and gets another chance — so the floor
+        // only needs to guard the seed itself.
+        const MIN_PLAUSIBLE_TICK_DELTA: u64 = 10_000;
+        if self.compare_delta_slow == 0 && self.compare_delta_fast == 0 && d < MIN_PLAUSIBLE_TICK_DELTA {
+            return;
+        }
+
         // ±5% fuzzy equality.
         let fuzzy_eq = |a: u64, b: u64| -> bool {
             let threshold = a.max(b) * 5 / 100;
             a.abs_diff(b) <= threshold
         };
 
-        if self.compare_delta_slow == 0 {
-            // First delta ever — seed slow bucket, assume 100 Hz.
-            self.compare_delta_slow = d;
-            return Some(10_000_000);
-        }
-
-        if fuzzy_eq(d, self.compare_delta_slow) {
-            return Some(10_000_000);
-        }
-
-        if self.compare_delta_fast != 0 && fuzzy_eq(d, self.compare_delta_fast) {
-            return Some(1_000_000);
-        }
-
-        // Check if d ≈ slow/10 (i.e. ~10x smaller → fast tick).
-        // Use division to avoid overflow; guard ensures slow has a meaningful integer part.
-        if self.compare_delta_slow >= (10 << 32) && fuzzy_eq(d, self.compare_delta_slow / 10) {
+        let tick_ns: u64 = if self.compare_delta_slow == 0 && self.compare_delta_fast == 0 {
+            // First delta ever — no learned bucket to compare against, so
+            // classify by magnitude against the *default* 33 MHz Count rate
+            // instead of blindly assuming "first delta = slow (100 Hz)".
+            // That assumption is wrong whenever the guest's first Compare
+            // write we observe is already on the fast (1 kHz, ~33,000
+            // counts at 33 MHz) cadence — e.g. IRIX using only its 1 kHz
+            // scheduler tick this early in boot, nothing at 100 Hz yet —
+            // which mislabels a fast-tick delta as the slow bucket and
+            // computes count_hz an order of magnitude too low (a live
+            // ~32,900-count delta was seen classified as "100 Hz" giving
+            // ~3.29 MHz, when it's actually the 1 kHz tick giving the
+            // correct ~32.9 MHz). Midpoint between the two expected
+            // magnitudes (100 Hz≈330,000 / 1 kHz≈33,000 counts at 33 MHz)
+            // is ~180,000 — anything below that is presumed fast, at/above
+            // presumed slow.
+            const DEFAULT_FAST_SLOW_MIDPOINT: u64 = DEFAULT_COUNT_HZ / 1_000 * 5; // ~180,000 (5.5ms)
+            if d < DEFAULT_FAST_SLOW_MIDPOINT {
+                self.compare_delta_fast = d;
+                1_000_000
+            } else {
+                self.compare_delta_slow = d;
+                10_000_000
+            }
+        } else if self.compare_delta_slow != 0 && fuzzy_eq(d, self.compare_delta_slow) {
+            10_000_000
+        } else if self.compare_delta_fast != 0 && fuzzy_eq(d, self.compare_delta_fast) {
+            1_000_000
+        } else if self.compare_delta_slow >= 10 && fuzzy_eq(d, self.compare_delta_slow / 10) {
+            // ~10x smaller than slow → this is the fast tick; learn it.
             self.compare_delta_fast = d;
-            return Some(1_000_000);
-        }
-
-        if d > self.compare_delta_slow {
-            // Larger than slow — one-shot or low-freq timer; update slow bucket.
+            1_000_000
+        } else if self.compare_delta_fast != 0 && fuzzy_eq(d, self.compare_delta_fast.saturating_mul(10)) {
+            // ~10x bigger than the already-known fast tick → this is the
+            // slow tick; learn it. Symmetric case to the branch above, for
+            // when the fast bucket was seeded first (see the first-delta
+            // classification comment).
             self.compare_delta_slow = d;
-            Some(10_000_000)
+            10_000_000
+        } else if self.compare_delta_unrecognized != 0 && fuzzy_eq(d, self.compare_delta_unrecognized) {
+            // Second consecutive unrecognized delta of the same size: the
+            // guest switched its periodic tick. Re-seed — but classify by
+            // magnitude against the *other* still-known bucket (or the
+            // 33 MHz default midpoint if neither is known) rather than
+            // unconditionally assuming "re-seed = slow". Blindly stamping
+            // this into compare_delta_slow regardless of size was the same
+            // bug as the old first-delta seeding: a repeated fast-tick-sized
+            // one-shot (e.g. two similar deltas around a reset) got
+            // mislabeled as a retuned 100 Hz tick, wiping out a correctly
+            // learned compare_delta_fast and dragging count_hz an order of
+            // magnitude off (a live 32,950-count repeat did exactly this,
+            // landing count_hz at 3.29 MHz instead of ~33 MHz).
+            let other = if self.compare_delta_slow != 0 { self.compare_delta_slow }
+                        else if self.compare_delta_fast != 0 { self.compare_delta_fast * 10 }
+                        else { DEFAULT_COUNT_HZ / 1_000 * 5 }; // ~180,000, same midpoint as first-delta seeding
+            if d < other {
+                self.compare_delta_fast = d;
+                self.compare_delta_unrecognized = 0;
+                1_000_000
+            } else {
+                self.compare_delta_slow = d;
+                self.compare_delta_fast = 0;
+                self.compare_delta_unrecognized = 0;
+                10_000_000
+            }
         } else {
-            // Unrecognised intermediate — fall back to slow.
-            Some(10_000_000)
+            // One-shot or first sighting of a new interval — remember it and
+            // keep the current frequency.
+            self.compare_delta_unrecognized = d;
+            return;
+        };
+        self.compare_delta_unrecognized = 0;
+        // Recognized periodic tick: `d` hardware counts span `tick_ns` real ns.
+        let hz = d.saturating_mul(1_000_000_000) / tick_ns;
+        if hz != 0 {
+            self.count_hz = hz;
+            self.count_hz_atomic.store(hz, Ordering::Relaxed);
         }
+    }
+
+    /// (Re-)arm the Count==Compare interrupt for the current
+    /// `cp0_count`/`cp0_compare` values. Caller must have just materialized
+    /// the count (`count_now`) so the delta is measured from *now*.
+    ///
+    /// Real-time builds: removes the previous hptimer one-shot (a stale
+    /// generation in the manager's FIFO is skipped, so this is race-free)
+    /// and arms a fresh one whose callback ORs IP7 into `hot.interrupts` and
+    /// bumps `fasttick_count`. ci_clock builds: computes the deterministic
+    /// `hot.cycles` value the interrupt fires at instead — step()'s preamble
+    /// checks it.
+    fn schedule_compare_timer(&mut self) {
+        // Real MIPS Count==Compare semantics: IP7 fires when the free-running
+        // 32-bit Count becomes numerically equal to Compare. If Count is
+        // already past Compare at arm time (Compare written "in the past",
+        // or real elapsed time crept Count forward since the last read),
+        // that equality genuinely does not happen again until Count wraps
+        // through 0 and climbs back up to Compare — there is no "fire
+        // immediately because we're past it" on real hardware, so don't
+        // synthesize one here either. Unsigned wrapping_sub naturally gives
+        // that full-wrap distance for any "already passed" case, and the
+        // explicit 0 case (Compare == Count exactly) is the same "next
+        // match is a full wrap away" situation, not "now".
+        let delta = match (self.cp0_compare as u32).wrapping_sub(self.cp0_count as u32) as u64 {
+            0 => 1u64 << 32,
+            d => d,
+        };
+        let ns = ((delta as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
+        #[cfg(feature = "ci_clock")]
+        {
+            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
+        }
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            if self.count_paused {
+                // CPU is stopped: stay disarmed; on_cpu_start re-arms from
+                // the then-current count/compare.
+                return;
+            }
+            let Some(tm) = self.timer_mgr.as_ref() else { return };
+            if let Some(id) = self.timer_id.take() {
+                tm.remove(id);
+            }
+            let irq = TimerIrqPtr(&self.hot.interrupts as *const AtomicU64);
+            let fasttick = self.fasttick_count.clone();
+            // After firing, hardware would next match Compare again after a
+            // full 32-bit Count wrap — self-reschedule that far out. In
+            // practice the guest's interrupt handler writes Compare long
+            // before then, which re-arms through this function afresh.
+            let wrap = std::time::Duration::from_nanos(
+                (((1u128 << 32) * 1_000_000_000) / self.count_hz as u128) as u64,
+            );
+            self.timer_id = Some(tm.add_one_shot(
+                std::time::Duration::from_nanos(ns),
+                (irq, fasttick, wrap),
+                |(irq, fasttick, wrap)| {
+                    // SAFETY: points into the MipsCore owned by the executor's
+                    // top-level Arc<Mutex<..>>, which outlives the armed timer
+                    // (Drop for MipsCore removes it). Same contract as
+                    // Ioc::set_interrupts's stored pointer.
+                    unsafe { &*irq.0 }.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+                    fasttick.fetch_add(1, Ordering::Relaxed);
+                    crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
+                },
+            ));
+        }
+    }
+
+    /// Cancel any armed Count==Compare interrupt source.
+    fn disarm_compare_timer(&mut self) {
+        #[cfg(feature = "ci_clock")]
+        { self.count_fire_cycle = u64::MAX; }
+        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
+            tm.remove(id);
+        }
+    }
+
+    /// Wire the machine's hptimer manager in. Must be called after the core
+    /// has reached its final address (inside the executor's `Arc<Mutex<..>>`)
+    /// — the armed timer callback keeps a raw pointer to `hot.interrupts`.
+    pub fn set_timer_manager(&mut self, tm: Arc<crate::hptimer::TimerManager>) {
+        self.timer_mgr = Some(tm);
+    }
+
+    /// Re-anchor the virtual count at the current `cp0_count` value (after a
+    /// Count write or a snapshot restore that set it as a raw field) and
+    /// re-arm the compare timer against it. While the CPU is stopped
+    /// (`count_paused`) the timer stays silenced — `schedule_compare_timer`
+    /// itself refuses to arm — and `on_cpu_start` re-arms.
+    pub fn reanchor_count_and_reschedule(&mut self) {
+        self.count_read_cycle = self.hot.cycles;
+        #[cfg(feature = "ci_clock")]
+        { self.count_anchor_cycle = self.hot.cycles; }
+        #[cfg(not(feature = "ci_clock"))]
+        { self.count_anchor_instant = std::time::Instant::now(); }
+        self.schedule_compare_timer();
+    }
+
+    /// CPU thread is stopping: latch the virtual count at its current value
+    /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
+    /// debugger stepping) sees a frozen Count and never gets IP7 raised
+    /// underneath it (use the monitor's `ip7` command to inject one
+    /// manually). Idempotent. No-op semantics under ci_clock (count follows
+    /// `hot.cycles` there, which stops advancing on its own).
+    pub fn on_cpu_stop(&mut self) {
+        if self.count_paused {
+            return;
+        }
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            // Materialize directly, bypassing count_now's cycles memo —
+            // cycles may not have moved since the last read, but real time
+            // has.
+            let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
+            let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+            self.cp0_count = (self.cp0_count as u32).wrapping_add(ticks as u32) as u64;
+        }
+        self.count_read_cycle = self.hot.cycles;
+        self.count_paused = true;
+        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id) {
+            tm.disable(id);
+        }
+    }
+
+    /// CPU thread is starting: resume counting from the latched value (the
+    /// anchor restarts at now, so the stopped interval simply never
+    /// happened as far as the guest's Count is concerned) and re-arm the
+    /// compare timer against it.
+    pub fn on_cpu_start(&mut self) {
+        self.count_paused = false;
+        self.reanchor_count_and_reschedule();
     }
 
     /// Write CP0 register by index.
@@ -1018,101 +1350,62 @@ impl MipsCore {
                 self.cp0_random_cycle = self.hot.cycles;
             }
             8 => { /* BadVAddr is read-only */ }
-            9 => self.cp0_count = value << 32,
+            9 => {
+                // Re-anchor the virtual count at the written value and re-arm
+                // the compare timer against the moved count.
+                self.cp0_count = value as u32 as u64;
+                self.reanchor_count_and_reschedule();
+            }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
                 self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
             },
             11 => {
-                self.cp0_compare = value << 32;
-                // Clear timer interrupt when Compare is written
+                // Materialize the count *first* so both new_delta below and
+                // schedule_compare_timer arm/classify against the true
+                // current Count/Compare relationship, then arm the
+                // interrupt.
+                self.count_now();
+                self.cp0_compare = value as u32 as u64;
+                // Writing Compare acknowledges the timer interrupt: clear
+                // IP7 both in Cause and in the shared pending word (the
+                // step() preamble mirrors the pending word into Cause, so
+                // leaving the atomic bit set would immediately re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
+                self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
 
-                // Recalibrate count_step so the timer fires at the correct wall-clock rate.
-                // CP0 Count increments at half the CPU clock (R4400: Count = CPU_clock / 2),
-                // so nominal step = 1<<15 (0.5 hardware counts per emulated instruction).
-                // Formula: count_step = delta * dt_ns / (dc * 1_000_000)
-                //   delta = count units to next compare (what the kernel programmed)
-                //   dc    = instructions executed in last interval
-                //   dt_ns = ns elapsed in last interval
-                // = (count units per instruction) * (rate-stretch factor)
-                // Only calibrate for ~1ms timer intervals (IRIX 1000 Hz scheduler);
-                // leave count_step unchanged for other timer uses (one-shot, low-freq).
-                //
-                // Two clock sources, gated by `ci_clock`:
-                //   default (interactive desktop): dt_ns from host `Instant::now()`,
-                //     so the guest timer tracks real wall-clock. Sensitive to host
-                //     scheduling jitter, but that's the price of a real-time desktop.
-                //   --features ci_clock: dt_ns = dc * 10 ns (synthetic R4400 ~100 MIPS).
-                //     Decouples guest-perceived time from host scheduling so the Phase
-                //     3.3 snapshot determinism validator passes at any N. Tradeoff: a
-                //     CI run that takes 5 host minutes may present as 30 guest minutes
-                //     depending on host MIPS — exactly what reproducible CI wants.
-                #[cfg(feature = "ci_clock")]
-                const NS_PER_GUEST_CYCLE: u64 = 10;
-                #[cfg(not(feature = "ci_clock"))]
-                let now = std::time::Instant::now();
-                let cycles_now = self.hot.cycles;
-                // Compute new_delta before the calibration block so we can guard on it.
-                // Top bit set means cp0_count > cp0_compare — counter hasn't wrapped correctly
-                // or the kernel is writing a compare in the past. Skip calibration entirely.
-                let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
-                if new_delta >> 63 != 0 {
-                    self.compare_last_cycles = cycles_now;
-                    #[cfg(not(feature = "ci_clock"))]
-                    { self.compare_last_instant = now; }
-                } else if self.compare_last_cycles != 0 {
-                    let dc = cycles_now.wrapping_sub(self.compare_last_cycles);
-                    #[cfg(feature = "ci_clock")]
-                    let dt_ns = dc.saturating_mul(NS_PER_GUEST_CYCLE);
-                    #[cfg(not(feature = "ci_clock"))]
-                    let dt_ns = now.duration_since(self.compare_last_instant).as_nanos() as u64;
-                    // new_delta: what the *next* interval will fire at, stored as 32.32 fp.
-                    #[cfg(feature = "developer_ip7")]
-                    {
-                        let bucket = ((new_delta >> 32) as u32 / 100) * 100;
-                        *self.compare_delta_stats.entry(bucket).or_insert(0) += 1;
-                    }
-                    // dt_ns/dc measure the interval since the last Compare write, which
-                    // ran under compare_delta_prev.  Calibrate against that, not new_delta,
-                    // so a tick-rate switch doesn't mix old timing with the new delta.
-                    // If there was no previous delta (first write after reset), skip.
-                    let prev_delta = self.compare_delta_prev;
-                    if prev_delta != 0 && dt_ns > 0 {
-                        // Directly measured hw-count units per real ns — no bucket-snapping
-                        // or "assume 100 Hz" involved, unlike compare_delta_slow/fast.
-                        self.hw_per_ns = ((prev_delta as u128) / (dt_ns as u128)) as u64;
-                    }
-                    if prev_delta != 0 {
-                        if let Some(snapped_ns) = self.bin_compare_delta(prev_delta) {
-                            if dc > 0 {
-                                let denom = (dc as u128).saturating_mul(snapped_ns.into());
-                                self.count_step = ((prev_delta as u128).saturating_mul(dt_ns.into()) / denom)
-                                    .clamp(1 << 30, 10 << 31) as u64;
-                                #[cfg(feature = "developer_ip7")]
-                                {
-                                    let total_samples: u32 = self.compare_delta_stats.values().sum();
-                                    if total_samples <= 10 {
-                                        eprintln!("compare calib: prev_d={} new_d={} dt_ns={} dc={} \
-                                            snapped={}ms slow={} fast={} count_step={}",
-                                            prev_delta >> 32, new_delta >> 32, dt_ns, dc,
-                                            snapped_ns / 1_000_000,
-                                            self.compare_delta_slow >> 32,
-                                            self.compare_delta_fast >> 32,
-                                            self.count_step);
-                                    }
-                                }
-                            } else {
-                                self.count_step = 1 << 31;
-                            }
-                            self.count_step_atomic.store(self.count_step, Ordering::Relaxed);
-                        }
-                    }
-                    self.compare_delta_prev = new_delta;
+                // new_delta is this write's own Compare-minus-Count — what
+                // the guest is asking to wait *starting now*, not yet lived
+                // through. Classify compare_delta_prev instead: the delta
+                // programmed on the *previous* write, which the guest just
+                // finished actually waiting out (the interval that just
+                // elapsed really did contain that many hw-counts, since IP7
+                // firing is what prompted this write) — matches the
+                // pre-hptimer calibration's own `compare_delta_prev`/
+                // `bin_compare_delta(prev_delta)` shape exactly. Classifying
+                // new_delta instead would be judging an interval before it's
+                // happened. Pure pattern matching on magnitude in
+                // infer_count_hz, never real elapsed time — count_hz decides
+                // when our own hptimer fires (schedule_compare_timer below),
+                // so measuring real time between Compare writes would be
+                // circular with our own previous count_hz guess.
+                let new_delta = (self.cp0_compare as u32).wrapping_sub(self.cp0_count as u32);
+                #[cfg(feature = "developer_ip7")]
+                {
+                    let bucket = (new_delta / 100) * 100;
+                    *self.compare_delta_stats.entry(bucket).or_insert(0) += 1;
                 }
-                // First write: keep default count_step (1<<15), just record state.
-                self.compare_last_cycles = cycles_now;
-                #[cfg(not(feature = "ci_clock"))]
-                { self.compare_last_instant = now; }
+                if self.compare_delta_prev != 0 {
+                    self.infer_count_hz(self.compare_delta_prev);
+                }
+                // Top bit set means this write's own Compare is already
+                // behind Count (written "in the past", or Count/Compare are
+                // unrelated one-shots the guest isn't using periodically) —
+                // don't carry a meaningless negative interval forward as
+                // the next write's classification input; treat it like "no
+                // previous write yet" instead of poisoning that round too.
+                self.compare_delta_prev = if new_delta >> 31 == 0 { new_delta as u64 } else { 0 };
+
+                self.schedule_compare_timer();
             }
             12 => {
                 let old = self.cp0_status;

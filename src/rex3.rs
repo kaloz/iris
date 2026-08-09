@@ -1228,10 +1228,10 @@ pub struct Rex3 {
     pub screenshot_pending: AtomicBool,
     /// Monotonically incrementing screenshot counter for unique filenames.
     pub screenshot_counter: AtomicU32,
-    /// Atomic shadow of MipsCore::count_step — updated by CPU thread, read by refresh thread.
+    /// Atomic shadow of MipsCore::count_hz — updated by CPU thread, read by refresh thread.
     /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
     #[cfg(feature = "developer")]
-    pub count_step_atomic: Mutex<Arc<AtomicU64>>,
+    pub count_hz_atomic: Mutex<Arc<AtomicU64>>,
 }
 
 unsafe impl Sync for Rex3 {}
@@ -1354,7 +1354,7 @@ impl Rex3 {
             screenshot_pending: AtomicBool::new(false),
             screenshot_counter: AtomicU32::new(0),
             #[cfg(feature = "developer")]
-            count_step_atomic: Mutex::new(Arc::new(AtomicU64::new(1 << 15))),
+            count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::mips_core::DEFAULT_COUNT_HZ))),
         }
     }
 
@@ -1481,8 +1481,8 @@ impl Rex3 {
     }
 
     #[cfg(feature = "developer")]
-    pub fn set_count_step_atomic(&self, arc: Arc<AtomicU64>) {
-        *self.count_step_atomic.lock() = arc;
+    pub fn set_count_hz_atomic(&self, arc: Arc<AtomicU64>) {
+        *self.count_hz_atomic.lock() = arc;
     }
 
     /// Wire up the CPU cycle counter — called from `Machine::new` once
@@ -3879,9 +3879,9 @@ impl Rex3 {
                 #[cfg(not(feature = "developer"))]
                 uncached:     0,
                 #[cfg(feature = "developer")]
-                count_step:   self.count_step_atomic.lock().load(Ordering::Relaxed),
+                count_hz:     self.count_hz_atomic.lock().load(Ordering::Relaxed),
                 #[cfg(not(feature = "developer"))]
-                count_step:   0,
+                count_hz:     0,
                 gfifo_pending: self.gfifo.len(),
             };
 

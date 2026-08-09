@@ -85,6 +85,10 @@ impl CpuRollbackSnapshot {
         exec.core.delay_slot_target = self.delay_slot_target;
         exec.cached_pending    = self.cached_pending;
         exec.tlb.restore_from_mips_tlb(&self.tlb);
+        // cp0_count/cp0_compare were restored as raw fields — re-anchor the
+        // virtual count at the restored value and re-arm the compare timer
+        // so the block's own Count reads/Compare writes leave no residue.
+        exec.core.reanchor_count_and_reschedule();
     }
 
     /// Compare GPRs between snapshot and current state.

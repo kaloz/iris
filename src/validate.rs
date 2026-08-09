@@ -154,7 +154,7 @@ pub struct JitDeterminismReport {
 ///
 /// `skip`: once a divergence at instruction N has been manually inspected
 /// and confirmed benign (e.g. a known, already-understood modeling gap —
-/// `cp0_count`/`count_step` themselves never count as divergences here at
+/// `cp0_count`/`count_hz` themselves never count as divergences here at
 /// all, see below, but there can be others), re-running with `skip >= 1`
 /// reconverges past that *specific* one (restores the reference pass's
 /// register/cop0 state at that exact point) and keeps comparing, so it
@@ -265,7 +265,7 @@ pub fn validate_jit_determinism(
         let upcoming = digests.get(pos_b as usize).unwrap_or(&state_final);
         machine.cpu_set_hw_read_fixup_replay(Some(upcoming.hw_reads.clone()))?;
 
-        // Resync cp0_count/count_step to the reference's own PRE-step
+        // Resync cp0_count/count_hz to the reference's own PRE-step
         // values before each step attempt (not just after, per-instruction,
         // the way this used to work). `before_step` — NOT `upcoming`, which
         // is the state AFTER this step (digests[pos_b], correctly used above
@@ -285,7 +285,7 @@ pub fn validate_jit_determinism(
         // between the two passes on literally the second instruction ever
         // compared.
         //
-        // cp0_count/count_step are deliberately excluded from the diff
+        // cp0_count/count_hz are deliberately excluded from the diff
         // below (unlike validate_snapshot_determinism's use of the same
         // `diff`, where both passes replay the identical instruction stream
         // against the identical host-timing calibration and matching is a
@@ -361,7 +361,7 @@ pub fn validate_jit_determinism(
         machine.cpu_fixup_cp0_count(expected)?;
 
         let diffs: Vec<_> = expected.diff(&replay_digest).into_iter()
-            .filter(|(field, _, _)| field != "cp0_count" && field != "count_step")
+            .filter(|(field, _, _)| field != "cp0_count" && field != "count_hz")
             .collect();
         if !diffs.is_empty() {
             let divergence = JitDivergence { instruction: pos_b, replay_pc: replay_digest.pc, diffs };

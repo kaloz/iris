@@ -598,9 +598,17 @@ impl Machine {
         // Re-sync raw pointers after Arc injection (the Arcs above replaced the ones captured in new()).
         executor.rebind_atomic_ptrs();
 
-        // Share count_step_atomic from MipsCore with Rex3 so the refresh thread can display it.
+        // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
-        if let Some(rex3) = &phys.rex3 { rex3.set_count_step_atomic(Arc::clone(&executor.core.count_step_atomic)); }
+        if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(Arc::clone(&executor.core.count_hz_atomic)); }
+
+        // Give the core the machine's hptimer manager: CP0 Compare writes
+        // arm a one-shot on it that raises IP7 from the timer thread. Safe
+        // to hand over before the move into MipsCpu below — nothing gets
+        // armed (no raw pointer captured) until the CPU actually executes a
+        // Compare write, by which time the core sits at its final address
+        // inside the executor's Arc<Mutex<..>>.
+        executor.core.set_timer_manager(timer_manager.clone());
 
         let cpu = Arc::new(MipsCpu::new(executor));
 
@@ -1084,7 +1092,7 @@ impl Machine {
         self.cpu.restore_state_digest(digest)
     }
 
-    /// Force `cp0_count`/`count_step` to a reference digest's values — see
+    /// Force `cp0_count`/`count_hz` to a reference digest's values — see
     /// `MipsCpu::fixup_cp0_count`'s doc comment.
     #[cfg(feature = "developer")]
     pub fn cpu_fixup_cp0_count(&self, digest: &crate::mips_exec::CpuStateDigest) -> Result<(), String> {

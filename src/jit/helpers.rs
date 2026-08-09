@@ -173,13 +173,11 @@ pub extern "C" fn jit_interp_one_step<T: Tlb, C: MipsCache>(
 // ─── CP0 helpers ─────────────────────────────────────────────────────────────
 
 /// MFC0: read CP0 register `rd` as 32-bit sign-extended to 64.
-/// Random (rd=1) depends on cycle count; flush before read.
 pub extern "C" fn jit_mfc0<T: Tlb, C: MipsCache>(
     _ctx_ptr: *mut JitContext, exec_ptr: *mut u8, rd: u64,
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let rd_u32 = rd as u32;
-    if rd_u32 == 1 { exec.flush_cycles(); }
     let v = exec.core.read_cp0(rd_u32);
     // sign-extend 32→64 to match interpreter exec_mfc0
     v as u32 as i32 as i64 as u64
@@ -191,7 +189,6 @@ pub extern "C" fn jit_dmfc0<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let rd_u32 = rd as u32;
-    if rd_u32 == 1 { exec.flush_cycles(); }
     exec.core.read_cp0(rd_u32)
 }
 
