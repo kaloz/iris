@@ -66,6 +66,15 @@ pub struct PagedArenaState {
     /// Sum of every segment's reserved length (`Segment::len`), always a
     /// multiple of the host page size.
     reserved_bytes: AtomicU64,
+    /// The arena's real (hugepage-aligned, on Linux) base address and total
+    /// reserved length — written once, by `new_with_size`, before the
+    /// provider is ever handed to `JITModule`; read-only from then on (no
+    /// `Ordering` subtlety needed beyond Relaxed — this is set-once-then-frozen,
+    /// not a value that changes concurrently with reads). `j2 hugepages`
+    /// (`developer` only) uses this to scope its `/proc/self/smaps`
+    /// `AnonHugePages` query to exactly this arena's address range.
+    arena_ptr: AtomicU64,
+    arena_len: AtomicU64,
 }
 
 impl PagedArenaState {
@@ -77,12 +86,125 @@ impl PagedArenaState {
     pub fn packing_stats(&self) -> (u64, u64) {
         (self.used_bytes.load(Ordering::Relaxed), self.reserved_bytes.load(Ordering::Relaxed))
     }
+
+    /// `(base_address, len)` of the arena's real (possibly hugepage-aligned)
+    /// reservation — `(0, 0)` before `new_with_size` has run. Dev diagnostic
+    /// only (`j2 hugepages`); nothing on the hot compile path reads this.
+    #[cfg(feature = "developer")]
+    pub fn arena_range(&self) -> (u64, u64) {
+        (self.arena_ptr.load(Ordering::Relaxed), self.arena_len.load(Ordering::Relaxed))
+    }
 }
 
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (addr + align - 1) & !(align - 1)
 }
+
+/// Transparent-hugepage size this arena aligns/collapses against — 2MiB, the
+/// standard THP size on Linux (the only OS any of this hugepage machinery
+/// runs on at all — see this constant's `#[cfg]`: Windows has no madvise or
+/// THP concept, large pages there require `MEM_LARGE_PAGES` +
+/// `SeLockMemoryPrivilege` at allocation time, a different mechanism
+/// entirely; macOS has no public THP/superpage API on Apple Silicon, and the
+/// old x86 `VM_FLAGS_SUPERPAGE_SIZE_2MB` is dead). Not queried at runtime
+/// (the real value lives in
+/// `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`, a file read neither
+/// `region` nor `libc` wrap) — 2MiB is correct for both mainstream Linux
+/// hugepage-capable architectures (x86_64, aarch64) this project ships on;
+/// every operation below is advisory (`madvise` failures are logged, never
+/// fatal) and alignment only wastes a little reserved-but-unused address
+/// space if that ever stops being true, never incorrect behavior.
+#[cfg(target_os = "linux")]
+const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Best-effort `madvise(MADV_HUGEPAGE)` over the whole reservation, called
+/// once right after `region::alloc` — asks the kernel to prefer backing this
+/// VMA with transparent hugepages as it gets populated (khugepaged can also
+/// promote it later without this, but async promotion can take a scan cycle
+/// or more to kick in; asking upfront means a freshly-compiled hot function
+/// doesn't have to wait for that). Purely advisory: failure is logged once
+/// and otherwise ignored — this is a throughput optimization, never a
+/// correctness requirement, and the arena works identically (just without
+/// the TLB-pressure benefit) if the kernel declines or the platform lacks
+/// `MADV_HUGEPAGE` entirely (see the `#[cfg]` gate on this whole family of
+/// functions).
+#[cfg(target_os = "linux")]
+fn madvise_hugepage(ptr: *mut u8, len: usize) {
+    let rc = unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
+    if rc != 0 {
+        eprintln!("jitv2: madvise(MADV_HUGEPAGE) failed on paged arena reservation: {}", std::io::Error::last_os_error());
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn madvise_hugepage(_ptr: *mut u8, _len: usize) {}
+
+/// Best-effort `madvise(MADV_COLLAPSE)` over `[ptr, ptr+len)`, which must
+/// already be hugepage-aligned and hugepage-sized (caller's responsibility —
+/// see `PagedArenaMemoryProvider::advance_hugepage_collapse_watermark`, the
+/// only caller). Unlike `MADV_HUGEPAGE` (a standing preference the kernel
+/// acts on lazily, via khugepaged's background scanner), `MADV_COLLAPSE`
+/// (Linux 6.1+) synchronously compacts the region into a hugepage right now
+/// — worth paying for once a region is fully written and sealed (RX,
+/// finalized) rather than waiting for khugepaged's own schedule, which is
+/// tuned for general workloads, not "this code just got hot, please collapse
+/// it immediately." Best-effort: a kernel without `MADV_COLLAPSE` support
+/// (pre-6.1) returns `ENOSYS`/`EINVAL`, silently ignored — no version probe
+/// needed, the syscall's own failure path is the probe.
+#[cfg(target_os = "linux")]
+fn madvise_collapse(ptr: *mut u8, len: usize) {
+    let _ = unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_COLLAPSE) };
+}
+#[cfg(not(target_os = "linux"))]
+fn madvise_collapse(_ptr: *mut u8, _len: usize) {}
+
+/// Dev diagnostic (`j2 hugepages`): sum the `AnonHugePages:` field of every
+/// `/proc/self/smaps` VMA entry that falls (even partially) within
+/// `[range_start, range_start+range_len)`. Lets a live run confirm THP is
+/// actually landing on the JIT arena, rather than assuming `MADV_HUGEPAGE`/
+/// `MADV_COLLAPSE` succeeded from their own (best-effort, silently-ignored)
+/// return codes alone — a host with `transparent_hugepage=never` in sysfs,
+/// or a container/cgroup that disables THP, makes every `madvise` call here
+/// a silent no-op, and this is the only way short of external tooling
+/// (`grep AnonHugePages /proc/<pid>/smaps`) to notice that's happening
+/// before it shows up as an unexplained iTLB-miss regression.
+///
+/// smaps format per VMA: a header line (`<start>-<end> <perms> ...`)
+/// followed by indented `Key:    N kB` lines until the next header. Only
+/// `AnonHugePages` is summed; every other field is skipped. Returns `None`
+/// if `/proc/self/smaps` can't be opened/read at all (containerized/
+/// sandboxed environments sometimes restrict it) — the caller reports that
+/// as "unavailable," not as "0 hugepages," since those mean different things.
+#[cfg(all(target_os = "linux", feature = "developer"))]
+pub fn anon_hugepages_in_range(range_start: u64, range_len: u64) -> Option<u64> {
+    let range_end = range_start + range_len;
+    let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut total_kb: u64 = 0;
+    let mut in_range = false;
+    for line in smaps.lines() {
+        if let Some((addrs, _rest)) = line.split_once(' ') {
+            if let Some((start_hex, end_hex)) = addrs.split_once('-') {
+                if let (Ok(start), Ok(end)) = (u64::from_str_radix(start_hex, 16), u64::from_str_radix(end_hex, 16)) {
+                    // A real smaps header line always parses both halves as
+                    // hex; anything that doesn't (an indented "Key: N kB"
+                    // line) falls through to the `else` below instead.
+                    in_range = start < range_end && end > range_start;
+                    continue;
+                }
+            }
+        }
+        if in_range {
+            if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+                if let Some(kb) = rest.trim().strip_suffix(" kB").and_then(|n| n.trim().parse::<u64>().ok()) {
+                    total_kb += kb;
+                }
+            }
+        }
+    }
+    Some(total_kb * 1024)
+}
+#[cfg(not(all(target_os = "linux", feature = "developer")))]
+pub fn anon_hugepages_in_range(_range_start: u64, _range_len: u64) -> Option<u64> { None }
 
 /// Port of `cranelift_jit::memory::set_readable_and_executable` — `pub(crate)`
 /// in that crate, so not reachable from here; duplicated verbatim rather than
@@ -181,6 +303,16 @@ pub struct PagedArenaMemoryProvider {
     size: usize,
     position: usize,
     segments: Vec<Segment>,
+    /// How much of `[ptr, ptr+size)` has already been `MADV_COLLAPSE`d, as a
+    /// byte offset from `ptr` — always a multiple of `HUGE_PAGE_SIZE` (or 0
+    /// on a platform without hugepage support, where it never advances).
+    /// Monotonic: `finalize()` is the only writer, advancing it by whole
+    /// hugepage-sized steps as segments seal past each boundary — see
+    /// `advance_hugepage_collapse_watermark`. Segments are allocated
+    /// contiguously (`self.position` only ever grows, `allocate_segment`
+    /// always places the next segment right after the last), so a single
+    /// watermark is sufficient — there are never gaps to track separately.
+    collapsed_up_to: usize,
     /// Shared with whoever constructed this provider (`Codegen`) — see
     /// `PagedArenaState`'s own doc comment for why this indirection exists
     /// (`JITModule` takes ownership of the provider as an opaque boxed trait
@@ -193,17 +325,81 @@ unsafe impl Send for PagedArenaMemoryProvider {}
 impl PagedArenaMemoryProvider {
     pub fn new_with_size(reserve_size: usize, state: Arc<PagedArenaState>) -> Result<Self, region::Error> {
         let size = align_up(reserve_size, region::page::size());
-        let mut alloc = region::alloc(size, region::Protection::NONE)?;
-        let ptr = alloc.as_mut_ptr();
+        // Over-reserve by one extra hugepage and use the hugepage-aligned
+        // address within that larger mapping as the arena's real base — the
+        // padding before/after is virtual address space only (still
+        // PROT_NONE / never touched), never physically backed, so this
+        // costs nothing but address space. `region::alloc` gives no
+        // alignment control of its own (a plain `mmap(NULL, size, ...)`
+        // under the hood — kernel picks a page-aligned but not necessarily
+        // hugepage-aligned base), so this is the standard way to get a
+        // hugepage-aligned region through it. `self.alloc` keeps the
+        // *original*, untrimmed `Allocation` for correct freeing (its
+        // `Drop` frees by its own stored base/size, unaffected by what
+        // `self.ptr` below points at) — only `self.ptr`/`self.size` (what
+        // segments actually get carved out of) are the aligned sub-region.
+        // On a platform with no hugepage support (HUGE_PAGE_SIZE undefined),
+        // this degenerates to exactly the old unaligned behavior.
+        #[cfg(target_os = "linux")]
+        let (mut alloc, ptr, size) = {
+            let over_reserved = size + HUGE_PAGE_SIZE;
+            let mut alloc = region::alloc(over_reserved, region::Protection::NONE)?;
+            let base = alloc.as_mut_ptr::<u8>() as usize;
+            let aligned = align_up(base, HUGE_PAGE_SIZE);
+            (alloc, aligned as *mut u8, size)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (mut alloc, ptr, size) = {
+            let alloc = region::alloc(size, region::Protection::NONE)?;
+            let ptr = alloc.as_ptr::<u8>() as *mut u8;
+            (alloc, ptr, size)
+        };
+        let _ = &mut alloc; // silence unused_mut when the aligned-address branch doesn't need it
+        madvise_hugepage(ptr, size);
+        #[cfg(feature = "developer")]
+        {
+            state.arena_ptr.store(ptr as u64, Ordering::Relaxed);
+            state.arena_len.store(size as u64, Ordering::Relaxed);
+        }
         Ok(Self {
             alloc: ManuallyDrop::new(Some(alloc)),
             segments: Vec::new(),
             ptr,
             size,
             position: 0,
+            collapsed_up_to: 0,
             state,
         })
     }
+
+    /// Called from `finalize()` after every segment in the batch has been
+    /// flipped RW->RX: `MADV_COLLAPSE` every hugepage-sized region that has
+    /// now become fully sealed (every byte in it belongs to some finalized
+    /// segment) since the last call, advancing `collapsed_up_to`. Never
+    /// touches the region past the last *finalized* segment's end — the
+    /// arena's own bump cursor (`self.position`) can extend further if a
+    /// not-yet-finalized segment already claimed address space beyond it,
+    /// and collapsing memory that's still being actively written by
+    /// Cranelift (RW, mid-compile) would be both wasted work (it'll just get
+    /// split again on the next write past a THP boundary) and pointless
+    /// (the whole point is compacting *finished*, stable code).
+    #[cfg(target_os = "linux")]
+    fn advance_hugepage_collapse_watermark(&mut self) {
+        let finalized_end = self.segments.iter()
+            .filter(|s| s.finalized)
+            .map(|s| (s.ptr as usize - self.ptr as usize) + s.len)
+            .max()
+            .unwrap_or(0);
+        let target = (finalized_end / HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE; // round DOWN — only whole, fully-sealed hugepages
+        if target > self.collapsed_up_to {
+            let len = target - self.collapsed_up_to;
+            let region_ptr = unsafe { self.ptr.add(self.collapsed_up_to) };
+            madvise_collapse(region_ptr, len);
+            self.collapsed_up_to = target;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn advance_hugepage_collapse_watermark(&mut self) {}
 
     fn record_packing(&self) {
         // Recomputed from scratch (sum across all segments) rather than
@@ -271,6 +467,7 @@ impl PagedArenaMemoryProvider {
         for segment in &mut self.segments {
             segment.finalize(branch_protection);
         }
+        self.advance_hugepage_collapse_watermark();
         wasmtime_jit_icache_coherence::pipeline_flush_mt().expect("Failed pipeline flush");
     }
 
@@ -401,5 +598,51 @@ mod tests {
         let (mut arena, _state) = new_arena(1 << 20);
         arena.allocate(900_000, 1, JITMemoryKind::Executable).unwrap();
         assert!(arena.allocate(200_000, 1, JITMemoryKind::Executable).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn arena_base_is_hugepage_aligned() {
+        // The whole point of over-reserving by one extra hugepage in
+        // new_with_size — see its own doc comment. Every segment is carved
+        // out of self.ptr, so if this holds, every segment's own address is
+        // automatically hugepage-aligned too (segments are 4KiB-page
+        // multiples, which divide evenly into a 2MiB-aligned base).
+        let (arena, _state) = new_arena(1 << 20);
+        assert_eq!(arena.ptr as usize % HUGE_PAGE_SIZE, 0, "arena base must be hugepage-aligned");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn collapse_watermark_advances_only_past_fully_finalized_hugepages() {
+        // Arena big enough to span more than one hugepage, so we can prove
+        // the watermark tracks real boundaries rather than always being 0 or
+        // always being everything.
+        let (mut arena, _state) = new_arena(HUGE_PAGE_SIZE * 3);
+
+        // Fill and finalize enough small segments to cross the first
+        // hugepage boundary, but stop partway into the second — the
+        // watermark must advance exactly one hugepage's worth, not more (the
+        // still-open, not-yet-finalized segment past the boundary must never
+        // be counted as "sealed").
+        let chunk = region::page::size();
+        let mut bytes_allocated = 0usize;
+        while bytes_allocated < HUGE_PAGE_SIZE + chunk {
+            arena.allocate(chunk, 16, JITMemoryKind::Executable).unwrap();
+            arena.finalize(BranchProtection::None); // seals the growing segment each time, forcing the next allocate() to start a fresh one
+            bytes_allocated += align_up(chunk, region::page::size());
+        }
+
+        assert_eq!(arena.collapsed_up_to, HUGE_PAGE_SIZE,
+            "watermark must advance exactly one whole hugepage once that much has been finalized, not the partial second hugepage too");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn collapse_watermark_does_not_advance_below_one_hugepage() {
+        let (mut arena, _state) = new_arena(1 << 20);
+        arena.allocate(64, 16, JITMemoryKind::Executable).unwrap();
+        arena.finalize(BranchProtection::None);
+        assert_eq!(arena.collapsed_up_to, 0, "a single small finalized segment must not advance the watermark -- it's nowhere near a full hugepage");
     }
 }

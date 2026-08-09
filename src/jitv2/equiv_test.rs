@@ -88,19 +88,26 @@ mod tests {
         magic_responses: Mutex<std::collections::VecDeque<(u32, u32)>>, // (status, data)
         #[cfg(feature = "jitv2")]
         gens: Mutex<std::collections::HashMap<u32, Box<AtomicU64>>>,
-        /// When true, `gen_ptr` always returns null (`is_compilable() ==
-        /// false` for every page backed by this memory — see
-        /// `PhysicalCodePage::is_compilable`), so every jitv2 dispatch gate
+        /// When true, `seeded_executor_over` pre-claims and permanently
+        /// denylists (`PhysicalCodePage::denylist_all`) pc's own physical
+        /// page, and disables every `jitv2_lockstep` class
+        /// (`lockstep_enabled.{alu,branch,load_store,fpu} = false`), right
+        /// after constructing the executor — so every jitv2 dispatch gate
         /// variant (real/inline/lockstep) falls straight through to the
         /// interpreter unconditionally, regardless of which jitv2 feature is
-        /// compiled in. Needed by harnesses like `run_interpreter_page` whose
-        /// dispatch-count arithmetic assumes exactly one instruction retires
-        /// per `exec()` call — a real jitv2 gate is free to redispatch a
-        /// compiled multi-instruction region on a later call, which would
-        /// silently break that count once a real compile actually landed in
-        /// time (previously only ever true by luck, since the async compile
-        /// thread rarely won the race within these short loops — see
-        /// rules/jitv2/codegen-gotchas.md).
+        /// compiled in. Both are needed: `denylist_all` blocks the real
+        /// (async/inline) dispatch gate, but `jitv2_lockstep`'s
+        /// `lockstep_check` deliberately bypasses page state entirely (never
+        /// touches publish/entries/ENTRY_DENYLISTED — see its own doc comment)
+        /// so it can intercept a word before it's ever compiled; only the
+        /// executor-level switch stops it. Needed by harnesses like
+        /// `run_interpreter_page` whose dispatch-count arithmetic assumes
+        /// exactly one instruction retires per `exec()` call — a real jitv2
+        /// gate is free to redispatch a compiled multi-instruction region on
+        /// a later call, which would silently break that count once a real
+        /// compile actually landed in time (previously only ever true by
+        /// luck, since the async compile thread rarely won the race within
+        /// these short loops — see rules/jitv2/codegen-gotchas.md).
         #[cfg(feature = "jitv2")]
         no_jitv2: bool,
     }
@@ -202,6 +209,11 @@ mod tests {
         }
         #[cfg(feature = "jitv2")]
         fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+            // Real enforcement of no_jitv2 is seeded_executor_over's
+            // denylist_all() call, not this null return (a null gen_ptr no
+            // longer means "not dispatchable" — see the no_jitv2 field's own
+            // doc comment) — kept null here anyway since it's still
+            // factually true that this device has no real gen tracking.
             if self.no_jitv2 {
                 return std::ptr::null();
             }
@@ -260,6 +272,40 @@ mod tests {
         exec.core.count_step = 0;
         exec.core.cp0_compare = u64::MAX;
         exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        // no_jitv2 (MockMemory::new_not_compilable's doc comment): pre-claim
+        // pc's own physical page and denylist every offset on it right here,
+        // in the test setup, rather than relying on gen_ptr returning null
+        // to imply "never compilable" — that inference doesn't hold anymore
+        // (PhysicalCodePage::gen is never null; a null gen_ptr just means
+        // "use the shared, never-bumped fallback counter", not "never
+        // dispatchable" — see NEVER_COMPILABLE_GEN's doc comment). Denylisting
+        // every offset is the real, still-current mechanism for "this page
+        // must never compile/dispatch, everything runs on the interpreter".
+        #[cfg(feature = "jitv2")]
+        if mem.no_jitv2 {
+            let phys_base = (pc as u32) & 0x1FFF_FFFF & !(PAGE_SIZE as u32 - 1);
+            let pfn = phys_base / PAGE_SIZE;
+            let mut jit = exec.jitv2.lock();
+            let slot = jit.page_for(pfn, phys_base, exec.sysad.as_ref())
+                .expect("fresh Jitv2 pool must have room for one page");
+            unsafe { (*jit.page_ptr(slot)).denylist_all(); }
+            drop(jit);
+            // denylist_all only blocks the real (async/inline) dispatch
+            // gate — jitv2_lockstep's lockstep_check deliberately bypasses
+            // page state entirely (never touches publish/entries/ENTRY_DENYLISTED,
+            // see its own doc comment) so it can intercept a word before it's
+            // ever compiled; nothing but this executor-level switch stops it
+            // from compiling and running this exact instruction with no
+            // handle_exception_fn installed, which aborts the whole process
+            // the moment it raises an exception.
+            #[cfg(feature = "jitv2_lockstep")]
+            {
+                exec.lockstep_enabled.alu = false;
+                exec.lockstep_enabled.branch = false;
+                exec.lockstep_enabled.load_store = false;
+                exec.lockstep_enabled.fpu = false;
+            }
+        }
         (exec, mem)
     }
 
@@ -528,15 +574,15 @@ mod tests {
     /// caller that actually wants jitv2 involved (`run_jit_fpu` and the
     /// individual `jit_exec` sites) calls `install_jit_hooks` explicitly
     /// before touching a compiled function or `exec_decoded`, so whether
-    /// this executor's page reports `is_compilable()` makes no difference to
-    /// them — but the `interp_exec`/`run_interpreter_fpu` callers that never
-    /// install hooks would abort if a jitv2 gate variant ever intercepted
-    /// their plain `exec.exec()` call (as `jitv2_lockstep`'s `lockstep_check`
+    /// this executor's page is denylisted makes no difference to them — but
+    /// the `interp_exec`/`run_interpreter_fpu` callers that never install
+    /// hooks would abort if a jitv2 gate variant ever intercepted their
+    /// plain `exec.exec()` call (as `jitv2_lockstep`'s `lockstep_check`
     /// already does unconditionally for ALU ops, with FPU ops a natural next
     /// target — see `add_overflow_traps_and_matches_interpreter`'s
     /// pre-fix history in rules/jitv2/codegen-gotchas.md). Always
-    /// non-compilable, unconditionally, is simplest and safe for every
-    /// caller here.
+    /// denylisted, unconditionally, is simplest and safe for every caller
+    /// here.
     fn fpu_seeded_executor(gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
         let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
         exec.core.fpr = fpr;
@@ -3858,11 +3904,11 @@ mod tests {
         // core.interp_fallback_fn (emit_interp_fallback_exit), a real fetch+
         // decode+dispatch of whatever's actually at core.pc — it needs a
         // memory backend real fetch_instr can read from, same as any other
-        // interpreter dispatch, not the "always non-compilable" stub built
-        // only for tests that never leave the JIT (see that stub's own doc
-        // comment). is_compilable() itself is irrelevant to this path (only
-        // exec_decoded's JIT gate consults it) — this just needs page[] to
-        // be readable.
+        // interpreter dispatch, not the "always denylisted" stub built only
+        // for tests that never leave the JIT (see that stub's own doc
+        // comment). Whether the page is denylisted is irrelevant to this
+        // path (only exec_decoded's JIT gate consults it) — this just needs
+        // page[] to be readable.
         let (mut jit_exec, jit_mem) = seeded_executor_over(MockMemory::new(), [0u64; 32], pc);
         jit_exec.core.fpr = fpr;
         jit_exec.core.cp0_status = 0; // CU1 clear

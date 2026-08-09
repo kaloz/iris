@@ -105,7 +105,7 @@ pub fn handle_request(
     let page = unsafe { &*req.page };
     let offset = req.offset as usize;
 
-    // Clears `scheduled_bits`' bit for this offset on every return path,
+    // Clears this offset's ENTRY_SCHEDULED flag on every return path,
     // including early returns and panics — `exec_decoded`'s dispatch gate
     // (mips_exec.rs) sets this bit via `try_schedule` before sending a
     // request, specifically so a hot PC that keeps re-satisfying the gate's
@@ -133,7 +133,7 @@ pub fn handle_request(
     // lands between this read and the snapshot copy below is never missed:
     // worst case it's captured in the copy too, and publish's re-check
     // catches anything after.
-    let gen_snap = if page.is_compilable() { page.current_gen() } else { 0 };
+    let gen_snap = page.current_gen();
 
     let mut words = [0u32; ENTRIES_PER_PAGE];
     for (i, w) in words.iter_mut().enumerate() {
@@ -161,7 +161,7 @@ pub fn handle_request(
         // MIN_INSTRS_TO_COMPILE's own doc comment. Sticky-denylisted like
         // any other decline (§6.4): the region's instruction count can't
         // change without the page itself mutating (a gen bump, which clears
-        // denylist_bits alongside it), so there's nothing to gain from
+        // ENTRY_DENYLISTED alongside it), so there's nothing to gain from
         // re-evaluating this offset on a later arrival against the same
         // unchanged bytes.
         page.denylist(offset);
@@ -191,7 +191,7 @@ pub fn handle_request(
             // shared arena is just out of room right now (see
             // `Codegen::last_compile_ran_out_of_memory`'s doc comment).
             // Denylisting it would be wrong (permanently, until an
-            // unrelated future flush happens to clear denylist_bits too);
+            // unrelated future flush happens to clear ENTRY_DENYLISTED too);
             // instead, leave it un-denylisted so it retries naturally on
             // its own next arrival, and tell the caller to flush — it has
             // the `Jitv2`/CPU-pause machinery this function doesn't.
@@ -272,7 +272,7 @@ pub fn handle_request_deferred(
     }
 
     let phys_base = page.pfn * PAGE_SIZE;
-    let gen_snap = if page.is_compilable() { page.current_gen() } else { 0 };
+    let gen_snap = page.current_gen();
 
     let mut words = [0u32; ENTRIES_PER_PAGE];
     for (i, w) in words.iter_mut().enumerate() {
@@ -508,10 +508,10 @@ mod tests {
         assert!(!page.is_denylisted(0), "a transient read failure must not become a sticky rejection");
     }
 
-    /// Regression test: `exec_decoded`'s dispatch gate sets `scheduled_bits`
+    /// Regression test: `exec_decoded`'s dispatch gate sets `ENTRY_SCHEDULED`
     /// (via `try_schedule`) before sending a `CompileRequest` to stop a hot
     /// PC from flooding the queue with duplicate requests for the same
-    /// offset. `handle_request` must clear that bit again once it decides —
+    /// offset. `handle_request` must clear that flag again once it decides —
     /// on every exit path, not just the success path — or the offset can
     /// never be scheduled again after this one request, even once it's
     /// fully resolved. Covers all three decision outcomes: publish success,

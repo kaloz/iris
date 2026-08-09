@@ -107,7 +107,26 @@ mod tests {
         let mem = Arc::new(MockMemory::new());
         let bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
-        let exec = MipsExecutor::new(bus, PassthroughTlb::default(), &cfg);
+        let mut exec = MipsExecutor::new(bus, PassthroughTlb::default(), &cfg);
+        // This file predates jitv2 and never calls `install_jit_hooks` — a
+        // jitv2 dispatch gate variant that intercepted a dispatch here would
+        // abort the whole process (`core.handle_exception_fn` etc. never
+        // wired up). MockMemory's gen_ptr is the trait default (null), which
+        // is no longer sufficient on its own to keep jitv2 away (see
+        // `crate::jitv2::jitv2::NEVER_COMPILABLE_GEN`'s doc comment) —
+        // `jitv2_lockstep`'s `lockstep_check` in particular bypasses page
+        // state entirely and must be disabled at the executor level.
+        #[cfg(feature = "jitv2")]
+        {
+            exec.jitv2_dispatch_enabled = false;
+            #[cfg(feature = "jitv2_lockstep")]
+            {
+                exec.lockstep_enabled.alu = false;
+                exec.lockstep_enabled.branch = false;
+                exec.lockstep_enabled.load_store = false;
+                exec.lockstep_enabled.fpu = false;
+            }
+        }
         (exec, mem)
     }
 

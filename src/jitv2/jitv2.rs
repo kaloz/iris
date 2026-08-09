@@ -18,7 +18,7 @@
 //! — the compile thread and publish path land with codegen (Phase 2).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -83,28 +83,78 @@ pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
 /// boundary.
 pub type JitFn = unsafe extern "C" fn(*mut MipsCore) -> ExecStatus;
 
+/// `JitEntry::flags` bit — set iff this offset holds a published,
+/// dispatchable function. Authoritative for dispatch (probed on un-promoted
+/// arrivals, §6.1) and the kill path — Release-set by `publish`, cleared by
+/// `kill`. This bit is the single source of truth for "is this entry live";
+/// `entries[i].func` being non-null is not itself checked (kill clears the
+/// flag but may leave `func` populated until the slot is reused — see
+/// `JitEntry::func`'s doc comment).
+const ENTRY_VALID: u8 = 1 << 0;
+/// `JitEntry::flags` bit — set iff this offset was permanently refused by
+/// the compiler (too-short region below the yield threshold, excluded first
+/// instruction, 0xFFC/slot hazard, etc — §6.4 "sticky rejection"). Consulted
+/// by arrival/queueing to stop re-requesting a compile that will only be
+/// declined again; cleared on a gen bump (re-classify against new bytes)
+/// alongside `ENTRY_VALID`.
+const ENTRY_DENYLISTED: u8 = 1 << 1;
+/// `JitEntry::flags` bit — set iff a `CompileRequest` for this offset has
+/// been sent to the async compile-thread queue and hasn't been decided yet
+/// (published or denylisted). `exec_decoded`'s dispatch gate consults this
+/// before building/sending another request for the same offset — without
+/// it, every dispatch of a not-yet-compiled offset that keeps
+/// re-satisfying the gate's trigger conditions (e.g. a hot loop back-edge
+/// landing on the same still-uncompiled word every iteration, or
+/// `jit_trigger` now also being set by JIT-to-JIT jump exits — see
+/// `MipsCore::jit_trigger`) sends a fresh, redundant `CompileRequest` for
+/// the exact same (page, offset) every single time, flooding the
+/// compile-thread's queue with requests that all do the same work.
+/// `try_schedule` is the only setter (a compare-exchange, so only the first
+/// caller for a given offset actually wins and sends); cleared by
+/// `clear_scheduled` once `handle_request` (`comp.rs`) has decided the
+/// offset one way or the other, so a later legitimate re-request (e.g.
+/// after a gen bump invalidates a stale artifact) isn't permanently
+/// blocked. Irrelevant to the synchronous `jitv2_inline_compile` path —
+/// that path can't re-enter before `comp::handle_request` returns, so
+/// there's no queue to flood.
+const ENTRY_SCHEDULED: u8 = 1 << 2;
+
 /// Single entry in a page's compiled-function table (§2.4 `entry_table`).
 /// AoS layout (one `JitEntry` per offset) rather than the design doc's literal
 /// SoA (`entry_bits` bitmap + separate `entry_table` pointer array): `gen` is
 /// consulted together with `func` at every dispatch (staleness check against
 /// the page's current generation, §4.1/§6.5), so keeping them in the same
-/// cache line avoids a second, unrelated array touch on the hot path. The
-/// separate `valid_bits`/`denylist_bits` arrays in `PhysicalCodePage` remain
-/// SoA because each is scanned/tested independently of the others (bitmap
-/// probe on un-promoted arrivals vs. sticky-rejection check, §6.1/§6.4).
+/// cache line avoids a second, unrelated array touch on the hot path.
+/// `flags` (ENTRY_VALID/ENTRY_DENYLISTED/ENTRY_SCHEDULED) is colocated here
+/// too, rather than `PhysicalCodePage` holding three separate
+/// `[AtomicU64; BITMAP_WORDS]` bitmaps — the dispatch-hot read
+/// (`is_entry_valid`, checked on every dispatch) used to mean touching a
+/// bitmap word in one cache line and then `func`/`gen` in a completely
+/// separate one; a single `flags` byte right next to `func`/`gen` means the
+/// first touch of this entry already pulls the whole thing into L1 together.
+/// `saved_bits` (corpus-collection scaffolding only, not part of the design
+/// doc's per-page metadata — see its own field doc) is the one bitmap that
+/// stays a separate SoA array: it's scanned/tested completely independently
+/// of dispatch and is slated for deletion once the real compiler replaces
+/// the dump-to-disk stub anyway.
 pub struct JitEntry {
     /// Compiled function pointer for this offset, or null if unpublished.
-    /// Validity is owned entirely by `PhysicalCodePage::valid_bits` (§6.1.2's
+    /// Validity is owned entirely by `flags`' `ENTRY_VALID` bit (§6.1.2's
     /// "the remove check IS this load" — a raw pointer, not `Option`, keeps
     /// that the single source of truth instead of letting callers branch on
     /// `func.is_some()` as a second, potentially-stale answer to the same
-    /// question). Callers must check the valid bit before calling this.
+    /// question). Callers must check `ENTRY_VALID` before calling this.
     pub func: *const (),
     /// Generation this entry was compiled against (§6.5 `gen_snap`). An entry
     /// is valid iff `gen == page.current_gen()` — mismatch means the page
     /// mutated since compilation and the entry must be treated as stale
-    /// (downgrade to interpreter, §6.1.2) regardless of what `valid_bits` says.
+    /// (downgrade to interpreter, §6.1.2) regardless of what `flags` says.
     pub gen: AtomicU64,
+    /// See `ENTRY_VALID`/`ENTRY_DENYLISTED`/`ENTRY_SCHEDULED`'s own doc
+    /// comments. A single byte holding all three independent per-offset
+    /// flags — they're set/cleared/tested independently of each other
+    /// (never as a combined mask), just packed together for locality.
+    pub flags: AtomicU8,
     /// Dev-only diagnostics for `j2 pcp`: how many instructions this
     /// entry's compiled region covers (set once at publish time — not
     /// atomic since it's write-once-then-read, same lifecycle as `func`)
@@ -138,6 +188,7 @@ impl Default for JitEntry {
         Self {
             func: std::ptr::null(),
             gen: AtomicU64::new(0),
+            flags: AtomicU8::new(0),
             #[cfg(feature = "developer")]
             instr_count: 0,
             #[cfg(feature = "developer")]
@@ -411,53 +462,34 @@ unsafe impl Send for CompileRequest {}
 /// currently executing out of.
 ///
 /// Does not yet own `queued_bits`/`artifact_list` (§2.4) — those land with
-/// the compile-thread/dispatcher work. `valid_bits`, `denylist_bits`, and
-/// `entries` (this pass) are the `entry_bits`/`entry_table` pair from the
-/// design doc, laid out AoS per-entry (see `JitEntry`) rather than the
-/// document's literal SoA split.
+/// the compile-thread/dispatcher work. `entries` (`JitEntry::flags` plus
+/// `func`/`gen`) is the `entry_bits`/`entry_table` pair from the design
+/// doc, laid out AoS per-entry rather than the document's literal SoA
+/// split.
+/// Fallback generation counter for a page whose backing `BusDevice` doesn't
+/// implement `gen_ptr` (MMIO, etc — the trait's default returns null). A
+/// single `static`, shared by every such page rather than one dummy per page:
+/// it never advances (same as a ROM's shared, never-bumped counter — see
+/// `PhysicalCodePage::gen`'s doc comment), so there's no reason for each page
+/// to have its own copy. Pointing `gen` here instead of leaving it null means
+/// `current_gen()`/every dispatch-path deref is unconditionally valid — no
+/// null check needed anywhere, ever (`claim()` is the only place that decides
+/// whether a page's real `gen_ptr` or this fallback gets used). If code
+/// somehow executes out of true MMIO, this makes the JIT treat it like an
+/// immutable ROM page instead — the JIT is not in the business of making
+/// that scenario correct or fast, just of not crashing on it.
+static NEVER_COMPILABLE_GEN: AtomicU64 = AtomicU64::new(0);
+
 pub struct PhysicalCodePage {
     pub pfn: Pfn,
     /// Pointer to this page's generation counter, obtained from the owning
     /// `BusDevice` via `gen_ptr` (§2.4, §7). RAM devices return one counter
     /// per page; ROM devices point every page at a single counter that is
     /// initialized to 0 and never bumped, since ROM content is immutable.
-    /// Null if the page's device doesn't back JIT-compilable memory (MMIO).
+    /// Never null — a device with no real gen tracking (MMIO, etc — `gen_ptr`
+    /// returns null) gets pointed at the shared [`NEVER_COMPILABLE_GEN`]
+    /// fallback instead, by `claim()`.
     gen: *const AtomicU64,
-    /// One bit per entry offset (word-aligned, §2.4): set iff `entries[i]`
-    /// holds a published, dispatchable function. Authoritative for dispatch
-    /// (probed on un-promoted arrivals, §6.1) and the kill path — release-set
-    /// by publish, cleared by kill. This bit is the single source of truth
-    /// for "is this entry live"; `entries[i].func` being non-null is not
-    /// itself checked (kill nulls the bit but may leave `func` populated
-    /// until the slot is reused — see `JitEntry::func`'s doc comment).
-    pub valid_bits: [AtomicU64; BITMAP_WORDS],
-    /// One bit per entry offset: set iff this offset was permanently refused
-    /// by the compiler (too-short region below the yield threshold, excluded
-    /// first instruction, 0xFFC/slot hazard, etc — §6.4 "sticky rejection").
-    /// Consulted by arrival/queueing to stop re-requesting a compile that will
-    /// only be declined again; cleared on a gen bump (re-classify against new
-    /// bytes) alongside `valid_bits`.
-    pub denylist_bits: [AtomicU64; BITMAP_WORDS],
-    /// One bit per entry offset: set iff a `CompileRequest` for this offset
-    /// has been sent to the async compile-thread queue and hasn't been
-    /// decided yet (published or denylisted). `exec_decoded`'s dispatch gate
-    /// consults this before building/sending another request for the same
-    /// offset — without it, every dispatch of a not-yet-compiled offset that
-    /// keeps re-satisfying the gate's trigger conditions (e.g. a hot loop
-    /// back-edge landing on the same still-uncompiled word every iteration,
-    /// or `jit_trigger` now also being set by JIT-to-JIT jump exits — see
-    /// `MipsCore::jit_trigger`) sends a fresh, redundant `CompileRequest`
-    /// for the exact same (page, offset) every single time, flooding the
-    /// compile-thread's queue with requests that all do the same work.
-    /// `try_schedule` is the only setter (a compare-exchange, so only the
-    /// first caller for a given offset actually wins and sends); cleared by
-    /// `clear_scheduled` once `handle_request` (`comp.rs`) has decided the
-    /// offset one way or the other, so a later legitimate re-request (e.g.
-    /// after a gen bump invalidates a stale artifact) isn't permanently
-    /// blocked. Irrelevant to the synchronous `jitv2_inline_compile` path —
-    /// that path can't re-enter before `comp::handle_request` returns, so
-    /// there's no queue to flood.
-    pub scheduled_bits: [AtomicU64; BITMAP_WORDS],
     /// Per-offset compiled-function slots (§2.4 `entry_table`). Inline, not
     /// boxed: `Jitv2::pages` is a single array allocated once, up front, at
     /// full capacity (`Jitv2::new`'s own doc comment) — every
@@ -485,48 +517,48 @@ unsafe impl Send for PhysicalCodePage {}
 unsafe impl Sync for PhysicalCodePage {}
 
 impl PhysicalCodePage {
-    /// Construct an as-yet-unclaimed page descriptor: `pfn = 0`, `gen =
-    /// null` (the same "not compilable" sentinel `is_compilable()` already
-    /// checks everywhere), every bitmap zeroed, every entry at its default
-    /// (unpublished) state. Used both to build `Jitv2::pages`' full-capacity
-    /// array up front (every slot starts unclaimed) and, functionally
-    /// identically, by [`Self::claim`]/[`Self::reset_in_place`] to return a
-    /// slot to this same state in place without reallocating anything.
+    /// Construct an as-yet-unclaimed page descriptor: `pfn = 0`, every
+    /// bitmap zeroed, every entry at its default (unpublished) state. Used
+    /// both to build `Jitv2::pages`' full-capacity array up front (every slot
+    /// starts unclaimed) and, functionally identically, by
+    /// [`Self::claim`]/[`Self::reset_in_place`] to return a slot to this same
+    /// state in place without reallocating anything.
+    ///
+    /// `gen` null is accepted here (callers pass it for an as-yet-unclaimed
+    /// slot, or when the real device has no gen tracking) and normalized to
+    /// [`NEVER_COMPILABLE_GEN`] — `self.gen` itself is never null, so nothing
+    /// downstream ever needs to check.
     pub fn new(pfn: Pfn, gen: *const AtomicU64) -> Self {
         Self {
             pfn,
-            gen,
-            valid_bits: std::array::from_fn(|_| AtomicU64::new(0)),
-            denylist_bits: std::array::from_fn(|_| AtomicU64::new(0)),
-            scheduled_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
             entries: std::array::from_fn(|_| JitEntry::default()),
             saved_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
-    /// Zero every bitmap and reset every entry to its default (unpublished)
-    /// state, in place — no reallocation, `entries`'s 1024 slots are written
-    /// through, not replaced. Called only from [`Self::reset_to_unclaimed`]
-    /// (`Jitv2::mega_flush`'s per-slot reset) — a fresh, never-claimed slot
-    /// is already zeroed by `PhysicalCodePage::new` and doesn't need this
-    /// (see [`Self::claim`]'s doc comment for why re-running it there on
-    /// every ordinary page arrival would be wasted, hot-path work).
+    /// Zero every bitmap and reset every entry (including `flags`) to its
+    /// default (unpublished) state, in place — no reallocation, `entries`'s
+    /// 1024 slots are written through, not replaced. Called only from
+    /// [`Self::reset_to_unclaimed`] (`Jitv2::mega_flush`'s per-slot reset) —
+    /// a fresh, never-claimed slot is already zeroed by
+    /// `PhysicalCodePage::new` and doesn't need this (see [`Self::claim`]'s
+    /// doc comment for why re-running it there on every ordinary page
+    /// arrival would be wasted, hot-path work).
     ///
     /// Explicitly zeroing every `entries[i].gen` here (not just `func`/
-    /// `valid_bits`) is the important part: that field doubles as
+    /// `flags`) is the important part: that field doubles as
     /// `PhysicalCodePage::count_dispatch_and_check_threshold`'s pre-publish
     /// call counter (`j2 min-calls`) when the entry has never been
     /// published — without this, a slot reused after a flush would inherit
     /// whatever count was sitting there from its previous physical page's
     /// occupancy, silently skewing the new page's own warm-up window.
     fn reset_entries_and_bitmaps(&mut self) {
-        for word in self.valid_bits.iter() { word.store(0, std::sync::atomic::Ordering::Relaxed); }
-        for word in self.denylist_bits.iter() { word.store(0, std::sync::atomic::Ordering::Relaxed); }
-        for word in self.scheduled_bits.iter() { word.store(0, std::sync::atomic::Ordering::Relaxed); }
         for word in self.saved_bits.iter() { word.store(0, std::sync::atomic::Ordering::Relaxed); }
         for entry in self.entries.iter_mut() {
             entry.func = std::ptr::null();
             entry.gen.store(0, std::sync::atomic::Ordering::Relaxed);
+            entry.flags.store(0, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "developer")]
             {
                 entry.instr_count = 0;
@@ -554,65 +586,59 @@ impl PhysicalCodePage {
     /// build, rather than paying a real-build cost to re-verify it on every
     /// single claim.
     pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64) {
-        debug_assert!(!self.is_compilable() && self.pfn == 0,
-            "claim() called on a slot that wasn't clean (pfn={}, is_compilable={}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
-            self.pfn, self.is_compilable());
+        debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == 0,
+            "claim() called on a slot that wasn't clean (pfn={}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
+            self.pfn);
         debug_assert!((0..ENTRIES_PER_PAGE).all(|i| !self.is_published(i)),
             "claim() called on a slot with a still-published entry — mega_flush must reset_to_unclaimed before this slot can be reused");
         self.pfn = pfn;
-        self.gen = gen;
+        self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
     }
 
-    /// Return this slot to the fully-unclaimed state (`pfn = 0`, `gen =
-    /// null`) — `Jitv2::mega_flush`'s in-place counterpart to what used to
-    /// be `Vec::clear()` dropping every `PhysicalCodePage` outright.
+    /// Return this slot to the fully-unclaimed state (`pfn = 0`, `gen`
+    /// pointed at the shared [`NEVER_COMPILABLE_GEN`] fallback) —
+    /// `Jitv2::mega_flush`'s in-place counterpart to what used to be
+    /// `Vec::clear()` dropping every `PhysicalCodePage` outright.
     pub fn reset_to_unclaimed(&mut self) {
         self.reset_entries_and_bitmaps();
         self.pfn = 0;
-        self.gen = std::ptr::null();
+        self.gen = &NEVER_COMPILABLE_GEN;
     }
 
-    /// Whether this page's backing device supports JIT generation tracking
-    /// at all (i.e. `gen_ptr` returned non-null).
-    #[inline]
-    pub fn is_compilable(&self) -> bool {
-        !self.gen.is_null()
-    }
-
-    /// Current generation count for this page. Panics in debug builds if the
-    /// page isn't compilable (see [`Self::is_compilable`]) — callers on the
-    /// hot path are expected to have already branched on that.
+    /// Current generation count for this page. `self.gen` is never null (see
+    /// its own doc comment) — a page whose backing device has no real gen
+    /// tracking (MMIO, etc) reads the shared, never-bumped
+    /// [`NEVER_COMPILABLE_GEN`] fallback here instead, so this is
+    /// unconditionally safe to call on any claimed or unclaimed page, no
+    /// branch needed on the caller's part.
     #[inline]
     pub fn current_gen(&self) -> u64 {
-        debug_assert!(self.is_compilable());
         // Relaxed: publish-time (§6.5) and mutation-time (§7) orderings are
         // established by the fetch_or/re-read pair at those call sites, not here.
         unsafe { (*self.gen).load(std::sync::atomic::Ordering::Relaxed) }
     }
 
-    /// Whether `entries[offset_word]`'s valid bit is set — i.e. some compile
-    /// has published a function here, without regard to whether it's still
-    /// fresh against the page's current gen. Callers that need "is this
+    /// Whether `entries[offset_word]`'s `ENTRY_VALID` flag is set — i.e. some
+    /// compile has published a function here, without regard to whether it's
+    /// still fresh against the page's current gen. Callers that need "is this
     /// dispatchable right now" want [`Self::is_entry_valid`]; this is for the
     /// dispatch-trigger gate (§6.1.2's `entry_bits[pfn].test(offset)`), which
-    /// probes the bit first and only then decides exec-vs-recompile from gen.
+    /// probes the flag first and only then decides exec-vs-recompile from gen.
     #[inline]
     pub fn is_published(&self, offset_word: usize) -> bool {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.valid_bits[word].load(std::sync::atomic::Ordering::Acquire) & (1 << bit) != 0
+        self.entries[offset_word].flags.load(std::sync::atomic::Ordering::Acquire) & ENTRY_VALID != 0
     }
 
-    /// Whether `entries[offset_word]` is both published (`valid_bits`) and
+    /// Whether `entries[offset_word]` is both published (`ENTRY_VALID`) and
     /// still fresh (its recorded gen matches the page's current gen, §6.5).
-    /// A set valid bit whose gen has drifted is stale — the caller should
+    /// A set valid flag whose gen has drifted is stale — the caller should
     /// treat it as unpublished (downgrade to interpreter, §6.1.2) rather than
     /// dispatch it.
     ///
     /// The `gen` load is Acquire, not Relaxed: it's the real synchronization
     /// point for `entries[offset_word].func` (see `publish`'s doc comment) —
-    /// `valid_bits` alone doesn't provide fresh ordering across a recompile
-    /// of an already-published entry, since the bit's *value* doesn't change
+    /// `ENTRY_VALID` alone doesn't provide fresh ordering across a recompile
+    /// of an already-published entry, since the flag's *value* doesn't change
     /// on that path. Callers must not read `func` after this returns `true`
     /// without going through this same `gen` load (i.e. don't cache
     /// `is_published`'s result and reuse it — always call `is_entry_valid`
@@ -627,9 +653,7 @@ impl PhysicalCodePage {
     /// Whether `offset_word` has been sticky-rejected by the compiler (§6.4).
     #[inline]
     pub fn is_denylisted(&self, offset_word: usize) -> bool {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.denylist_bits[word].load(std::sync::atomic::Ordering::Relaxed) & (1 << bit) != 0
+        self.entries[offset_word].flags.load(std::sync::atomic::Ordering::Relaxed) & ENTRY_DENYLISTED != 0
     }
 
     /// Count one interpreter dispatch of `offset_word` *before* it has ever
@@ -667,16 +691,23 @@ impl PhysicalCodePage {
     /// (no emitter for some visited instruction, or `walk` found it excluded
     /// outright) and arrival/queueing should stop re-requesting a compile
     /// that will only be declined again. Cleared on a gen bump alongside
-    /// `valid_bits` — not implemented yet (no gen-triggered reclassification
+    /// `ENTRY_VALID` — not implemented yet (no gen-triggered reclassification
     /// exists until invalidation lands, §7).
     #[inline]
     pub fn denylist(&self, offset_word: usize) {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.denylist_bits[word].fetch_or(1 << bit, std::sync::atomic::Ordering::Relaxed);
+        self.entries[offset_word].flags.fetch_or(ENTRY_DENYLISTED, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Un-publish `offset_word`'s entry — clears the valid bit only, NOT
+    /// Sticky-reject every offset on this page at once. Not on any hot path
+    /// (a page-wide, one-time operation) — used to make a whole page
+    /// permanently non-dispatchable, e.g. tests that need a deterministic
+    /// "this page never compiles/dispatches, everything runs on the
+    /// interpreter" guarantee.
+    pub fn denylist_all(&self) {
+        for entry in self.entries.iter() { entry.flags.fetch_or(ENTRY_DENYLISTED, std::sync::atomic::Ordering::Relaxed); }
+    }
+
+    /// Un-publish `offset_word`'s entry — clears `ENTRY_VALID` only, NOT
     /// denylist: the artifact itself isn't wrong in general, just stale for
     /// *this* dispatch (`emit_fpu_entry_guard`'s FR-mismatch case — the
     /// region was compiled for the wrong FR mode, so every future dispatch
@@ -688,44 +719,39 @@ impl PhysicalCodePage {
     /// handles that exactly like any other never-yet-compiled offset.
     /// `entries[offset_word].func` itself is deliberately left in place
     /// (same "may be stale until slot reuse" contract as `JitEntry::func`'s
-    /// own doc comment) — nothing between clearing this bit and the next
+    /// own doc comment) — nothing between clearing this flag and the next
     /// `publish` ever reads `func` without first re-checking `is_entry_valid`.
     #[inline]
     pub fn kill(&self, offset_word: usize) {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.valid_bits[word].fetch_and(!(1 << bit), std::sync::atomic::Ordering::Release);
+        self.entries[offset_word].flags.fetch_and(!ENTRY_VALID, std::sync::atomic::Ordering::Release);
     }
 
-    /// Test-and-set `offset_word`'s scheduled bit: returns `true` (and sets
-    /// the bit) only if it was previously clear, i.e. only the first caller
-    /// for a given offset should actually build and send a `CompileRequest`
-    /// — every other concurrent/subsequent caller sees `false` and skips it,
-    /// since a request for this offset is already in flight. `fetch_or`
-    /// alone (like `denylist`'s) isn't enough here: unlike sticky rejection,
-    /// where every caller doing the same idempotent write is fine, this bit
-    /// exists specifically to distinguish "I am the one who should send the
-    /// request" from "someone else already did" — `fetch_or`'s return value
-    /// (the *previous* bits) gives exactly that distinction for free, no
-    /// separate compare-exchange needed.
+    /// Test-and-set `offset_word`'s `ENTRY_SCHEDULED` flag: returns `true`
+    /// (and sets the flag) only if it was previously clear, i.e. only the
+    /// first caller for a given offset should actually build and send a
+    /// `CompileRequest` — every other concurrent/subsequent caller sees
+    /// `false` and skips it, since a request for this offset is already in
+    /// flight. `fetch_or` alone (like `denylist`'s) isn't enough here: unlike
+    /// sticky rejection, where every caller doing the same idempotent write
+    /// is fine, this flag exists specifically to distinguish "I am the one
+    /// who should send the request" from "someone else already did" —
+    /// `fetch_or`'s return value (the *previous* bits) gives exactly that
+    /// distinction for free, no separate compare-exchange needed.
     #[inline]
     pub fn try_schedule(&self, offset_word: usize) -> bool {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        let prev = self.scheduled_bits[word].fetch_or(1 << bit, std::sync::atomic::Ordering::Relaxed);
-        prev & (1 << bit) == 0
+        let prev = self.entries[offset_word].flags.fetch_or(ENTRY_SCHEDULED, std::sync::atomic::Ordering::Relaxed);
+        prev & ENTRY_SCHEDULED == 0
     }
 
-    /// Clear `offset_word`'s scheduled bit — called once `handle_request`
-    /// (`comp.rs`) has decided the offset one way or the other (published or
-    /// denylisted), so a future legitimate re-request for this offset (e.g.
-    /// after a gen bump invalidates a stale artifact) isn't permanently
-    /// blocked by a stale scheduled bit from a request that already finished.
+    /// Clear `offset_word`'s `ENTRY_SCHEDULED` flag — called once
+    /// `handle_request` (`comp.rs`) has decided the offset one way or the
+    /// other (published or denylisted), so a future legitimate re-request
+    /// for this offset (e.g. after a gen bump invalidates a stale artifact)
+    /// isn't permanently blocked by a stale scheduled flag from a request
+    /// that already finished.
     #[inline]
     pub fn clear_scheduled(&self, offset_word: usize) {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.scheduled_bits[word].fetch_and(!(1 << bit), std::sync::atomic::Ordering::Relaxed);
+        self.entries[offset_word].flags.fetch_and(!ENTRY_SCHEDULED, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Publish a freshly compiled function at `offset_word` (§6.5 step 4):
@@ -740,14 +766,14 @@ impl PhysicalCodePage {
     /// The `func`-then-`gen` order (and `gen`'s Release/Acquire ordering,
     /// paired with `is_entry_valid`'s Acquire load) is load-bearing, not
     /// cosmetic — it's what makes *recompiling* an already-published entry
-    /// safe, which `valid_bits` alone cannot do. §2.5's "no recompile of
+    /// safe, which `ENTRY_VALID` alone cannot do. §2.5's "no recompile of
     /// existing artifacts" design intent means `handle_request`
     /// (`comp.rs`) never calls this on an entry that's currently
     /// `is_entry_valid` — but an entry whose gen has drifted stale (page
-    /// mutated, bit still 1) *does* get recompiled in place. On that path,
-    /// `valid_bits`' Release/Acquire pairing provides no fresh
-    /// synchronization at all: the bit doesn't change value (it was already
-    /// 1), so a dispatcher's Acquire-load of it can be satisfied by a stale
+    /// mutated, flag still set) *does* get recompiled in place. On that path,
+    /// `ENTRY_VALID`'s Release/Acquire pairing provides no fresh
+    /// synchronization at all: the flag doesn't change value (it was already
+    /// set), so a dispatcher's Acquire-load of it can be satisfied by a stale
     /// cached observation from the *original* publish, with no
     /// happens-before relationship to this recompile's writes whatsoever.
     /// Without `gen` itself carrying the ordering, a dispatcher could
@@ -773,7 +799,7 @@ impl PhysicalCodePage {
         // `&self` — sound because no concurrent reader trusts `func` without
         // first Acquire-loading `gen` below and observing it equal to
         // current_gen() (see this function's doc comment for why that's the
-        // synchronization point, not `valid_bits`), and no other writer
+        // synchronization point, not `ENTRY_VALID`), and no other writer
         // targets the same offset concurrently (the compile thread is
         // single-threaded and processes requests in order).
         unsafe {
@@ -786,14 +812,14 @@ impl PhysicalCodePage {
             }
         }
         self.entries[offset_word].gen.store(gen_snap, std::sync::atomic::Ordering::Release);
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        // fetch_or on an already-1 bit (the recompile-of-a-stale-entry case)
-        // is a no-op on the bit's value but still executes as a Release op —
-        // harmless to keep doing unconditionally here since it costs nothing
-        // extra and keeps first-publish's existing Acquire/Release-on-bit
-        // contract intact for `is_published`'s own callers.
-        self.valid_bits[word].fetch_or(1 << bit, std::sync::atomic::Ordering::Release);
+        // fetch_or on an already-set ENTRY_VALID (the recompile-of-a-stale-entry
+        // case) is a no-op on the flag's value but still executes as a Release
+        // op — harmless to keep doing unconditionally here since it costs
+        // nothing extra and keeps first-publish's existing Acquire/Release
+        // contract intact for `is_published`'s own callers. Only ever touches
+        // the ENTRY_VALID bit — ENTRY_DENYLISTED/ENTRY_SCHEDULED (if either
+        // happens to also be set on this same byte) are left untouched.
+        self.entries[offset_word].flags.fetch_or(ENTRY_VALID, std::sync::atomic::Ordering::Release);
         true
     }
 
@@ -1088,7 +1114,7 @@ impl Jitv2 {
     /// every slot to its unclaimed state, including zeroing every entry's
     /// `gen` (doubling as the pre-publish call counter — see
     /// `reset_entries_and_bitmaps`'s doc comment for why that specifically
-    /// matters here, not just for `func`/`valid_bits`), is what "flush"
+    /// matters here, not just for `func`/`flags`), is what "flush"
     /// means now.
     ///
     /// Private: real callers want [`Self::flush`], which wraps this with the
@@ -1648,9 +1674,14 @@ mod tests {
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
 
     #[test]
-    fn null_gen_ptr_is_not_compilable() {
+    fn null_gen_ptr_reads_the_never_compilable_fallback_without_panicking() {
+        // A device with no real gen tracking (gen_ptr returns null, e.g.
+        // most MMIO) must never leave PhysicalCodePage::gen null itself —
+        // current_gen() has to be unconditionally safe to call on any page,
+        // claimed or not, real gen or not (see NEVER_COMPILABLE_GEN's doc
+        // comment) — so this must read 0, not panic/deref-null.
         let page = PhysicalCodePage::new(0, std::ptr::null());
-        assert!(!page.is_compilable());
+        assert_eq!(page.current_gen(), 0);
     }
 
     #[test]
@@ -1671,7 +1702,6 @@ mod tests {
     fn reads_through_gen_pointer() {
         let counter = AtomicU64::new(42);
         let page = PhysicalCodePage::new(7, &counter as *const AtomicU64);
-        assert!(page.is_compilable());
         assert_eq!(page.current_gen(), 42);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(page.current_gen(), 43);
@@ -1692,8 +1722,7 @@ mod tests {
     /// `false`) — this is what stops `exec_decoded`'s dispatch gate from
     /// sending a duplicate `CompileRequest` for the same offset every time a
     /// hot PC re-satisfies the gate's trigger conditions while the first
-    /// request is still in flight (see `PhysicalCodePage::scheduled_bits`'
-    /// doc comment).
+    /// request is still in flight (see `ENTRY_SCHEDULED`'s doc comment).
     #[test]
     fn try_schedule_is_test_and_set() {
         let counter = AtomicU64::new(0);
@@ -1741,7 +1770,7 @@ mod tests {
         assert!(!page.is_entry_valid(offset));
 
         // Publish: set the bit -> now valid.
-        page.valid_bits[offset >> 6].fetch_or(1 << (offset & 63), Ordering::Release);
+        page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
         assert!(page.is_entry_valid(offset));
 
         // Page mutates (gen bumps past what the entry was compiled against):
@@ -1761,7 +1790,7 @@ mod tests {
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let offset = 4usize;
         page.entries[offset].gen.store(0, Ordering::Relaxed);
-        page.valid_bits[offset >> 6].fetch_or(1 << (offset & 63), Ordering::Release);
+        page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
         assert!(page.is_entry_valid(offset));
 
         page.kill(offset);
@@ -1773,18 +1802,18 @@ mod tests {
         // A later re-publish (simulating the next visit's fresh compile)
         // must work normally — kill leaves the offset fully recompilable.
         page.entries[offset].gen.store(0, Ordering::Relaxed);
-        page.valid_bits[offset >> 6].fetch_or(1 << (offset & 63), Ordering::Release);
+        page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
         assert!(page.is_entry_valid(offset), "offset must be re-publishable after kill");
     }
 
     #[test]
     fn publish_recompiling_a_stale_entry_updates_func_and_gen_together() {
         // Regression test for the recompile-ordering race: an entry whose
-        // gen has drifted stale (page mutated, valid_bits bit still 1) gets
+        // gen has drifted stale (page mutated, ENTRY_VALID still set) gets
         // recompiled in place by handle_request (comp.rs) — the ONE case
-        // where publish() is called on an offset whose bit is already set.
-        // valid_bits' Release/Acquire pairing gives no fresh synchronization
-        // on that path (the bit's value doesn't change), so `gen` itself
+        // where publish() is called on an offset whose flag is already set.
+        // ENTRY_VALID's Release/Acquire pairing gives no fresh synchronization
+        // on that path (the flag's value doesn't change), so `gen` itself
         // must be the ordering point: func must be visible before gen ever
         // reads as matching current_gen(). This test can't force a true
         // concurrent interleaving, but it does verify the sequential
@@ -1818,7 +1847,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let offset = 7usize;
-        page.denylist_bits[offset >> 6].fetch_or(1 << (offset & 63), Ordering::Relaxed);
+        page.entries[offset].flags.fetch_or(ENTRY_DENYLISTED, Ordering::Relaxed);
         assert!(page.is_denylisted(offset));
         assert!(!page.is_entry_valid(offset), "denylisting must not itself mark an entry valid");
     }
@@ -1875,7 +1904,7 @@ mod tests {
         // doubles as PhysicalCodePage::count_dispatch_and_check_threshold's
         // counter before an entry is ever published — mega_flush's in-place
         // reset (PhysicalCodePage::reset_to_unclaimed) must zero it just
-        // like func/valid_bits, or a slot claimed for a brand-new physical
+        // like func/flags, or a slot claimed for a brand-new physical
         // page after a flush would inherit whatever count was left over from
         // its previous occupant.
         let dev = FakeDevice(AtomicU64::new(0));
@@ -2007,11 +2036,11 @@ mod tests {
         q.set_batch_enabled(true);
         q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
 
-        // A real (non-null) gen counter: page.publish() calls current_gen()
-        // unconditionally, which debug_asserts is_compilable() — unlike
-        // FakeDevice-based tests elsewhere in this module, this test's
-        // AddiuDevice produces real compilable code, so publish() actually
-        // gets reached and needs a real counter behind it.
+        // A real (non-null) gen counter: page.publish() calls current_gen(),
+        // which is always safe now (reads the shared NEVER_COMPILABLE_GEN
+        // fallback for a null gen), but this test wants a real, independent
+        // counter behind it since it's exercising a real compile+publish,
+        // not just checking current_gen() doesn't crash.
         let gen_counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &gen_counter as *const AtomicU64);
         let stats = JitStats::default();

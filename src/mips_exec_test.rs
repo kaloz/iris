@@ -111,34 +111,62 @@ mod tests {
             BUS_OK
         }
 
-        // Always null: this whole file predates jitv2 and no test here calls
-        // `install_jit_hooks` — a null gen_ptr makes every page's
-        // `PhysicalCodePage::is_compilable()` false, so every jitv2 dispatch
-        // gate variant (real, jitv2_inline_compile, jitv2_lockstep) falls
-        // straight through to the plain interpreter, unconditionally,
-        // regardless of which jitv2 feature happens to be compiled in. Only
-        // `test_r4000cache_step_sequence` wants real jitv2 dispatch — it
-        // builds its own executor with a real gen-tracking memory and calls
-        // `install_jit_hooks` explicitly instead of using this helper's
-        // `MockMemory`/`create_executor_with_r4000cache`. Without this, a
-        // jitv2 gate variant that runs unconditionally (jitv2_lockstep's
-        // lockstep_check, in particular — see rules/jitv2/codegen-gotchas.md)
-        // can compile and run a function against an executor whose
-        // `core.handle_exception_fn` was never installed, aborting the whole
-        // process the moment that function raises an exception
-        // (`jit_hooks_not_installed_exception`, `panic = "abort"`).
+        // This whole file predates jitv2 and no test here calls
+        // `install_jit_hooks` — every `create_executor*` helper below
+        // explicitly disables both the real dispatch gate
+        // (`jitv2_dispatch_enabled = false`) and every `jitv2_lockstep`
+        // class (`lockstep_enabled.{alu,branch,load_store,fpu} = false`),
+        // so no jitv2 gate variant ever touches these executors,
+        // unconditionally, regardless of which jitv2 feature happens to be
+        // compiled in. Only `test_r4000cache_step_sequence` wants real jitv2
+        // dispatch — it builds its own executor with a real gen-tracking
+        // memory and calls `install_jit_hooks` explicitly instead of using
+        // this helper's `MockMemory`/`create_executor_with_r4000cache`.
+        // Without disabling both gates, a jitv2 gate variant that runs
+        // unconditionally (jitv2_lockstep's lockstep_check, in particular —
+        // see rules/jitv2/codegen-gotchas.md) can compile and run a function
+        // against an executor whose `core.handle_exception_fn` was never
+        // installed, aborting the whole process the moment that function
+        // raises an exception (`jit_hooks_not_installed_exception`,
+        // `panic = "abort"`). This used to be enforced by returning a null
+        // gen_ptr here (a page with no real gen tracking used to be flatly
+        // "not compilable") — that inference no longer holds (a null
+        // gen_ptr now just means "use the shared, never-bumped fallback
+        // counter", not "never dispatchable" — see
+        // `crate::jitv2::jitv2::NEVER_COMPILABLE_GEN`'s doc comment), so the
+        // real enforcement moved to the executor-level switches below;
+        // staying null here is still fine (and simplest — no per-page
+        // counter storage needed in this basic MockMemory at all).
         #[cfg(feature = "jitv2")]
         fn gen_ptr(&self, _addr: u32) -> *const std::sync::atomic::AtomicU64 {
             std::ptr::null()
         }
     }
 
+    /// Disable every jitv2 dispatch path on a freshly-constructed executor —
+    /// see `MockMemory::gen_ptr`'s doc comment for why this, not a null
+    /// `gen_ptr`, is what actually keeps jitv2 out of this file's tests now.
+    #[cfg(feature = "jitv2")]
+    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>) {
+        exec.jitv2_dispatch_enabled = false;
+        #[cfg(feature = "jitv2_lockstep")]
+        {
+            exec.lockstep_enabled.alu = false;
+            exec.lockstep_enabled.branch = false;
+            exec.lockstep_enabled.load_store = false;
+            exec.lockstep_enabled.fpu = false;
+        }
+    }
+    #[cfg(not(feature = "jitv2"))]
+    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(_exec: &mut MipsExecutor<T, C>) {}
+
     // Helper to create executor with mock memory
     fn create_executor() -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
-        let exec = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        let mut exec = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        disable_jitv2(&mut exec);
         (exec, mem)
     }
 
@@ -147,7 +175,8 @@ mod tests {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
-        let exec = MipsExecutor::new(mem_bus, tlb, &cfg);
+        let mut exec = MipsExecutor::new(mem_bus, tlb, &cfg);
+        disable_jitv2(&mut exec);
         (exec, mem)
     }
 
@@ -156,7 +185,8 @@ mod tests {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
-        let exec = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        let mut exec = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        disable_jitv2(&mut exec);
         (exec, mem)
     }
 
@@ -2967,12 +2997,12 @@ mod tests {
         }
     }
 
-    /// Same shape as `MockMemory`, but with a real per-page gen counter
-    /// (`is_compilable() == true`) — used only by
-    /// `test_r4000cache_step_sequence`, the one test in this file that
-    /// actually wants jitv2 dispatch to fire. Every other test uses the
-    /// shared `MockMemory`, whose `gen_ptr` is always null specifically so
-    /// jitv2 never intercepts (see its doc comment).
+    /// Same shape as `MockMemory`, but with a real per-page gen counter —
+    /// used only by `test_r4000cache_step_sequence`, the one test in this
+    /// file that actually wants jitv2 dispatch to fire. Every other test
+    /// uses the shared `MockMemory` via `create_executor`/friends, which
+    /// disable every jitv2 gate at the executor level (see
+    /// `disable_jitv2`'s doc comment) so jitv2 never intercepts them.
     #[cfg(feature = "jitv2")]
     struct JitCapableMockMemory {
         data: Mutex<HashMap<u64, u8>>,

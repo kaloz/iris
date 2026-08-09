@@ -363,6 +363,13 @@ impl Codegen {
         self.paged_state.packing_stats()
     }
 
+    /// `(base_address, len)` of the underlying arena's real reservation —
+    /// see `PagedArenaState::arena_range`. `j2 hugepages` only.
+    #[cfg(feature = "developer")]
+    pub fn arena_range(&self) -> (u64, u64) {
+        self.paged_state.arena_range()
+    }
+
     /// Reclaim every executable-memory page this `Codegen` has ever
     /// finalized and start fresh with a new, empty `JITModule`. Plain
     /// `Drop`/replacement (`*self = Codegen::new()`) does **not** do this —

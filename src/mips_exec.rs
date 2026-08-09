@@ -611,6 +611,7 @@ impl Default for DecodedInstr {
 // check `core.in_delay_slot` instead.
 pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // ran fine, no exception/retry/breakpoint
 pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry same instr
+pub const EXEC_FALLBACK:           ExecStatus = 0x0000_0200; // jitv2+lightning's decode-skip fast path missed; caller must decode and dispatch normally
 pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
 
 // Exception flags
@@ -1689,6 +1690,26 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if same_page {
             return;
         }
+        // Landing on a genuinely different physical page than the one this
+        // executor was just tracking is itself compile-worthy, regardless of
+        // which word within that page pc happens to be at — a strictly more
+        // accurate and more general replacement for exec_decoded's old
+        // `entry_offset == 0` proxy (which only caught this for the specific
+        // case of a sequential fallthrough landing exactly on word 0).
+        // Notably, this closes a real gap `entry_offset == 0` missed:
+        // exception/TLB-refill vector entry — `deliver_exception`
+        // (mips_core.rs) writes `core.pc` directly to a fixed vector address
+        // and has no reason to know about jit_trigger (shared, non-jitv2-aware
+        // exception delivery logic) — the general-exception vector in
+        // particular (0x...80000180) lands at word-offset 0x60 within its
+        // page, not 0, so it was never probed by the old check unless that
+        // word happened to already be published from some earlier arrival.
+        // A harmless, bounded over-trigger case: nanotlb_invalidate nulls
+        // self.pcp unconditionally, so the next dispatch after any TLB
+        // invalidate always takes this branch even if it lands back on an
+        // already-tracked physical page — is_entry_valid still short-circuits
+        // correctly either way, this just costs one redundant probe.
+        self.core.jit_trigger = true;
         let page_base = pfn * crate::jitv2::PAGE_SIZE;
         let mut jit = self.jitv2.lock();
         match jit.page_for(pfn, page_base, self.sysad.as_ref()) {
@@ -1913,6 +1934,50 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.local_fasttick = 0;
     }
 
+    /// `lightning`'s decode-skip fast path: check whether jitv2 already has
+    /// a valid compiled entry for `self.core.pc` and, if so, call straight
+    /// into it — WITHOUT decoding the raw instruction word first. Only ever
+    /// worth calling separately from `exec_decoded` under `jitv2` +
+    /// `lightning` together: `jitv2_dispatch_enabled` is fixed `true` there
+    /// (see `exec_decoded`'s own gate — `lightning`/`developer` are
+    /// mutually exclusive, so the runtime switch that could turn dispatch
+    /// off is unreachable), so this check is never wasted work the way it
+    /// would be in a build where dispatch might be toggled off. Every other
+    /// build keeps decoding unconditionally before dispatch — `jitv2_lockstep`
+    /// needs the decoded instruction to classify it (ALU/branch/load-store/
+    /// FPU), and non-`lightning` builds want `d` regardless of a JIT hit
+    /// (traceback, trace recording).
+    ///
+    /// Must be called with `self.pcp` already current for this pc (i.e.
+    /// after `fetch_instr`/`nanotlb_translate`, same precondition
+    /// `exec_decoded`'s own gate documents) — mirrors that gate's hit path
+    /// exactly, just without needing a `&DecodedInstr` to do it. Returns the
+    /// compiled function's own status directly on a hit (decode was
+    /// successfully avoided) or `EXEC_FALLBACK` on a miss (caller must fall
+    /// through to the normal fetch-decode-`exec_decoded` path; nothing has
+    /// been mutated on a miss, so falling through is always safe) — a plain
+    /// `ExecStatus` sentinel rather than `Option<ExecStatus>` deliberately:
+    /// this runs on every single dispatch under `jitv2`+`lightning`, and an
+    /// `Option`'s extra discriminant check/branch is exactly the kind of
+    /// cost a hot path shouldn't pay when a spare status bit does the same
+    /// job for free (matches every other status code in this file — see
+    /// HACKING.md's `ExecStatus` section).
+    #[cfg(all(feature = "jitv2", feature = "lightning", not(feature = "jitv2_lockstep")))]
+    #[inline(always)]
+    fn jitv2_try_dispatch_without_decode(&mut self) -> ExecStatus {
+        assert!(!self.pcp.is_null(), "jitv2_try_dispatch_without_decode reached with no tracked PhysicalCodePage");
+        let page = unsafe { &mut *self.pcp };
+        let entry_offset = ((self.core.pc & 0xFFF) >> 2) as usize;
+        if (self.core.jit_trigger || page.is_published(entry_offset)) && page.is_entry_valid(entry_offset) {
+            let func = page.entries[entry_offset].func;
+            debug_assert!(!func.is_null(), "valid bit set with null func");
+            let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
+            unsafe { jit_fn(&mut self.core as *mut MipsCore) }
+        } else {
+            EXEC_FALLBACK
+        }
+    }
+
     pub fn step(&mut self) -> ExecStatus {
         // Increment the real, shared cycle counter directly — no local
         // shadow, no batching. See Hot::cycles's doc comment for why: a
@@ -1997,6 +2062,20 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
+            // jitv2+lightning: self.pcp is already current (fetch_instr's
+            // nanotlb_translate just ran jitv2_track_pcp) — check for a
+            // compiled hit before paying for decode_into below, since a hit
+            // calls straight into the compiled function and never looks at
+            // the decoded instruction at all. See
+            // jitv2_try_dispatch_without_decode's own doc comment for why
+            // this is only safe/worthwhile under this exact build combo.
+            #[cfg(all(feature = "jitv2", feature = "lightning", not(feature = "jitv2_lockstep")))]
+            {
+                let status = self.jitv2_try_dispatch_without_decode();
+                if status != EXEC_FALLBACK {
+                    return status;
+                }
+            }
             {
                 let slot = fetch.instr as *mut DecodedInstr;
                 let d = unsafe { &mut *slot };
@@ -5889,21 +5968,23 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // this same step() (the only thing that ever sets it) — null here
         // means that invariant broke, not a state to quietly route around.
         //
-        // Three conditions make PC worth probing as a compiled entry:
+        // Two conditions make PC worth probing as a compiled entry:
         // `core.jit_trigger` (a branch/jump just committed this PC — set by
-        // the interpreter's handle_exec_complete/exec_complete_pc_set, *and*
-        // by JIT-compiled code's own jump/branch exit stubs
-        // (emit_absolute_pc_exit/emit_runtime_pc_exit in codegen.rs) — a
-        // taken transfer needs this signal regardless of which engine
-        // executed it, otherwise a jump reached exclusively via JIT-to-JIT
-        // control transfer could land on a fresh, never-published word and
-        // never get probed for compilation at all), PC sitting at word-offset
-        // 0 (entry_offset == 0; the one statically always-checkable offset —
-        // every sequential page-crossing dispatch lands here, so it's the
-        // page-boundary analog of a loop back-edge landing on a published
-        // entry), or the offset's valid bit already being set (worth
-        // re-probing even without a fresh trigger, e.g. loop back-edges
-        // within an already-hot region).
+        // the interpreter's handle_exec_complete/exec_complete_pc_set, by
+        // JIT-compiled code's own jump/branch exit stubs
+        // (emit_absolute_pc_exit/emit_runtime_pc_exit in codegen.rs), *and*
+        // by jitv2_track_pcp itself whenever this dispatch's physical page
+        // differs from the one previously tracked — covering every way pc
+        // can land on a fresh page, not just branch/jump commits: sequential
+        // page-crossing fallthrough, and — the case the old, narrower
+        // "entry_offset == 0" proxy this replaced actually missed —
+        // exception/TLB-refill vector entry, since `deliver_exception`
+        // (mips_core.rs) writes `core.pc` directly to a fixed vector address
+        // with no reason to know about jit_trigger, and the general-exception
+        // vector in particular lands at word-offset 0x60 within its page, not
+        // 0), or the offset's valid bit already being set (worth re-probing
+        // even without a fresh trigger, e.g. loop back-edges within an
+        // already-hot region).
         //
         // Word 0 was refused as an entry offset entirely until this point
         // (§6.1.4's "total entry predicate," original rationale: a page's
@@ -5943,14 +6024,138 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // compile thread won a race within a short loop — see
         // rules/jitv2/codegen-gotchas.md) or to compare inline-vs-threaded
         // compile behavior directly.
+        // Under `lightning`, this is a literal `true` (not
+        // `self.jitv2_dispatch_enabled` read at runtime) so the compiler can
+        // see the gate is unconditional at compile time — `lightning`/
+        // `developer` are mutually exclusive (see lib.rs), and
+        // jitv2_dispatch_enabled has no setter reachable outside
+        // `developer` (`set_jitv2_dispatch_enabled`, `j2 dispatch off`), so
+        // the field can never actually be false here under `lightning`
+        // anyway; this just lets the compiler know that statically instead
+        // of leaving a dead runtime check on the hot path.
         #[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
-        if self.jitv2_dispatch_enabled {
+        if cfg!(feature = "lightning") || self.jitv2_dispatch_enabled {
             assert!(!self.pcp.is_null(), "exec_decoded reached with no tracked PhysicalCodePage");
             let page = unsafe { &mut *self.pcp };
-            if page.is_compilable() {
-                let entry_offset = ((self.core.pc & 0xFFF) >> 2) as usize;
-                let trigger = self.core.jit_trigger;
-                if trigger || entry_offset == 0 || page.is_published(entry_offset) {
+            let entry_offset = ((self.core.pc & 0xFFF) >> 2) as usize;
+            let trigger = self.core.jit_trigger;
+            if trigger || page.is_published(entry_offset) {
+                if page.is_entry_valid(entry_offset) {
+                    let func = page.entries[entry_offset].func;
+                    debug_assert!(!func.is_null(), "valid bit set with null func");
+                    #[cfg(feature = "developer")]
+                    { page.entries[entry_offset].call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
+                    return unsafe { jit_fn(&mut self.core as *mut MipsCore) };
+                }
+                // Call-count gate (`j2 min-calls`): only applies to the
+                // async path — `jitv2_inline_compile`'s whole contract is
+                // "compile and run this exact dispatch immediately"
+                // (tests flip it on specifically for that determinism,
+                // see its own doc comment below), which a >0 threshold
+                // would silently break by sometimes returning to the
+                // interpreter instead on the first dispatch. Threshold 0
+                // (the default) makes this check a no-op either way.
+                // Below threshold: skip sending a request this dispatch
+                // (not yet hot enough) and fall through to the
+                // interpreter, same as every other "nothing to send"
+                // outcome below (denylisted, try_schedule lost, ...) —
+                // no early return, this dispatch still needs to actually
+                // execute the instruction via the interpreter path past
+                // this whole gate.
+                // Under `lightning`, `jitv2_inline_compile` is unreachable
+                // (no setter exists outside `developer`, and `lightning`/
+                // `developer` are mutually exclusive — see lib.rs) and is
+                // forced to its literal-`false` compile-time value here, same
+                // reasoning as the dispatch gate above: the field can never
+                // actually be true, so let the compiler see that statically
+                // and drop the inline-compile arm entirely instead of
+                // carrying a dead runtime check on the hot path.
+                let inline_compile = !cfg!(feature = "lightning") && self.jitv2_inline_compile;
+                let below_call_threshold = !inline_compile
+                    && !page.count_dispatch_and_check_threshold(entry_offset, crate::jitv2::min_calls_before_compile());
+                if !below_call_threshold {
+                self.core.jit_trigger = false;
+                let req = crate::jitv2::CompileRequest {
+                    page: self.pcp,
+                    offset: entry_offset as u16,
+                    compiled_for_fr1: (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0,
+                };
+                if inline_compile {
+                    // Unlike the async compile thread's own worker_loop,
+                    // nothing else ever checks this shared Codegen's
+                    // growth on the inline path — so do it here, BEFORE
+                    // compiling this request, not after: `flush_from_cpu_thread`
+                    // clears the page pool (including `self.pcp`/`page`,
+                    // via `nanotlb_invalidate`), which would yank the rug
+                    // out from under the "run it immediately" logic below
+                    // if it ran right after this call's own `handle_request`
+                    // published into that same page. Checking before means
+                    // worst case this dispatch's own compile pushes one
+                    // past the threshold and the *next* dispatch flushes —
+                    // same bounded-overshoot behavior worker_loop already
+                    // accepts for the threaded path.
+                    let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
+                        .is_some_and(|c| c.packing_stats().1 > crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+                    if over_threshold {
+                        // `core.pc` is virtual — jitv2_track_pcp needs a
+                        // physical address, and `page`/`self.pcp` are
+                        // about to go dangling into the just-cleared
+                        // pool, so grab the physical page base from
+                        // `page.pfn` (still valid) before flushing rather
+                        // than re-translating pc from scratch.
+                        let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
+                        unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+                        // Only `self.pcp`/`page` above are stale (raw
+                        // pointers into the just-cleared pool) — the
+                        // nanotlb's own translations are untouched by
+                        // mega_flush, so leave them alone; just null the
+                        // dangling pcp and re-derive it for the exact
+                        // page this dispatch already landed on (mirrors
+                        // jitv2_track_pcp's own pool-exhaustion recovery).
+                        self.pcp = std::ptr::null_mut();
+                        self.jitv2_track_pcp(phys_page_base);
+                        return self.exec_decoded(d);
+                    }
+                    // Take the shared Codegen for the duration of this
+                    // one compile only — see Jitv2::codegen's doc
+                    // comment for why inline dispatch and the async
+                    // compile thread share a single instance rather than
+                    // each owning a separate Cranelift memory arena.
+                    let mut codegen = self.jitv2.lock().codegen.lock().take();
+                    let mut ran_out_of_memory = false;
+                    if let Some(codegen) = codegen.as_mut() {
+                        #[cfg(feature = "developer")]
+                        {
+                            let stats = self.jitv2.lock().stats.clone();
+                            ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                        }
+                        #[cfg(not(feature = "developer"))]
+                        { ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+                    }
+                    *self.jitv2.lock().codegen.lock() = codegen;
+                    if ran_out_of_memory {
+                        // The compile that just ran couldn't get memory
+                        // — flush immediately and retry this exact
+                        // dispatch from scratch, regardless of
+                        // function_count (see
+                        // Codegen::last_compile_ran_out_of_memory's doc
+                        // comment for why the count-based threshold
+                        // alone isn't enough now that regions can be
+                        // much larger than the single-instruction case
+                        // it was originally sized against). Same
+                        // pcp/nanotlb recovery as the pre-emptive
+                        // threshold check above.
+                        let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
+                        unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+                        self.pcp = std::ptr::null_mut();
+                        self.jitv2_track_pcp(phys_page_base);
+                        return self.exec_decoded(d);
+                    }
+                    // Freshly published (if handle_request succeeded):
+                    // run it immediately instead of falling through to
+                    // the interpreter and waiting for the next dispatch
+                    // of this PC to pick it up via is_entry_valid above.
                     if page.is_entry_valid(entry_offset) {
                         let func = page.entries[entry_offset].func;
                         debug_assert!(!func.is_null(), "valid bit set with null func");
@@ -5959,136 +6164,28 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                         let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
                         return unsafe { jit_fn(&mut self.core as *mut MipsCore) };
                     }
-                    // Call-count gate (`j2 min-calls`): only applies to the
-                    // async path — `jitv2_inline_compile`'s whole contract is
-                    // "compile and run this exact dispatch immediately"
-                    // (tests flip it on specifically for that determinism,
-                    // see its own doc comment below), which a >0 threshold
-                    // would silently break by sometimes returning to the
-                    // interpreter instead on the first dispatch. Threshold 0
-                    // (the default) makes this check a no-op either way.
-                    // Below threshold: skip sending a request this dispatch
-                    // (not yet hot enough) and fall through to the
-                    // interpreter, same as every other "nothing to send"
-                    // outcome below (denylisted, try_schedule lost, ...) —
-                    // no early return, this dispatch still needs to actually
-                    // execute the instruction via the interpreter path past
-                    // this whole gate.
-                    let below_call_threshold = !self.jitv2_inline_compile
-                        && !page.count_dispatch_and_check_threshold(entry_offset, crate::jitv2::min_calls_before_compile());
-                    if !below_call_threshold {
-                    self.core.jit_trigger = false;
-                    let req = crate::jitv2::CompileRequest {
-                        page: self.pcp,
-                        offset: entry_offset as u16,
-                        compiled_for_fr1: (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0,
-                    };
-                    if self.jitv2_inline_compile {
-                        // Unlike the async compile thread's own worker_loop,
-                        // nothing else ever checks this shared Codegen's
-                        // growth on the inline path — so do it here, BEFORE
-                        // compiling this request, not after: `flush_from_cpu_thread`
-                        // clears the page pool (including `self.pcp`/`page`,
-                        // via `nanotlb_invalidate`), which would yank the rug
-                        // out from under the "run it immediately" logic below
-                        // if it ran right after this call's own `handle_request`
-                        // published into that same page. Checking before means
-                        // worst case this dispatch's own compile pushes one
-                        // past the threshold and the *next* dispatch flushes —
-                        // same bounded-overshoot behavior worker_loop already
-                        // accepts for the threaded path.
-                        let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
-                            .is_some_and(|c| c.packing_stats().1 > crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
-                        if over_threshold {
-                            // `core.pc` is virtual — jitv2_track_pcp needs a
-                            // physical address, and `page`/`self.pcp` are
-                            // about to go dangling into the just-cleared
-                            // pool, so grab the physical page base from
-                            // `page.pfn` (still valid) before flushing rather
-                            // than re-translating pc from scratch.
-                            let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
-                            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
-                            // Only `self.pcp`/`page` above are stale (raw
-                            // pointers into the just-cleared pool) — the
-                            // nanotlb's own translations are untouched by
-                            // mega_flush, so leave them alone; just null the
-                            // dangling pcp and re-derive it for the exact
-                            // page this dispatch already landed on (mirrors
-                            // jitv2_track_pcp's own pool-exhaustion recovery).
-                            self.pcp = std::ptr::null_mut();
-                            self.jitv2_track_pcp(phys_page_base);
-                            return self.exec_decoded(d);
-                        }
-                        // Take the shared Codegen for the duration of this
-                        // one compile only — see Jitv2::codegen's doc
-                        // comment for why inline dispatch and the async
-                        // compile thread share a single instance rather than
-                        // each owning a separate Cranelift memory arena.
-                        let mut codegen = self.jitv2.lock().codegen.lock().take();
-                        let mut ran_out_of_memory = false;
-                        if let Some(codegen) = codegen.as_mut() {
-                            #[cfg(feature = "developer")]
-                            {
-                                let stats = self.jitv2.lock().stats.clone();
-                                ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
-                            }
-                            #[cfg(not(feature = "developer"))]
-                            { ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
-                        }
-                        *self.jitv2.lock().codegen.lock() = codegen;
-                        if ran_out_of_memory {
-                            // The compile that just ran couldn't get memory
-                            // — flush immediately and retry this exact
-                            // dispatch from scratch, regardless of
-                            // function_count (see
-                            // Codegen::last_compile_ran_out_of_memory's doc
-                            // comment for why the count-based threshold
-                            // alone isn't enough now that regions can be
-                            // much larger than the single-instruction case
-                            // it was originally sized against). Same
-                            // pcp/nanotlb recovery as the pre-emptive
-                            // threshold check above.
-                            let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
-                            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
-                            self.pcp = std::ptr::null_mut();
-                            self.jitv2_track_pcp(phys_page_base);
-                            return self.exec_decoded(d);
-                        }
-                        // Freshly published (if handle_request succeeded):
-                        // run it immediately instead of falling through to
-                        // the interpreter and waiting for the next dispatch
-                        // of this PC to pick it up via is_entry_valid above.
-                        if page.is_entry_valid(entry_offset) {
-                            let func = page.entries[entry_offset].func;
-                            debug_assert!(!func.is_null(), "valid bit set with null func");
-                            #[cfg(feature = "developer")]
-                            { page.entries[entry_offset].call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                            let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
-                            return unsafe { jit_fn(&mut self.core as *mut MipsCore) };
-                        }
-                        // handle_request declined (denylisted, e.g. a 0xFFC
-                        // hazard or codegen gap) — fall through to the
-                        // interpreter below, same as the threaded path's
-                        // post-send fallthrough.
-                    } else if page.try_schedule(entry_offset) {
-                        // Nothing valid to run, and no request for this
-                        // offset already in flight (try_schedule won the
-                        // test-and-set): ask the compile thread for a fresh
-                        // artifact and fall through to the interpreter
-                        // below. If try_schedule lost (another dispatch
-                        // already scheduled this exact offset — e.g. a hot
-                        // loop back-edge re-triggering every iteration while
-                        // the first request is still queued/compiling),
-                        // skip sending a redundant duplicate; still falls
-                        // through to the interpreter the same as if we had.
-                        {
-                            let mut jit = self.jitv2.lock();
-                            let stats = jit.stats.clone();
-                            jit.compile_queue.send(req, &stats);
-                        }
+                    // handle_request declined (denylisted, e.g. a 0xFFC
+                    // hazard or codegen gap) — fall through to the
+                    // interpreter below, same as the threaded path's
+                    // post-send fallthrough.
+                } else if page.try_schedule(entry_offset) {
+                    // Nothing valid to run, and no request for this
+                    // offset already in flight (try_schedule won the
+                    // test-and-set): ask the compile thread for a fresh
+                    // artifact and fall through to the interpreter
+                    // below. If try_schedule lost (another dispatch
+                    // already scheduled this exact offset — e.g. a hot
+                    // loop back-edge re-triggering every iteration while
+                    // the first request is still queued/compiling),
+                    // skip sending a redundant duplicate; still falls
+                    // through to the interpreter the same as if we had.
+                    {
+                        let mut jit = self.jitv2.lock();
+                        let stats = jit.stats.clone();
+                        jit.compile_queue.send(req, &stats);
                     }
-                    } // !below_call_threshold
                 }
+                } // !below_call_threshold
             }
         }
 
@@ -6340,9 +6437,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
         assert!(!self.pcp.is_null(), "lockstep_check reached with no tracked PhysicalCodePage");
         let page = unsafe { &*self.pcp };
-        if !page.is_compilable() {
-            return None;
-        }
         let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
         let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
         let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
@@ -6439,9 +6533,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
         assert!(!self.pcp.is_null(), "lockstep_check_fpu reached with no tracked PhysicalCodePage");
         let page = unsafe { &*self.pcp };
-        if !page.is_compilable() {
-            return None;
-        }
         let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
         let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
         let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
@@ -6546,9 +6637,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
         assert!(!self.pcp.is_null(), "lockstep_check_branch reached with no tracked PhysicalCodePage");
         let page = unsafe { &*self.pcp };
-        if !page.is_compilable() {
-            return None;
-        }
         let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
         let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
         let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
@@ -6558,9 +6646,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // if the check proceeds, to compile it — same same-page assumption
         // `emit_slot_semantics`/the real compiler already makes (a
         // branch/jump at a page's last word is the 0xFFC hazard, excluded by
-        // is_compilable/the analyzer, not reachable here). Fetching the raw
-        // word here is a code read, not a data access — safe to do
-        // unconditionally, unlike actually executing it.
+        // the analyzer, not reachable here). Fetching the raw word here is a
+        // code read, not a data access — safe to do unconditionally, unlike
+        // actually executing it.
         let slot_word = entry_word + 1;
         if slot_word >= crate::jitv2::ENTRIES_PER_PAGE {
             return None;
@@ -6713,9 +6801,6 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
         assert!(!self.pcp.is_null(), "lockstep_check_load_store reached with no tracked PhysicalCodePage");
         let page = unsafe { &*self.pcp };
-        if !page.is_compilable() {
-            return None;
-        }
         let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
         let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
         let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
@@ -7918,7 +8003,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     /// outside a `step_one_inline_counting_instructions` caller like
     /// `jitcheck` — see that field's doc comment).
     pub fn state_digest(&self) -> Result<CpuStateDigest, String> {
+        #[cfg(feature = "developer")]
         let mut exec = self.try_lock_executor()?;
+        #[cfg(not(feature = "developer"))]
+        let exec = self.try_lock_executor()?;
         #[cfg(feature = "developer")]
         let hw_reads = std::mem::take(&mut exec.hw_read_fixup_recorded);
         #[cfg(not(feature = "developer"))]
@@ -9254,6 +9342,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 writeln!(writer, "j2 inline compile: {}", if exec.jitv2_inline_compile { "on" } else { "off" }).unwrap();
                             }
                             Some("on") => {
+                                #[cfg(feature = "lightning")]
+                                return Err("j2 inline on: unavailable under `lightning` — compiles always go to the async queue, never inline".to_string());
                                 // Switching TO inline: the async compile
                                 // queue, if running, must give its Codegen
                                 // back — inline dispatch takes it from
@@ -9261,11 +9351,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 // field's doc comment for why the two modes
                                 // share one Cranelift arena instead of each
                                 // keeping a separate one).
-                                if let Some(codegen) = exec.jitv2.lock().compile_queue.stop() {
-                                    *exec.jitv2.lock().codegen.lock() = Some(codegen);
+                                #[cfg(not(feature = "lightning"))]
+                                {
+                                    if let Some(codegen) = exec.jitv2.lock().compile_queue.stop() {
+                                        *exec.jitv2.lock().codegen.lock() = Some(codegen);
+                                    }
+                                    exec.jitv2_inline_compile = true;
+                                    writeln!(writer, "j2 inline compile: on").unwrap();
                                 }
-                                exec.jitv2_inline_compile = true;
-                                writeln!(writer, "j2 inline compile: on").unwrap();
                             }
                             Some("off") => {
                                 // Switching TO threaded: hand the shared
@@ -9298,8 +9391,13 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 writeln!(writer, "j2 dispatch: on").unwrap();
                             }
                             Some("off") => {
-                                exec.jitv2_dispatch_enabled = false;
-                                writeln!(writer, "j2 dispatch: off (real JIT dispatch gate skipped entirely, interpreter-only)").unwrap();
+                                #[cfg(feature = "lightning")]
+                                return Err("j2 dispatch off: unavailable under `lightning` — JIT dispatch is always on".to_string());
+                                #[cfg(not(feature = "lightning"))]
+                                {
+                                    exec.jitv2_dispatch_enabled = false;
+                                    writeln!(writer, "j2 dispatch: off (real JIT dispatch gate skipped entirely, interpreter-only)").unwrap();
+                                }
                             }
                             Some(_) => return Err("Usage: j2 dispatch [on|off]".to_string()),
                         }
@@ -9463,10 +9561,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         let pc = exec.core.pc;
                         let entry_offset = ((pc & 0xFFF) >> 2) as usize;
 
-                        writeln!(writer, "pfn={:#010x}  compilable={}", page.pfn, page.is_compilable()).unwrap();
-                        if page.is_compilable() {
-                            writeln!(writer, "gen={}", page.current_gen()).unwrap();
-                        }
+                        writeln!(writer, "pfn={:#010x}  gen={}", page.pfn, page.current_gen()).unwrap();
                         writeln!(writer, "pc={:#018x}  entry_offset={:#05x}", pc, entry_offset).unwrap();
                         writeln!(
                             writer,
@@ -9502,7 +9597,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 let vaddr = vbase | ((off as u64) * 4);
                                 let func = page.entries[off].func;
                                 let gen = page.entries[off].gen.load(Ordering::Relaxed);
-                                let stale = page.is_compilable() && gen != page.current_gen();
+                                let stale = gen != page.current_gen();
                                 #[cfg(feature = "developer")]
                                 let dev_cols = format!(" instrs={} code_size={} calls={}",
                                     page.entries[off].instr_count,
@@ -9667,7 +9762,32 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             }
                         }
                     }
-                    _ => return Err("Usage: j2 <pcp|status|inline [on|off]|dispatch [on|off]|batch [on|off]|opt [none|speed]|min-instrs [N]|min-calls [N]|lockstep>".to_string()),
+                    #[cfg(all(target_os = "linux", feature = "developer"))]
+                    "hugepages" => {
+                        let jit = exec.jitv2.lock();
+                        let (ptr, len) = jit.codegen.lock().as_ref()
+                            .map(|c| c.arena_range())
+                            .unwrap_or((0, 0));
+                        if len == 0 {
+                            writeln!(writer, "jitv2 arena not yet allocated (no compile has run) or owned by the async compile thread right now — try again after `stop`/a compile.").unwrap();
+                            return Ok(());
+                        }
+                        writeln!(writer, "arena: {:#x}..{:#x} ({} bytes, {} MiB)", ptr, ptr + len, len, len / (1024 * 1024)).unwrap();
+                        match crate::jitv2::paged_memory::anon_hugepages_in_range(ptr, len) {
+                            Some(hugepage_bytes) => {
+                                let pct = hugepage_bytes as f64 * 100.0 / len as f64;
+                                writeln!(writer, "AnonHugePages within arena: {} bytes ({} MiB, {:.1}% of reservation) — from /proc/self/smaps",
+                                    hugepage_bytes, hugepage_bytes / (1024 * 1024), pct).unwrap();
+                                if hugepage_bytes == 0 {
+                                    writeln!(writer, "  0% is suspicious once real code has compiled and finalized — check `cat /sys/kernel/mm/transparent_hugepage/enabled` (want `madvise` or `always`, not `never`).").unwrap();
+                                }
+                            }
+                            None => {
+                                writeln!(writer, "/proc/self/smaps unavailable (sandboxed/restricted environment?) — can't verify hugepage status this way.").unwrap();
+                            }
+                        }
+                    }
+                    _ => return Err("Usage: j2 <pcp|status|inline [on|off]|dispatch [on|off]|batch [on|off]|opt [none|speed]|min-instrs [N]|min-calls [N]|lockstep|hugepages>".to_string()),
                 }
                 Ok(())
             }

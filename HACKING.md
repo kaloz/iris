@@ -133,19 +133,19 @@ PC advancement and delay slots are managed internally by the executor.
 ```rust
 pub type ExecStatus = u32;
 
-// Normal (non-exception) status — bits [15:8]
-pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // advance PC by 4
-pub const EXEC_COMPLETE_NO_INC:    ExecStatus = 0x0000_0080; // PC already set, no increment
-pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry same instr
-pub const EXEC_BRANCH_DELAY:       ExecStatus = 0x0000_0200; // branch taken; target in delay_slot_target
-pub const EXEC_BRANCH_LIKELY_SKIP: ExecStatus = 0x0000_0400; // branch-likely not taken, skip delay slot
-pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
+// Normal (non-exception) status
+pub const EXEC_COMPLETE:   ExecStatus = 0x0000_0000; // ran fine, no exception/retry/breakpoint
+pub const EXEC_RETRY:      ExecStatus = 0x0000_0100; // bus busy, retry same instr
+pub const EXEC_FALLBACK:   ExecStatus = 0x0000_0200; // jitv2+lightning's decode-skip fast path missed; caller must decode and dispatch normally
+pub const EXEC_BREAKPOINT: ExecStatus = 0x0000_0800; // breakpoint hit
 
 // Exception flags — upper bits
 pub const EXEC_IS_EXCEPTION:       ExecStatus = 1 << 27;     // 0x0800_0000
 pub const EXEC_IS_TLB_REFILL:      ExecStatus = 1 << 28;     // 0x1000_0000 — use 32-bit UTLB vector
 pub const EXEC_IS_XTLB_REFILL:     ExecStatus = 1 << 29;     // 0x2000_0000 — use 64-bit XTLB vector
 ```
+
+`EXEC_COMPLETE_NO_INC`/`EXEC_BRANCH_DELAY`/`EXEC_BRANCH_LIKELY_SKIP` used to distinguish *why* PC ended up where it did (interpreter PC+=4 vs a JIT/ERET direct-set vs a taken branch vs PC+=8) back when callers needed that to decide whether to advance PC themselves; every handler is now unconditionally responsible for its own PC, so that distinction is gone. A caller that needs "was a branch just taken" (e.g. gdbstub's `step_one`) checks `core.in_delay_slot` instead.
 
 Exception status values are built with helpers:
 

@@ -1,5 +1,12 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 
+#[cfg(all(feature = "lightning", feature = "developer"))]
+compile_error!(
+    "features `lightning` and `developer` are mutually exclusive: lightning strips \
+     debuggability for speed (fixed jitv2 dispatch, no jitcheck/inline-compile \
+     switching, etc.) while developer exists specifically to add it back — pick one"
+);
+
 /// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
 /// surface "CHD support required" / "camera support required" hints without
 /// duplicating the cargo feature set.
