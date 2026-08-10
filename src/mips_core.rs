@@ -1095,21 +1095,33 @@ impl MipsCore {
     /// row), which means the guest genuinely retuned its periodic tick, so
     /// the slow bucket is re-seeded from it.
     fn infer_count_hz(&mut self, d: u64) {
-        // A real 100 Hz/1 kHz periodic tick, at any plausible guest CPU
-        // clock (tens of MHz, Count = clock/2), spans at least tens of
-        // thousands of hardware counts even for the 1 kHz case. PROM runs
-        // short one-shot Compare writes before IRIX's own clock handler
-        // ever starts (diagnostic delays, early watchdogs, e.g. a live
-        // 58-count delta observed at boot) — trusting one of those as the
-        // *seed* for compare_delta_slow poisons every later classification
-        // (everything else gets fuzzy-matched against that bad baseline)
-        // until two future one-shots coincidentally match each other
-        // closely enough to force a re-seed. A rejected mid-stream (already
-        // seeded) delta isn't this fragile — it just falls through to
-        // compare_delta_unrecognized and gets another chance — so the floor
-        // only needs to guard the seed itself.
+        // Bound `d` against the full plausible range of real MIPS Count
+        // clocks (Count = CPU_clock/2), roughly 10 MHz to 300 MHz for any
+        // guest this emulator targets: a 1 kHz tick spans at least
+        // 10,000,000/1000 = 10,000 counts at the slowest plausible clock,
+        // and a 100 Hz tick spans at most 300,000,000/100 = 3,000,000
+        // counts at the fastest. PROM runs short one-shot Compare writes
+        // before IRIX's own clock handler ever starts (diagnostic delays,
+        // early watchdogs, e.g. a live 58-count delta observed at boot),
+        // and one-shots can also be implausibly *large* (multi-second
+        // watchdog timeouts) — trusting either extreme anywhere this
+        // function can write into compare_delta_slow/fast poisons every
+        // later classification (everything else gets fuzzy-matched against
+        // that bad baseline). This bound used to guard only the very first
+        // call (`compare_delta_slow == 0 && compare_delta_fast == 0`), on
+        // the theory that once a bucket is seeded, further bad deltas just
+        // fall through to compare_delta_unrecognized — but that reasoning
+        // missed that a *seeded-but-tiny* bucket keeps being read, not just
+        // written: `compare_delta_slow / 10` (the "recognize the fast
+        // tick" branch below) can itself land below the floor if
+        // compare_delta_slow is small, and `fuzzy_eq` against a tiny value
+        // degenerates (its ±5% threshold rounds to 0, making it an
+        // exact-match test at low magnitudes) — a live run latched
+        // compare_delta_fast=1 this way. Apply the bound unconditionally,
+        // every call, not just the first.
         const MIN_PLAUSIBLE_TICK_DELTA: u64 = 10_000;
-        if self.compare_delta_slow == 0 && self.compare_delta_fast == 0 && d < MIN_PLAUSIBLE_TICK_DELTA {
+        const MAX_PLAUSIBLE_TICK_DELTA: u64 = 3_000_000;
+        if d < MIN_PLAUSIBLE_TICK_DELTA || d > MAX_PLAUSIBLE_TICK_DELTA {
             return;
         }
 
