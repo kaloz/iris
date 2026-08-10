@@ -357,10 +357,10 @@ pub const DRAWMODE0_INTERP_SETUP_MASK: u32 =
 
 /// Mask of dm1 bits that affect planes_setup / host_setup / proc selection.
 /// planes(2:0) | drawdepth(4:3) | dblsrc(5) | rwpacked(7) | hostdepth(9:8) |
-/// rwdouble(10) | rgbmode(15) | dither(16) | fastclear(17) | blend(18) |
+/// rwdouble(10) | compare(14:12) | rgbmode(15) | dither(16) | fastclear(17) | blend(18) |
 /// sfactor(21:19) | dfactor(24:22) | backblend(25) | blendalpha(27) | logicop(31:28)
 pub const DRAWMODE1_INTERP_SETUP_MASK: u32 =
-    0x7 | (0x3<<3) | (1<<5) | (1<<7) | (0x3<<8) | (1<<10) |
+    0x7 | (0x3<<3) | (1<<5) | (1<<7) | (0x3<<8) | (1<<10) | (0x7<<12) |
     (1<<15) | (1<<16) | (1<<17) | (1<<18) |
     (0x7<<19) | (0x7<<22) | (1<<25) | (1<<27) | (0xF<<28);
 
@@ -370,6 +370,10 @@ pub const DRAWMODE1_PLANES_RGBA: u32 = 2;
 pub const DRAWMODE1_PLANES_OLAY: u32 = 4;
 pub const DRAWMODE1_PLANES_PUP: u32 = 5;
 pub const DRAWMODE1_PLANES_CID: u32 = 6;
+
+/// COMPARE=0x7 (all three relations OR'ed) — afunction always passes, i.e. disabled.
+/// Hardware reset default; real drawmode1 words always carry this explicitly.
+pub const DRAWMODE1_COMPARE_DISABLE: u32 = 0x7 << 12;
 
 pub const DRAWMODE1_LOGICOP_ZERO: u32 = 0 << 28;
 pub const DRAWMODE1_LOGICOP_AND: u32 = 1 << 28;
@@ -823,6 +827,16 @@ pub struct Rex3Context {
 }
 
 impl Rex3Context {
+    /// Power-on/reset state: like `Default::default()`, but with DRAWMODE1.COMPARE
+    /// at its documented hardware reset value (0x7 = afunction disabled/always-pass).
+    /// `#[derive(Default)]` zero-inits DrawMode1, which would leave COMPARE=0x0
+    /// (always-kill) — real REX3 boots with afunction off until software sets it.
+    pub fn power_on_default() -> Self {
+        let mut ctx = Self::default();
+        ctx.drawmode1 = DrawMode1(ctx.drawmode1.0 | (0x7 << 12));
+        ctx
+    }
+
     pub fn set_colori(&mut self, val: u32) {
         if self.drawmode1.rgbmode() {
             // CI-style integer write to RGB mode: each byte → component << 11
@@ -1103,6 +1117,9 @@ pub struct Rex3 {
     pub px_wr: UnsafeCell<fn(&Rex3, u32, u32)>,
     pub px_amp: UnsafeCell<fn(u32) -> u32>,
     pub px_logic: UnsafeCell<fn(u32, u32) -> u32>,
+    /// Afunction test: (src_alpha, alpharef) -> pass. Selected in planes_setup from
+    /// DRAWMODE1 COMPARE/RGBMODE; a no-op always-pass fn outside rgbmode or COMPARE==0x7.
+    pub px_afunc: UnsafeCell<fn(u32, u32) -> bool>,
     /// Pack bayer index into bits [27:24] for dither compress functions (rgbmode=1 only).
     /// In CI mode this is a no-op (returns color unchanged) — CI values need no dithering.
     pub px_bayer: UnsafeCell<fn(u32, i32, i32) -> u32>,
@@ -1265,13 +1282,14 @@ impl Rex3 {
         Self {
             config,
             dcb: Mutex::new(Rex3DcbState::default()),
-            context: UnsafeCell::new(Rex3Context::default()),
+            context: UnsafeCell::new(Rex3Context::power_on_default()),
             fb_rgb: UnsafeCell::new(fb_rgb),
             fb_aux: UnsafeCell::new(fb_aux),
             px_rd: UnsafeCell::new(Self::default_px_rd),
             px_wr: UnsafeCell::new(Self::default_px_wr),
             px_amp: UnsafeCell::new(Self::amplify_nop),
             px_logic: UnsafeCell::new(Self::logic_op_src),
+            px_afunc: UnsafeCell::new(Self::afunc_always),
             px_bayer: UnsafeCell::new(Self::bayer_pack),
             px_compress: UnsafeCell::new(Self::identity),
             px_expand: UnsafeCell::new(Self::identity),
@@ -2680,10 +2698,12 @@ impl Rex3 {
 
     fn combine_host_dda(ctx: &Rex3Context, host_pixel: u32) -> u32 {
         let color = if ctx.drawmode0.colorhost() { host_pixel } else { ctx.get_colori() };
-        if !ctx.drawmode1.rgbmode() {
-            return color;
-        }
-        // RGB mode: overlay alpha channel
+        // Afunction's source alpha comes from "either DDA or host" (selected by
+        // ALPHAHOST) independent of RGB/CI plane format (rex3 spec §3.8.1) — CI-mode
+        // GL apps can stream a color index alongside a host alpha byte for ALPHAREF
+        // comparison. Always overlay bits 31:24 with the resolved alpha so afunction
+        // sees the right value in both modes; compress_fn/write paths for CI already
+        // mask down to the plane-depth index and never look at these high bits.
         let a = if ctx.drawmode0.alphahost() {
             (host_pixel >> 24) & 0xFF
         } else {
@@ -2843,6 +2863,16 @@ impl Rex3 {
             } else {
                 Self::combine_host_dda(ctx, host_pixel)
             };
+
+            // Afunction: inhibit the write unless source alpha (raw_src bits 31:24)
+            // passes the DRAWMODE1 COMPARE relation against ALPHAREF. px_afunc is
+            // selected once per mode change in planes_setup (see afunc_* below);
+            // it's a no-op always-pass function outside rgbmode or when COMPARE==0x7.
+            let afunc_fn = unsafe { *self.px_afunc.get() };
+            if !afunc_fn(raw_src >> 24 & 0xFF, ctx.alpharef & 0xFF) {
+                return;
+            }
+
             let rd_fn = unsafe { *self.px_rd.get() };
             let wr_fn = unsafe { *self.px_wr.get() };
             let compress_fn = unsafe { *self.px_compress.get() };
@@ -3186,6 +3216,17 @@ impl Rex3 {
     fn logic_op_ori(src: u32, dst: u32) -> u32 { !src | dst }
     fn logic_op_nand(src: u32, dst: u32) -> u32 { !(src & dst) }
     fn logic_op_one(_src: u32, _dst: u32) -> u32 { !0 }
+
+    // Afunction: (src_alpha, alpharef) -> pass.  COMPARE is three OR'ed enable
+    // bits — src>ref(2), src=ref(1), src<ref(0) — selected once in planes_setup.
+    fn afunc_always(_sa: u32, _aref: u32) -> bool { true }
+    fn afunc_never(_sa: u32, _aref: u32) -> bool { false }
+    fn afunc_lt(sa: u32, aref: u32) -> bool { sa < aref }
+    fn afunc_eq(sa: u32, aref: u32) -> bool { sa == aref }
+    fn afunc_le(sa: u32, aref: u32) -> bool { sa <= aref }
+    fn afunc_gt(sa: u32, aref: u32) -> bool { sa > aref }
+    fn afunc_ne(sa: u32, aref: u32) -> bool { sa != aref }
+    fn afunc_ge(sa: u32, aref: u32) -> bool { sa >= aref }
 
     fn read_rgb_4_0(rex: &Rex3, addr: u32) -> u32 {
         let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
@@ -3661,13 +3702,16 @@ impl Rex3 {
                     let en_ls       = ctx.drawmode0.enlspattern();
                     let no_zpopaque = !ctx.drawmode0.zpopaque();
                     let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
+                    // Afunction (alpha-vs-ALPHAREF compare) applies regardless of rgbmode;
+                    // only inhibits writes when COMPARE != 0x7 (always-pass/disabled).
+                    let no_afunction = ctx.drawmode1.compare() == 0x7;
 
                     if ctx.drawmode1.fastclear() && no_cid && no_host {
                         Self::process_pixel_fastclear
-                    } else if no_cid && no_host && no_blend && en_z && !en_ls && no_zpopaque && is_src_op {
+                    } else if no_cid && no_host && no_blend && no_afunction && en_z && !en_ls && no_zpopaque && is_src_op {
                         // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
                         Self::process_pixel_zpattern
-                    } else if no_cid && no_host && no_blend {
+                    } else if no_cid && no_host && no_blend && no_afunction {
                         // Common solid fills, spans, lines: no blend, no host FIFO.
                         Self::process_pixel_noblend
                     } else {
@@ -3831,11 +3875,27 @@ impl Rex3 {
 
         let bayer_fn: fn(u32, i32, i32) -> u32 = if rgbmode { Self::bayer_pack } else { Self::bayer_nop };
 
+        // Afunction: "source alpha (either from DDA or host)" vs ALPHAREF — applies in
+        // both RGB and CI mode (spec doesn't scope it to RGB; combine_host_dda leaves
+        // raw_src bits 31:24 as 0 in CI/DDA mode, so afunc_eq there degenerates to
+        // "alpharef==0", which is the correct behavior, not a special case).
+        let afunc_fn: fn(u32, u32) -> bool = match drawmode1.compare() {
+            0b000 => Self::afunc_never,
+            0b001 => Self::afunc_lt,
+            0b010 => Self::afunc_eq,
+            0b011 => Self::afunc_le,
+            0b100 => Self::afunc_gt,
+            0b101 => Self::afunc_ne,
+            0b110 => Self::afunc_ge,
+            _      => Self::afunc_always, // 0b111: disabled
+        };
+
         unsafe {
             *self.px_rd.get() = rd;
             *self.px_wr.get() = wr;
             *self.px_amp.get() = amp;
             *self.px_logic.get() = logic_fn;
+            *self.px_afunc.get() = afunc_fn;
             *self.px_bayer.get() = bayer_fn;
             *self.px_compress.get() = compress;
             *self.px_expand.get() = expand;
@@ -5221,7 +5281,7 @@ impl BusDevice for Rex3 {
 impl Resettable for Rex3 {
     fn power_on(&self) {
         // Reset drawing context
-        unsafe { *self.context.get() = Rex3Context::default(); }
+        unsafe { *self.context.get() = Rex3Context::power_on_default(); }
         // Reset config registers
         self.config.config.store(0, Ordering::Relaxed);
         self.config.status.store(0, Ordering::Relaxed);

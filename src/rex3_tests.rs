@@ -182,9 +182,11 @@ fn write_yendf(rex: &Rex3, screen_y: i32, frac4: i32) {
 // DRAWMODE constants (matching minigl3.c / SGI headers)
 // ============================================================================
 
-// DRAWMODE1 combinations
-const DM1_CI8_SRC: u32   = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_LOGICOP_SRC;
-const DM1_RGB24_SRC: u32 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC;
+// DRAWMODE1 combinations. COMPARE is included at its disabled value (0x7) — real
+// drawmode1 words always carry it explicitly; omitting it would leave COMPARE=0
+// (afunction always-kill) since DrawMode1's bitfield default zero-inits.
+const DM1_CI8_SRC: u32   = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+const DM1_RGB24_SRC: u32 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
 
 // DRAWMODE1 host-depth fields (bits [4:3] = hostdepth, bit 16 = rwpacked, bit 17 = rwdouble)
 // hostdepth: 0=4bpp, 1=8bpp, 2=12bpp, 3=32bpp
@@ -660,7 +662,7 @@ fn test_logicop_zero_clears() {
     assert_ne!(read_pixel(&rex, 4, 4) & 0xFF, 0);
 
     // Clear with ZERO logicop
-    let dm1_zero = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_LOGICOP_ZERO;
+    let dm1_zero = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_ZERO;
     reg(&rex, REX3_DRAWMODE1, dm1_zero);
     reg(&rex, REX3_COLORI, 0xFF);
     reg(&rex, REX3_XYENDI,   xy(4, 4));
@@ -674,7 +676,7 @@ fn test_logicop_zero_clears() {
 fn test_logicop_xor_roundtrip() {
     let rex = make_rex3();
     rex3init(&rex);
-    let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_LOGICOP_XOR;
+    let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_XOR;
 
     reg(&rex, REX3_DRAWMODE1, dm1_xor);
     reg(&rex, REX3_WRMASK, 0xFF);
@@ -1028,12 +1030,12 @@ fn test_patterns_gouraud_shade_span() {
 // DM1 values with host-depth and packed/double flags
 // CI8: hostdepth=1 (8bpp), rwpacked (bit 7), same draw-plane config as DM1_CI8_SRC
 const DM1_CI8_HOSTRW: u32 =
-    DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_LOGICOP_SRC | (1 << 8) | (1 << 7);
+    DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (1 << 8) | (1 << 7);
 // CI8 64-bit: same as CI8 + rwdouble (bit 10) → 8 CI8 pixels per 64-bit word
 const DM1_CI8_HOSTRW64: u32 = DM1_CI8_HOSTRW | (1 << 10);
 // RGB24: hostdepth=3 (32bpp), rwpacked (bit 7), same draw-plane as DM1_RGB24_SRC
 const DM1_RGB24_HOSTRW: u32 =
-    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC | (3 << 8) | (1 << 7);
+    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (3 << 8) | (1 << 7);
 // RGB24 64-bit: same as above + rwdouble (bit 10)
 const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
 

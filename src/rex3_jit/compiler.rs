@@ -86,6 +86,7 @@ impl Dm1 {
     fn hostdepth(&self)   -> u32  { (self.val >> 8) & 3 }
     fn rwdouble(&self)    -> bool { self.val & (1 << 10) != 0 }
     fn swapendian(&self)  -> bool { self.val & (1 << 11) != 0 }
+    fn compare(&self)     -> u32  { (self.val >> 12) & 7 }
     fn rgbmode(&self)     -> bool { self.val & (1 << 15) != 0 }
     fn dither(&self)      -> bool { self.val & (1 << 16) != 0 }
     fn fastclear(&self)   -> bool { self.val & (1 << 17) != 0 }
@@ -1136,12 +1137,19 @@ fn emit_shader(
                 b.ins().sshr(cr, c11)
             };
 
-            // alphahost=1 (only): color from DDA, alpha from host_pixel bits[31:24]
-            let raw_src = if is_hostw && dm0.alphahost() && !dm0.colorhost() && dm1.rgbmode() {
-                let alpha24 = b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64);
-                let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
-                b.ins().bor(color24, alpha24)
-            } else { raw_src };
+            // Afunction's source alpha is "either DDA or host" (selected by ALPHAHOST),
+            // independent of RGB/CI plane format — mirrors combine_host_dda in rex3.rs.
+            // Always overlay bits 31:24 so px_afunc/afunc_cmp below see the right value;
+            // CI write paths mask down to the plane-depth index and never see these bits.
+            let alpha_byte = if dm0.alphahost() {
+                b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64)
+            } else {
+                let ca = ld32!(ctx_off!(coloralpha));
+                let ca_c = clamp_color_component(&mut b, ca);
+                b.ins().ishl_imm_s(ca_c, 24)
+            };
+            let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
+            let raw_src = b.ins().bor(color24, alpha_byte);
 
             // Pattern checks (zpopaque/lsopaque can override src with colorback)
             let draw_block = b.create_block();
@@ -1202,7 +1210,43 @@ fn emit_shader(
             b.ins().select(use_bg_bool, colorback_v, raw_src)
         };
 
-        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+        // Afunction: DRAWMODE1 COMPARE tests source alpha (src_color bits 31:24) against
+        // ALPHAREF and inhibits the write on failure. Applies in both RGB and CI mode
+        // (in CI/DDA mode raw_src bits 31:24 are 0, so e.g. afunc_eq degenerates to
+        // "alpharef==0" — that's correct, not a special case). Mirrors the interpreter's
+        // px_afunc (afunc_{always,never,lt,eq,le,gt,ne,ge}). cmp==7 (disabled) is the
+        // common case — resolved at compile time so no check is emitted at all.
+        // FASTCLEAR bypasses afunction entirely, matching process_pixel_fastclear in
+        // the interpreter (a dispatch-level bypass, not routed through px_afunc at all).
+        let afunc_cmp = if dm1.fastclear() && !is_hostw { 7 } else { dm1.compare() };
+        if afunc_cmp == 7 {
+            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+        } else if afunc_cmp == 0 {
+            // Always-kill: still walks the loop (shade/pattern/shifter bookkeeping below),
+            // just never writes — same shape as a pattern-miss, not-opaque skip.
+        } else {
+            let sa   = b.ins().ushr_imm_s(src_color, 24);
+            let sa8  = b.ins().band_imm_s(sa, 0xFF);
+            let aref_v  = ld32!(ctx_off!(alpharef));
+            let aref8   = b.ins().band_imm_s(aref_v, 0xFF);
+            let cc = match afunc_cmp {
+                1 => IntCC::UnsignedLessThan,
+                2 => IntCC::Equal,
+                3 => IntCC::UnsignedLessThanOrEqual,
+                4 => IntCC::UnsignedGreaterThan,
+                5 => IntCC::NotEqual,
+                6 => IntCC::UnsignedGreaterThanOrEqual,
+                _ => unreachable!("afunc_cmp 0 and 7 handled above"),
+            };
+            let pass = b.ins().icmp(cc, sa8, aref8);
+            let write_block = b.create_block();
+            let after_write = b.create_block();
+            b.ins().brif(pass, write_block, &[], after_write, &[]);
+            b.switch_to_block(write_block); b.seal_block(write_block);
+            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+            b.ins().jump(after_write, &[]);
+            b.switch_to_block(after_write); b.seal_block(after_write);
+        }
         // Advance the host shifter/hostcnt only when we drew from host, not from colorback.
         let (final_shifter, final_hostcnt): (Value, Value) = if is_hostw && (dm0.colorhost() || dm0.alphahost()) {
             let s = b.ins().select(draw_use_bg_bool, no_fetch_skip_args_buf[0], host_shifter_after_fetch);
@@ -1805,6 +1849,15 @@ fn emit_draw_iline(
             }
         };
 
+        // Afunction source alpha for lines is always DDA (lines never use host mode —
+        // see compile_shader guard), independent of RGB/CI plane format. Mirrors the
+        // block/span shader's alpha_byte overlay.
+        let ca = ld32!(ctx_off!(coloralpha));
+        let ca_c = clamp_color_component(&mut b, ca);
+        let alpha_byte = b.ins().ishl_imm_s(ca_c, 24);
+        let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
+        let raw_src = b.ins().bor(color24, alpha_byte);
+
         let draw_block2 = b.create_block();
         b.append_block_param(draw_block2, types::I8);
         let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
@@ -1858,7 +1911,37 @@ fn emit_draw_iline(
         b.ins().select(use_bg_bool, colorback_v, raw_src)
     };
 
-    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, false);
+    // Afunction: see the block/span shader for details. Applies in both RGB and CI
+    // mode. cmp==7 (disabled) is resolved at compile time so no check is emitted;
+    // cmp==0 always kills without a runtime test.
+    let afunc_cmp = dm1.compare();
+    if afunc_cmp == 7 {
+        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, false);
+    } else if afunc_cmp == 0 {
+        // Always-kill: no write, still falls through to skip_block below.
+    } else {
+        let sa   = b.ins().ushr_imm_s(src_color, 24);
+        let sa8  = b.ins().band_imm_s(sa, 0xFF);
+        let aref_v  = ld32!(ctx_off!(alpharef));
+        let aref8   = b.ins().band_imm_s(aref_v, 0xFF);
+        let cc = match afunc_cmp {
+            1 => IntCC::UnsignedLessThan,
+            2 => IntCC::Equal,
+            3 => IntCC::UnsignedLessThanOrEqual,
+            4 => IntCC::UnsignedGreaterThan,
+            5 => IntCC::NotEqual,
+            6 => IntCC::UnsignedGreaterThanOrEqual,
+            _ => unreachable!("afunc_cmp 0 and 7 handled above"),
+        };
+        let pass = b.ins().icmp(cc, sa8, aref8);
+        let write_block = b.create_block();
+        let after_write = b.create_block();
+        b.ins().brif(pass, write_block, &[], after_write, &[]);
+        b.switch_to_block(write_block); b.seal_block(write_block);
+        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, false);
+        b.ins().jump(after_write, &[]);
+        b.switch_to_block(after_write); b.seal_block(after_write);
+    }
     b.ins().jump(skip_block, &[]);
 
     // ── skip_block: shade + pattern advance ──────────────────────────────────
