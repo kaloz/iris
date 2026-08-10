@@ -498,6 +498,26 @@ const LED_RED_ON:    u32 = 0xFF2020FF;
 const LED_RED_OFF:   u32 = 0xFF000030;
 const LED_GREEN_ON:  u32 = 0xFF20FF20;
 const LED_GREEN_OFF: u32 = 0xFF003000;
+/// Flash color for the jitv2 rectangle right after a `mega_flush` — purple,
+/// distinct from any steady-state green/red fill color so it reads as an
+/// event, not just "100% full and red". 0xAABBGGRR (this file's rgba
+/// convention — see `save_screenshot`'s doc comment).
+#[cfg(feature = "jitv2")]
+const JIT_FLUSH_FLASH: u32 = 0xFFFF20C0;
+
+/// Green-at-0-to-red-at-255 interpolation for the jitv2 fill bars
+/// (`StatusBar::draw_fill_bar`). `frac` is `JitFeedback`'s 0..=255
+/// fixed-point fraction, not a 0..=100 percentage. 0xAABBGGRR, this file's
+/// rgba convention: B fixed near 0, G falls from 0xE0 to 0 as R rises from
+/// 0 to 0xE0, so the midpoint lands on a yellow-ish amber rather than
+/// passing through a washed-out gray.
+#[cfg(feature = "jitv2")]
+fn lerp_green_red(frac: u8) -> u32 {
+    let f = frac as u32;
+    let r = f * 0xE0 / 255;
+    let g = 0xE0 - r;
+    0xFF000000 | (g << 8) | r
+}
 
 pub struct StatusBar {
     font: Vec<u8>,
@@ -514,6 +534,27 @@ pub struct StatusBar {
     decode_pct: f64,
     l1i_hit_pct: f64,
     uncached_pct: f64,
+    /// Live arena/queue fill fractions (0..=255) from `crate::jit_feedback`,
+    /// sampled fresh every `update()` — unlike the fade counters above,
+    /// these are gauges, not events, so there's nothing to remember between
+    /// frames beyond "what they are right now". Feature-gated: with jitv2
+    /// not built in, `crate::jit_feedback::JIT_FEEDBACK` never gets touched
+    /// by anything and would just read as a permanently-empty rectangle —
+    /// this hides it instead of showing a gauge for a JIT that isn't there.
+    #[cfg(feature = "jitv2")]
+    jit_arena_fill: u8,
+    #[cfg(feature = "jitv2")]
+    jit_queue_fill: u8,
+    /// Countdown that keeps the JIT rectangle flashing for a few frames
+    /// after a `mega_flush`, same fade pattern as `enet_tx_fade` above.
+    #[cfg(feature = "jitv2")]
+    jit_flush_fade: u8,
+    /// Last `JitFeedback::flush_events` value seen — a flush is detected by
+    /// this counter changing, not by a bool, so a flush that fires and a
+    /// later one both landing between two `update()` samples still counts
+    /// (see `JitFeedback::flush_events`'s own doc comment).
+    #[cfg(feature = "jitv2")]
+    jit_flush_seen: u32,
 }
 
 impl StatusBar {
@@ -533,6 +574,14 @@ impl StatusBar {
             decode_pct: 0.0,
             l1i_hit_pct: 0.0,
             uncached_pct: 0.0,
+            #[cfg(feature = "jitv2")]
+            jit_arena_fill: 0,
+            #[cfg(feature = "jitv2")]
+            jit_queue_fill: 0,
+            #[cfg(feature = "jitv2")]
+            jit_flush_fade: 0,
+            #[cfg(feature = "jitv2")]
+            jit_flush_seen: 0,
         }
     }
 
@@ -550,6 +599,20 @@ impl StatusBar {
         if self.enet_tx_fade > 0 { self.enet_tx_fade -= 1; }
         if self.enet_rx_fade > 0 { self.enet_rx_fade -= 1; }
         for f in self.scsi_fade.iter_mut() { if *f > 0 { *f -= 1; } }
+
+        #[cfg(feature = "jitv2")]
+        {
+            use std::sync::atomic::Ordering as JitOrdering;
+            let fb = &crate::jit_feedback::JIT_FEEDBACK;
+            self.jit_arena_fill = fb.arena_fill.load(JitOrdering::Relaxed);
+            self.jit_queue_fill = fb.queue_fill.load(JitOrdering::Relaxed);
+            let flush_events = fb.flush_events.load(JitOrdering::Relaxed);
+            if flush_events != self.jit_flush_seen {
+                self.jit_flush_seen = flush_events;
+                self.jit_flush_fade = FADE_FRAMES;
+            }
+            if self.jit_flush_fade > 0 { self.jit_flush_fade -= 1; }
+        }
     }
 
     pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, stats: &BarStats) {
@@ -598,7 +661,67 @@ impl StatusBar {
             if self.led_red   { LED_RED_ON   } else { LED_RED_OFF   });
         cursor_x = self.draw_square(rgba, cursor_x + 4, bar_y, width,
             if self.led_green { LED_GREEN_ON } else { LED_GREEN_OFF });
+        #[cfg(feature = "jitv2")]
+        {
+            cursor_x = self.draw_text(rgba, "  JIT:", cursor_x, bar_y, width, BAR_FG);
+            cursor_x = self.draw_jit_rect(rgba, cursor_x + 2, bar_y, width);
+        }
         let _ = cursor_x;
+    }
+
+    /// 32x16 jitv2 feedback rectangle: top 32x8 is arena (page-pool) fill,
+    /// bottom 32x8 is compile-queue fill. Each is a horizontal fill bar
+    /// (dim background, filled left-to-right by the live percentage,
+    /// like `draw_bar`'s convention elsewhere in this file) whose filled
+    /// color interpolates green-at-0%-to-red-at-100% (`lerp_green_red`) —
+    /// see `crate::jit_feedback::JitFeedback`'s own doc comment for what
+    /// feeds the two percentages. While `jit_flush_fade` is counting down
+    /// (a `mega_flush` happened recently), the whole rectangle flashes a
+    /// single flat color instead, overriding both bars — a flush resets the
+    /// gauges to near-zero anyway, so showing the bars mid-flash would just
+    /// read as "everything's fine" for one frame right when it isn't.
+    #[cfg(feature = "jitv2")]
+    fn draw_jit_rect(&self, rgba: &mut Vec<u32>, x: usize, bar_y: usize, width: usize) -> usize {
+        const RECT_W: usize = 32;
+        const RECT_H: usize = 8;
+        if self.jit_flush_fade > 0 {
+            self.fill_rect(rgba, x, bar_y, RECT_W, RECT_H * 2, width, JIT_FLUSH_FLASH);
+            return x + RECT_W + 4;
+        }
+        self.draw_fill_bar(rgba, x, bar_y,            RECT_W, RECT_H, width, self.jit_arena_fill);
+        self.draw_fill_bar(rgba, x, bar_y + RECT_H,   RECT_W, RECT_H, width, self.jit_queue_fill);
+        x + RECT_W + 4
+    }
+
+    /// One horizontal fill bar: `BAR_BG` background, filled left-to-right by
+    /// `fill/255`, colored by `lerp_green_red(fill)`.
+    #[cfg(feature = "jitv2")]
+    fn draw_fill_bar(&self, rgba: &mut Vec<u32>, x: usize, y: usize, w: usize, h: usize, width: usize, fill: u8) {
+        let filled_cols = (w * fill as usize) / 255;
+        let color = lerp_green_red(fill);
+        for col in 0..w {
+            let px = x + col;
+            if px >= width { break; }
+            let c = if col < filled_cols { color } else { BAR_BG };
+            for row in 0..h {
+                let idx = (y + row) * 2048 + px;
+                if idx < rgba.len() { rgba[idx] = c; }
+            }
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn fill_rect(&self, rgba: &mut Vec<u32>, x: usize, y: usize, w: usize, h: usize, width: usize, color: u32) {
+        for row in 0..h {
+            let py = y + row;
+            for col in 0..w {
+                let px = x + col;
+                if px < width {
+                    let idx = py * 2048 + px;
+                    if idx < rgba.len() { rgba[idx] = color; }
+                }
+            }
+        }
     }
 
     fn draw_square(&self, rgba: &mut Vec<u32>, x: usize, bar_y: usize, width: usize, color: u32) -> usize {

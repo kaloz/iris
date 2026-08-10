@@ -1129,6 +1129,16 @@ impl Jitv2 {
         }
         self.next_free = 0;
         self.pfn_to_slot.clear();
+        // Status-bar feedback (disp.rs's StatusBar): reset the code-arena
+        // gauge to empty and bump the flush-event counter so the bar
+        // flashes once this frame — see JitFeedback's own doc comment for
+        // why a counter, not a bool. Arena fill itself is tracked from
+        // Codegen::packing_stats() at each compile (worker_loop /
+        // jitv2_inline_compile), not here — this only needs to zero it
+        // because mega_flush is also what resets the real Cranelift arena
+        // (Codegen::reset, called by both of this fn's callers right after).
+        crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+        crate::jit_feedback::JIT_FEEDBACK.record_flush();
     }
 
     /// Self-contained page-pool + compiled-code-arena flush, called FROM the
@@ -1612,6 +1622,23 @@ impl CompileQueue {
                     // (`j2 stats` can't read the real codegen.function_count()
                     // directly while this thread owns `codegen` by value).
                     function_count.store(codegen.function_count(), Ordering::Relaxed);
+                    // Status-bar feedback (disp.rs's StatusBar), updated
+                    // from this side (the compile thread, once per actual
+                    // compile) rather than from CompileQueue::send on the
+                    // CPU/exec thread — send() runs on the hot dispatch-gate
+                    // path on every compile trigger, and an extra atomic
+                    // store there would tax exactly the thread this whole
+                    // async-queue design exists to keep off the compile
+                    // work. Reusing packing_stats() here means this doesn't
+                    // even add a second call — just reads the tuple this
+                    // iteration was already computing for the threshold
+                    // check below.
+                    let reserved_bytes = codegen.packing_stats().1;
+                    crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+                    // Consumer::slots() is occupancy directly (unlike
+                    // Producer::slots(), which is free space) — see rtrb's
+                    // own doc comment on that method.
+                    crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(consumer.slots(), COMPILE_QUEUE_CAPACITY);
                     if ran_out_of_memory {
                         // The compile that just ran couldn't get memory —
                         // flush immediately, regardless of the byte
@@ -1622,7 +1649,7 @@ impl CompileQueue {
                         // be retried on this offset's next real arrival —
                         // same as any other "retry later" outcome.
                         do_flush(&mut consumer, &mut codegen, &function_count, &mut pending);
-                    } else if codegen.packing_stats().1 > CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES {
+                    } else if reserved_bytes > CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES {
                         // Real bytes reserved in the arena (not a
                         // function-count proxy — see
                         // CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES's own doc

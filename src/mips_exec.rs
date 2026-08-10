@@ -6119,6 +6119,19 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                         { ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
                     }
                     *self.jitv2.lock().codegen.lock() = codegen;
+                    // Status-bar feedback (disp.rs's StatusBar): mirrors
+                    // worker_loop's own update on the threaded path. Only
+                    // runs on an actual compile (this whole block is gated
+                    // by below_call_threshold above), not every dispatch,
+                    // so it's fine on this otherwise-hot CPU-thread path.
+                    // Queue fill stays whatever the async side last left it
+                    // (0 if the queue was never started) — inline mode has
+                    // no queue of its own to report.
+                    {
+                        let reserved_bytes = self.jitv2.lock().codegen.lock().as_ref()
+                            .map_or(0, |c| c.packing_stats().1);
+                        crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+                    }
                     if ran_out_of_memory {
                         // The compile that just ran couldn't get memory
                         // — flush immediately and retry this exact

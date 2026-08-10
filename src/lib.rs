@@ -128,6 +128,7 @@ pub mod jit;
 pub mod rex3_jit;
 #[cfg(feature = "jitv2")]
 pub mod jitv2;
+pub mod jit_feedback;
 
 #[cfg(test)]
 mod platform_profile_tests;
