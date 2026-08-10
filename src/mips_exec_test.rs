@@ -667,10 +667,12 @@ mod tests {
 
     #[test]
     fn test_tlb_instructions() {
-        // MipsExecutor<MipsTlb> is ~512KB due to the inline vmap; spawn with a
-        // larger stack to avoid overflow in the default test thread.
+        // MipsExecutor<MipsTlb> is ~512KB due to the inline vmap, and debug
+        // builds don't elide the by-value moves through default()/new()/Self{},
+        // so several copies can be live on the stack at once. 4MB proved
+        // insufficient (overflowed in CI); use 16MB for headroom.
         std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
+            .stack_size(16 * 1024 * 1024)
             .spawn(|| { test_tlb_instructions_inner(); })
             .unwrap().join().unwrap();
     }
@@ -2271,8 +2273,9 @@ mod tests {
 
     #[test]
     fn test_tlb_random_write() {
+        // See stack_size comment on test_tlb_instructions above.
         std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
+            .stack_size(16 * 1024 * 1024)
             .spawn(|| { test_tlb_random_write_inner(); })
             .unwrap().join().unwrap();
     }
