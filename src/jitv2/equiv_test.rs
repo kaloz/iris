@@ -285,20 +285,15 @@ mod tests {
                 .expect("fresh Jitv2 pool must have room for one page");
             unsafe { (*jit.page_ptr(slot)).denylist_all(); }
             drop(jit);
-            // denylist_all only blocks the real (async/inline) dispatch
-            // gate — jitv2_lockstep's lockstep_check deliberately bypasses
-            // page state entirely (never touches publish/entries/ENTRY_DENYLISTED,
-            // see its own doc comment) so it can intercept a word before it's
-            // ever compiled; nothing but this executor-level switch stops it
-            // from compiling and running this exact instruction with no
-            // handle_exception_fn installed, which aborts the whole process
-            // the moment it raises an exception.
+            // Under jitv2_lockstep the real dispatch gate is ON and forces
+            // inline compile, so denylist_all alone isn't enough (a fresh page
+            // arrival could still compile). Turn the gate off outright for this
+            // pure-interpreter reference executor — `run_interpreter` needs an
+            // uninstrumented run, and the redesigned lockstep verifies via the
+            // gate itself, so "no gate" == "no lockstep instrumentation" here.
             #[cfg(feature = "jitv2_lockstep")]
             {
-                exec.lockstep_enabled.alu = false;
-                exec.lockstep_enabled.branch = false;
-                exec.lockstep_enabled.load_store = false;
-                exec.lockstep_enabled.fpu = false;
+                exec.jitv2_dispatch_enabled = false;
             }
         }
         (exec, mem)
@@ -456,7 +451,17 @@ mod tests {
 
         let (exec, mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
-        for &(word, raw) in page { mem.set_word(page_base as u64 + (word as u64) * 4, raw); }
+        // Store code at both the (unmasked) virtual page base AND the physical
+        // (kseg-masked) base. A native-emitter region never re-fetches, so the
+        // virtual copy alone sufficed historically — but an interpreter-fallback
+        // head (emit_interp_fallback_head) re-fetches through the bus, which
+        // sees the translated physical address; without the physical copy it
+        // would read 0 (a NOP) and silently mis-execute the fallback word.
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(word, raw) in page {
+            mem.set_word(page_base as u64 + (word as u64) * 4, raw);
+            mem.set_word(phys_base + (word as u64) * 4, raw);
+        }
         for &(addr, val) in mem_init { mem.set_word(addr, val); }
         exec.install_jit_hooks();
 
@@ -464,6 +469,423 @@ mod tests {
         std::mem::forget(codegen);
 
         Some(CoreSnapshot::capture(&exec.core))
+    }
+
+    /// Multi-page, `step()`-driven equivalence harness. Unlike `run_jit_page`
+    /// (one pre-compiled single-page region), this loads instructions at
+    /// arbitrary virtual addresses spanning several physical pages and drives
+    /// the *real* dispatch gate via `step()`, so cross-page `jal`/`jr`
+    /// transfers flow through the interpreter's dispatch exactly as they do
+    /// live — every page compiles into its own JIT region, control handed back
+    /// and forth through the gate. `code` is `(vaddr, raw)` pairs (stored at
+    /// both the virtual address and its kseg-masked physical, so fallback
+    /// re-fetches through the bus see the same bytes). Runs `steps` dispatches;
+    /// caller sizes it to reach a known quiescent PC on both engines.
+    ///
+    /// `jit`: `true` builds a JIT executor with inline (synchronous, no async
+    /// thread — deterministic) compilation and interpreter-fallback ON; `false`
+    /// builds a pure interpreter (`new_not_compilable`, no hooks). Same seeded
+    /// gpr/pc/mem otherwise.
+    #[cfg(not(feature = "lightning"))]
+    fn run_multipage(code: &[(u64, u32)], data: &[(u64, u32)], gpr: [u64; 32], pc: u64, steps: usize, jit: bool) -> CoreSnapshot {
+        let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        // Box so the executor's address is stable from install_jit_hooks onward
+        // (jit_ctx captures &mut exec — same discipline as run_jit).
+        let mut exec = Box::new(exec);
+        let store = |vaddr: u64, val: u32| {
+            mem.set_word(vaddr, val);              // virtual
+            mem.set_word(vaddr & 0x1FFF_FFFF, val); // kseg-masked physical (bus/fallback re-fetch)
+        };
+        for &(vaddr, raw) in code { store(vaddr, raw); }
+        for &(vaddr, val) in data { store(vaddr, val); }
+        if jit {
+            exec.jitv2_inline_compile = true;
+            exec.install_jit_hooks();
+        }
+        for _ in 0..steps {
+            exec.step();
+        }
+        CoreSnapshot::capture(&exec.core)
+    }
+
+    /// The developer per-instruction hook (`emit_dev_trace_bp` ->
+    /// `core.dev_trace_bp_fn`) must make JIT-executed instructions show up in
+    /// the traceback tagged `jit=true`, and a PC breakpoint set inside a
+    /// compiled region must fire (stopping before the instruction, pc left at
+    /// it for resume). Drives a small straight-line region through the real
+    /// `step()` gate with inline compile + hooks so the compiled path runs.
+    #[cfg(all(feature = "developer", not(feature = "lightning")))]
+    #[test]
+    fn dev_hook_traces_and_breakpoints_jit_instructions() {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        // Three ADDIUs then a JR to exit the region cleanly.
+        let code = [
+            (pc + 0x00, make_i(crate::mips_isa::OP_ADDIU, 0, 1, 1)),
+            (pc + 0x04, make_i(crate::mips_isa::OP_ADDIU, 0, 2, 2)),
+            (pc + 0x08, make_i(crate::mips_isa::OP_ADDIU, 0, 3, 3)),
+            (pc + 0x0c, make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR)),
+            (pc + 0x10, 0), // jr delay slot
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[31] = pc + 0x200; // jr target (off region)
+
+        // --- Part 1: traceback captures JIT-executed instructions, tagged jit.
+        {
+            let mem = MockMemory::new();
+            let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+            let mut exec = Box::new(exec);
+            for &(vaddr, raw) in &code {
+                mem.set_word(vaddr, raw);
+                mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+            }
+            exec.jitv2_inline_compile = true;
+            exec.install_jit_hooks();
+            // First step compiles + runs the region (the region's own
+            // interior instructions record via the dev hook, tagged jit;
+            // the entry word is recorded by exec_decoded's own JIT-hit push,
+            // right before it jumps into the compiled function — also
+            // tagged jit, NOT interp: this is a real external JIT dispatch,
+            // it just isn't recorded via the dev hook (that path stays
+            // internal-edge-only, see emit_dev_trace_bp's own doc comment).
+            exec.step(); // one step runs the whole first region under inline compile
+
+            let entries = exec.test_traceback_last(64);
+            let find = |want: u64| entries.iter().find(|&&(epc, _, _)| epc == want)
+                .unwrap_or_else(|| panic!("pc {:#x} missing from traceback", want));
+            assert!(find(pc).2, "entry word's external JIT dispatch must be tagged jit (recorded by exec_decoded's own JIT-hit push)");
+            // The interior instructions ran inside the compiled region, recorded
+            // by the dev hook — must be jit-tagged.
+            for off in [4u64, 8] {
+                assert!(find(pc + off).2,
+                    "instruction at {:#x} ran under JIT but wasn't tagged jit in the traceback", pc + off);
+            }
+        }
+
+        // --- Part 2: a PC breakpoint inside the region fires from compiled code.
+        {
+            let mem = MockMemory::new();
+            let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+            let mut exec = Box::new(exec);
+            for &(vaddr, raw) in &code {
+                mem.set_word(vaddr, raw);
+                mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+            }
+            exec.jitv2_inline_compile = true;
+            exec.install_jit_hooks();
+            // Breakpoint on the 3rd ADDIU (pc+8), which lives inside the
+            // compiled region (not the entry word).
+            exec.add_breakpoint(1, pc + 8, crate::mips_exec::BpType::Pc);
+
+            let mut hit = false;
+            for _ in 0..6 {
+                if exec.step() == crate::mips_exec::EXEC_BREAKPOINT { hit = true; break; }
+            }
+            assert!(hit, "PC breakpoint inside a compiled region must fire from the dev hook");
+            assert_eq!(exec.core.pc, pc + 8,
+                "breakpoint must stop with pc at the instruction (before it executes), for resume");
+            assert_eq!(exec.core.gpr[3], 0,
+                "the breakpointed instruction (addiu r3) must not have executed yet");
+        }
+    }
+
+    /// Every `InstrOrigin` arrival class actually gets recorded with its own
+    /// distinct tag: plain JIT body, an inlined delay slot, a fallback word,
+    /// and a fallback successor — all in one straight-line region, all
+    /// reached via their real external/first-time arrival (not a back-edge;
+    /// see the two back-edge tests below for those). Region:
+    ///   word0 (entry): ADDIU r2 = r1+1        -> Jit (recorded by
+    ///                                             exec_decoded's own JIT-hit
+    ///                                             push, right before it
+    ///                                             jumps in — a real JIT
+    ///                                             dispatch, just not routed
+    ///                                             through the dev hook)
+    ///   word1: BEQ r0,r0,+1 (always taken)    -> Jit (a plain head; itself
+    ///                                             not delay-slot-tagged)
+    ///   word2: delay slot: ADDIU r3 = r1+2    -> JitDelaySlot
+    ///   word3: BC1F cc0, not taken (fallback head) -> FallbackWord
+    ///   word4: fallback successor (BC1's delay slot): ADDIU r5=r1+3 -> FallbackSuccessor
+    ///
+    /// The fallback must be a BC1 specifically, not a plain excluded
+    /// instruction like MTC0: only a fallback that is itself a branch marks
+    /// its successor `is_branch_fallback_successor` (`analyzer::visit`'s
+    /// `is_fallback_branch` check) — an MTC0's successor is just an ordinary
+    /// fallthrough word, tagged `Jit` like any other plain head (found via
+    /// this exact test failing with an MTC0 fallback: successor came back
+    /// `Jit`, not `FallbackSuccessor`, correctly per that rule).
+    #[test]
+    #[cfg(feature = "developer")]
+    fn every_instr_origin_class_is_tagged_in_traceback() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_2000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x10;
+
+        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 1);
+        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 1); // always taken, target = word1+1+1 = word3
+        let slot = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 2);
+        // BC1F cc0, +10: branch-if-false, condition = !cc. cc0 set true
+        // below -> condition = false -> NOT taken -> falls through to its
+        // own delay slot (word4), same as bc1f in the back-edge test.
+        let bc1f = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | 10u32;
+        let succ = make_i(crate::mips_isa::OP_ADDIU, 1, 5, 3);
+        let page = [
+            (entry0, addiu0),
+            (entry0 + 1, beq),
+            (entry0 + 2, slot),
+            (entry0 + 3, bc1f),
+            (entry0 + 4, succ),
+            // Boundary sentinel: without this, the rest of MockMemory's
+            // zero-filled page decodes as valid NOPs (SLL r0,r0,0) and the
+            // analyzer just keeps walking the region all the way to the
+            // page's end — filling the 64-entry traceback window with ~250
+            // more Jit-tagged NOPs and pushing this test's 5 real entries
+            // out of it entirely (found via this exact test failing empty).
+            (entry0 + 5, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        // Drive through the REAL dispatch gate (step()), not a direct jit_fn
+        // call: only step() records the entry word's external Interp tag —
+        // a direct compile_region+call harness (like run_jit_page) never
+        // goes through step() at all, so it can't exercise that distinction.
+        let mem = MockMemory::new();
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        for &(w, raw) in &page {
+            let vaddr = ((pc & !0xFFFu64) as u64) + (w as u64) * 4;
+            mem.set_word(vaddr, raw);
+            mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+        }
+        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.set_fpu_cc(0, true); // cc0=true -> BC1F not taken
+        exec.update_fpr_mode();
+        exec.jitv2_inline_compile = true;
+        exec.install_jit_hooks();
+        exec.step(); // one step compiles + runs the whole region under inline compile
+
+        // Sanity: all three ADDIUs actually ran (proves the region really
+        // executed entry+slot+fallback+successor, not just compiled).
+        assert_eq!(exec.core.gpr[2], 0x11, "entry word ADDIU did not run");
+        assert_eq!(exec.core.gpr[3], 0x12, "delay slot ADDIU did not run");
+        assert_eq!(exec.core.gpr[5], 0x13, "fallback successor ADDIU did not run");
+
+        let entries = exec.test_traceback_last_origin(64);
+        let find = |want: u64| entries.iter().find(|&&(epc, _, _)| epc == want)
+            .unwrap_or_else(|| panic!("pc {:#x} missing from traceback: {:x?}", want, entries));
+
+        assert_eq!(find(pc).2, crate::mips_exec::InstrOrigin::JitEntry,
+            "entry word's external JIT dispatch must be tagged JitEntry (recorded by exec_decoded's own JIT-hit push, not the dev hook)");
+        assert_eq!(find(pc + 4).2, crate::mips_exec::InstrOrigin::Jit,
+            "the BEQ head must be tagged Jit");
+        assert_eq!(find(pc + 8).2, crate::mips_exec::InstrOrigin::JitDelaySlot,
+            "the BEQ's inlined delay slot must be tagged JitDelaySlot");
+        assert_eq!(find(pc + 12).2, crate::mips_exec::InstrOrigin::FallbackWord,
+            "the MTC0 fallback head must be tagged FallbackWord");
+        assert_eq!(find(pc + 16).2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+            "the word after the fallback must be tagged FallbackSuccessor");
+    }
+
+    /// The region's entry word, reached a SECOND time via an internal
+    /// back-edge (a backward branch looping to word0), is tagged
+    /// `JitEntryBackEdge` — distinct from its first, external arrival
+    /// (`Jit`, recorded by `exec_decoded`'s own JIT-hit push). Loop: word0
+    /// (entry, decrement counter) -> word1 (BNE back to word0 while counter
+    /// != 0) -> word2 (delay slot) -> falls through to word3 (boundary
+    /// sentinel) once done.
+    #[test]
+    #[cfg(feature = "developer")]
+    fn entry_word_back_edge_is_tagged_distinctly() {
+        let pc = 0xFFFF_FFFF_8000_3000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 2; // loop counter: 2 iterations -> 1 back-edge
+
+        let dec = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
+        let bne = make_i(crate::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word0
+        let page = [
+            (entry0, dec),
+            (entry0 + 1, bne),
+            (entry0 + 2, 0), // bne's delay slot (nop)
+            (entry0 + 3, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        let mem = MockMemory::new();
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        for &(w, raw) in &page {
+            let vaddr = ((pc & !0xFFFu64) as u64) + (w as u64) * 4;
+            mem.set_word(vaddr, raw);
+            mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+        }
+        exec.jitv2_inline_compile = true;
+        exec.install_jit_hooks();
+        exec.step(); // one step compiles + runs the whole looping region
+
+        assert_eq!(exec.core.gpr[1], 0, "loop must run to completion (counter 2 -> 0)");
+
+        let entries = exec.test_traceback_last_origin(64);
+        let entry_hits: Vec<_> = entries.iter().filter(|&&(epc, _, _)| epc == pc).collect();
+        assert_eq!(entry_hits.len(), 2, "entry word must be dispatched twice (external + one back-edge): {:x?}", entries);
+        assert_eq!(entry_hits[0].2, crate::mips_exec::InstrOrigin::JitEntry,
+            "first (external) entry arrival must be tagged JitEntry (exec_decoded's own JIT-hit push)");
+        assert_eq!(entry_hits[1].2, crate::mips_exec::InstrOrigin::JitEntryBackEdge,
+            "second (looped) entry arrival must be tagged JitEntryBackEdge");
+    }
+
+    /// A fallback successor word, reached a SECOND time via an internal
+    /// back-edge (a backward branch looping to it, not to the fallback
+    /// itself), still gets recorded and doesn't silently vanish from `dt`.
+    /// Only a fallback that is ITSELF a branch (BC1 — see
+    /// `analyzer::is_fallback_branch`) marks its successor
+    /// `is_branch_fallback_successor`; a plain fallback (e.g. MTC0) does not
+    /// — its successor is just an ordinary fallthrough word, so this test
+    /// must use BC1, not `benign_excluded_mtc0`. Loop: word0 (fallback head,
+    /// BC1 not-taken) -> word1 (successor/BC1 delay slot, decrement counter)
+    /// -> word2 (BNE back to word1 while counter != 0) -> word3 (delay slot)
+    /// -> falls through to word4 (boundary sentinel).
+    ///
+    /// `is_branch_fallback_successor` is walk-local, not persistent: a
+    /// fallback's own compiled region ends right after its successor (found
+    /// live: one step() landed exactly at the BNE's own address without
+    /// dispatching it), so the BNE and its loop body compile as a SEPARATE
+    /// region on the next dispatch, starting a fresh analyzer walk from the
+    /// BNE itself — a walk that never visits word0's fallback at all, so it
+    /// never learns word1 is architecturally a fallback successor. The
+    /// second region sees word1 purely as an ordinary backward-branch
+    /// target, tagged `Jit` like any other in-region head — correctly, since
+    /// on THIS arrival path (a plain taken branch, not a delay-slot-armed
+    /// transfer) `in_delay_slot` really is false and no foreign-slot
+    /// treatment is needed. So the two arrivals get two different, both
+    /// individually-correct tags: `FallbackSuccessor` (first, from the
+    /// fallback's own region) then `Jit` (second, from the loop body's own
+    /// separately-compiled region) — not the same tag twice.
+    #[test]
+    #[cfg(feature = "developer")]
+    fn fallback_successor_back_edge_is_still_recorded() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_4000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 2; // loop counter: 2 iterations through the successor -> 1 back-edge
+
+        // BC1F cc0, +10: branch-if-false, condition = !cc. With cc0=true
+        // below, condition = !true = false -> NOT taken -> falls through to
+        // its own delay slot (word1), same as any non-taken branch. (Offset
+        // value is irrelevant on the not-taken path — only used if taken.)
+        let bc1f = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | 10u32;
+        let dec = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1, BC1's delay slot / successor word
+        let bne = make_i(crate::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word1 (the successor)
+        let page = [
+            (entry0, bc1f),
+            (entry0 + 1, dec),
+            (entry0 + 2, bne),
+            (entry0 + 3, 0), // bne's delay slot (nop)
+            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        let mem = MockMemory::new();
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        for &(w, raw) in &page {
+            let vaddr = ((pc & !0xFFFu64) as u64) + (w as u64) * 4;
+            mem.set_word(vaddr, raw);
+            mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+        }
+        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.set_fpu_cc(0, true); // cc0=true -> BC1F (branch-if-false) not taken -> falls through
+        exec.update_fpr_mode();
+        exec.jitv2_inline_compile = true;
+        exec.install_jit_hooks();
+        // A fallback word ends its own compiled region right after its
+        // successor (found live: one step() call landed exactly at the BNE's
+        // own address, EXEC_COMPLETE, without dispatching it — the BNE and
+        // its delay slot compile as a fresh, separate region on the next
+        // dispatch) — unlike a pure-JIT loop, which can stay in one step()
+        // call for its whole run. Loop step() with a safety cap instead of
+        // assuming one call suffices.
+        for _ in 0..16 {
+            if exec.core.gpr[1] == 0 { break; }
+            exec.step();
+        }
+
+        assert_eq!(exec.core.gpr[1], 0, "loop must run to completion (counter 2 -> 0)");
+
+        let successor_pc = pc + 4;
+        let entries = exec.test_traceback_last_origin(64);
+        let hits: Vec<_> = entries.iter().filter(|&&(epc, _, _)| epc == successor_pc).collect();
+        assert_eq!(hits.len(), 2, "fallback successor must be dispatched twice (first arrival + one back-edge): {:x?}", entries);
+        assert_eq!(hits[0].2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+            "first arrival (from the fallback's own region) must be tagged FallbackSuccessor");
+        assert_eq!(hits[1].2, crate::mips_exec::InstrOrigin::Jit,
+            "second arrival (the loop back-edge) lands inside an already-compiled region as a plain interior word (not a fresh external entry, per emit_dev_trace_bp's normal path) — must be tagged Jit, not silently dropped from the trace");
+    }
+
+    /// Diagnostic (not a strict regression gate): loads the REAL page
+    /// contents captured live from `wd93_init`'s physical page (pfn=0x800b,
+    /// `ignore/mem.txt`, a `m 0xffffffff8800b000 1024` dump) and walks the
+    /// analyzer from word 0x150 (`0xffffffff8800b540`) — the exact entry
+    /// that live-boot's `handle_request` logged as `instr_count=2
+    /// visited_words=[150, 151]`. Confirms whether that's a real analyzer
+    /// bug or architecturally correct: word 0x150 is `jal 0x805de0` (a real
+    /// call, mandatory delay slot at 0x151, then control leaves this
+    /// page/walk) — a 2-instruction region is what a JAL entry SHOULD
+    /// produce, not evidence of a truncation bug.
+    #[test]
+    fn wd93_init_real_page_walk_from_jal_entry() {
+        let raw = include_str!("../../ignore/mem.txt");
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        let mut count = 0;
+        for line in raw.lines() {
+            let line = line.trim();
+            let Some((addr_str, word_str)) = line.split_once(':') else { continue };
+            let addr_str = addr_str.trim();
+            let word_str = word_str.trim();
+            let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x").trim_start_matches("ffffffff"), 16) else { continue };
+            let Ok(word) = u32::from_str_radix(word_str, 16) else { continue };
+            let off = ((addr & 0xFFF) / 4) as usize;
+            if off < ENTRIES_PER_PAGE {
+                page_words[off] = word;
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1024, "must have parsed all 1024 words from ignore/mem.txt — got {}", count);
+
+        // Sanity: word 0x150 (0xffffffff8800b540) must be the JAL we expect,
+        // confirming the file parsed at the right offsets.
+        assert_eq!(page_words[0x150], 0x0e0177b8, "word 0x150 must be the jal seen live");
+        assert_eq!(page_words[0x151], 0x02002025, "word 0x151 must be jal's delay slot");
+
+        let mut analyzer = Analyzer::new();
+        let entry_word: u16 = 0x150;
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, 0x8800b000, usize::MAX);
+        assert!(non_empty, "region must not be empty");
+        let visited: Vec<u16> = crate::jitv2::analyzer::instrs_linear(walked).map(|i| i.word).collect();
+        eprintln!("DEBUG real-page walk from word {:#x}: visited = {:x?}", entry_word, visited);
+        // A JAL is a control transfer with a mandatory delay slot — the walk
+        // SHOULD stop right after the slot (nothing else is reachable by
+        // straight-line fallthrough from a jal), so instr_count=2 here is
+        // architecturally correct, not a truncation bug. This assertion
+        // documents that expectation explicitly.
+        assert_eq!(visited, vec![0x150u16, 0x151],
+            "jal entry should walk exactly 2 words (itself + mandatory delay slot)");
+
+        // The other case from the live log: walking from word 0x154 DOES
+        // include 0x150/0x151 — initially looked like a bug (a "forward"
+        // walk reaching backward-earlier words), but it isn't: word 0x15a
+        // (0xffffffff8800b568) is `bne t9,zero,-11`, a backward branch whose
+        // target is exactly word 0x150 ((0x15a+1)-11 = 0x150) — a real loop
+        // back-edge inside this same region. `visit` correctly follows it
+        // and promotes 0x150/0x151 to reachable heads. Not a bug; documents
+        // the real (non-forward-only) reachability semantics.
+        let mut analyzer2 = Analyzer::new();
+        let entry2: u16 = 0x154;
+        let (walked2, non_empty2) = analyzer2.walk_bounded(&page_words, entry2, 0x8800b000, usize::MAX);
+        assert!(non_empty2, "region must not be empty");
+        let visited2: Vec<u16> = crate::jitv2::analyzer::instrs_linear(walked2).map(|i| i.word).collect();
+        eprintln!("DEBUG real-page walk from word {:#x}: visited = {:x?}", entry2, visited2);
+        assert!(visited2.contains(&0x150) && visited2.contains(&0x151),
+            "0x150/0x151 SHOULD be included here — they're the target of a real backward branch (bne at 0x15a) inside this region: {:x?}", visited2);
     }
 
     #[test]
@@ -708,6 +1130,20 @@ mod tests {
     /// this file actually depends on.
     static OPT_LEVEL_SPEED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Forces interpreter-fallback ON for the returned guard's lifetime (the
+    /// analyzer's `FALLBACK_ENABLED` defaults OFF now that it's a runtime `j2
+    /// fallback` toggle). Delegates to the crate-wide
+    /// `analyzer::test_fallback_guard` so this module's fallback tests share the
+    /// ONE lock with the analyzer module's — two separate locks would not be
+    /// mutually exclusive and would race on the shared flag (a real flake this
+    /// consolidation fixes). Fallback affects *correctness* (whether an
+    /// Excluded word is admitted to a region), so the guard is held for the
+    /// whole test body; tests using only native instructions or the
+    /// `RegionBoundary` sentinel are flag-independent and don't need it.
+    fn fallback_on_guard() -> crate::jitv2::analyzer::TestFallbackGuard {
+        crate::jitv2::analyzer::test_fallback_guard()
+    }
+
     /// Not a diff against `assert_jit_matches_interpreter`'s `opt_level=none`
     /// codepath — that's covered by every other test in this file. This
     /// confirms `opt_level=speed` itself (real Cranelift optimization
@@ -812,31 +1248,30 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_excludes_unimplemented_instruction_as_an_entry() {
-        // PREFX has no emitter (opcode_support::has_emitter) and, unlike
-        // most other gaps closed in this file's history, never will:
-        // exec_prefx checks STATUS_CU1 and raises cpu_unusable when it's
-        // clear, a genuine COP0-adjacent side effect this codebase's hard
-        // no on privilege/COP0-touching instructions excludes from jitv2
-        // permanently — a stable choice for this test, unlike the several
-        // opcodes used here previously (DMULT, then MOVZ) that had to be
-        // swapped out once they later gained real emitters.
+    fn analyzer_admits_unimplemented_instruction_as_a_fallback_entry() {
+        let _fb = fallback_on_guard();
+        // PREFX has no emitter (opcode_support::has_emitter) and, unlike most
+        // other gaps closed in this file's history, never will: exec_prefx
+        // checks STATUS_CU1 and raises cpu_unusable when it's clear, a genuine
+        // COP0-adjacent side effect this codebase's hard no on privilege/
+        // COP0-touching instructions excludes from *native* jitv2 codegen
+        // permanently.
         //
-        // The analyzer must exclude it as an entry (region reported empty)
-        // rather than admitting it as Sequential and letting
-        // compile_region discover the gap later — an unimplemented opcode
-        // used to silently poison every other instruction in whatever
-        // region it was walked into (see
-        // rules/jitv2/unsupported-instructions.md), which this classify()
-        // fix closes structurally: excluding it here means it never enters
-        // a region at all, so it can't poison anything downstream of it
-        // either.
+        // With interpreter-fallback, "no native emitter" no longer means "not
+        // in a region": the analyzer admits an Excluded instruction as a
+        // fallback head (is_fallback), and codegen runs it through the real
+        // interpreter (emit_interp_fallback_head), which delivers the
+        // cpu_unusable exception correctly. So a lone PREFX entry is now a
+        // one-instruction fallback region, not an empty one. (Pre-fallback this
+        // asserted non_empty == false — see git history / the analyzer's own
+        // walk_excluded_entry_* tests, updated in the same change.)
         let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_PREFX);
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = instr;
         let mut analyzer = Analyzer::new();
-        let (_, non_empty) = analyzer.walk(&page, 0, 0);
-        assert!(!non_empty, "PREFX has no emitter and must be excluded, not walked as Sequential");
+        let (result, non_empty) = analyzer.walk(&page, 0, 0);
+        assert!(non_empty, "PREFX has no native emitter but is now a compilable fallback region");
+        assert!(result[0].visited && result[0].is_fallback, "PREFX entry must be a fallback head");
     }
 
     fn make_i(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
@@ -1517,16 +1952,16 @@ mod tests {
         // the counter's own initialization every iteration).
         let target_word: i32 = 1;
         let imm16 = (target_word - (4 + 1)) as i16 as u16;
-        // word 6: MTC0 (Excluded, §4.4) — an explicit region boundary right
-        // after the delay slot, so the analyzer's walk stops there instead
-        // of continuing to treat word 6's default-zero (NOP) content as more
-        // Sequential region to absorb. Without this, the not-taken
-        // fallthrough edge (word 4+2=6) has no forced boundary and the
-        // walker (budget=16, well under exhausted) just keeps compiling
-        // NOPs past it — a test-construction bug, not a codegen one: the
-        // region silently grew past where this test's dispatch-count
-        // reasoning assumed it would stop.
-        let mtc0_word6 = crate::mips_isa::OP_COP0 << 26 | (crate::mips_isa::RS_MTC0) << 21 | (0 << 16) | (12 << 11);
+        // word 6: JIT_REGION_BOUNDARY_SENTINEL — a hard region end (the
+        // analyzer stops the walk at the predecessor's edge, never visiting or
+        // running it), so the not-taken fallthrough (word 4+2=6) has a
+        // deterministic boundary. An MTC0 was used here historically, but with
+        // interpreter-fallback an Excluded instruction no longer ends the
+        // region (it's kept as a fallback head), so a dedicated boundary
+        // sentinel — zero side effects, no delay slot, never executed — is the
+        // right marker now. The interpreter's PC just lands here after the loop
+        // exits; it never dispatches this word (step count unchanged from the
+        // original 16).
         let page = vec![
             (0, make_i(crate::mips_isa::OP_ADDIU, 0, 1, 3)), // r1 = 3
             (1, make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // loop body / branch target: r1 -= 1
@@ -1534,7 +1969,7 @@ mod tests {
             (3, 0),
             (4, make_i(crate::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
             (5, 0), // delay slot: nop
-            (6, mtc0_word6), // excluded -> forces the not-taken exit boundary here
+            (6, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL), // hard region end
         ];
         let pc = 0xFFFF_FFFF_8000_0000u64;
         // Interpreter dispatch count: word0 ADDIU (1), then per loop
@@ -1545,7 +1980,7 @@ mod tests {
         // executes 3 full iterations (r1: 3->2->1->0, the third BNE finds
         // r1==0 and doesn't re-take, but its own dispatch + slot still
         // count): 1 + 5*3 = 16 dispatches, ending at word 6 (past word 5) —
-        // the interpreter never actually executes word 6's MTC0, it's just
+        // the interpreter never actually executes word 6's sentinel, it's just
         // where PC lands after the loop exits.
         let steps = 1 + 5 * 3;
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, /*max_instrs=*/16, steps);
@@ -2386,7 +2821,7 @@ mod tests {
             .expect("region must compile");
 
         let pc = 0xFFFF_FFFF_8000_0000u64 + (word as u64) * 4;
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.hot.interrupts.store(1, std::sync::atomic::Ordering::Relaxed); // pending -- would normally bail
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         // status is EXEC_COMPLETE either way here (a 1-instruction
@@ -2511,7 +2946,7 @@ mod tests {
             .expect("region must compile");
 
         let pc = 0xFFFF_FFFF_8000_0000u64 + (word as u64) * 4;
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.hot.interrupts.store(1, std::sync::atomic::Ordering::Relaxed); // pending from the start
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         assert_eq!(exec.core.gpr[2], 1, "entry_word's own skipped preamble must not have bailed -- its semantics ran for real");
@@ -4537,6 +4972,43 @@ mod tests {
     /// that `exec()` doesn't do, corrupting `self.pcp`'s PFN and making this
     /// test fail for a second, unrelated reason on top of the one it's
     /// trying to isolate.
+    /// Run exactly one instruction (`instr` at `pc`) through the real dispatch
+    /// gate under jitv2_lockstep: places `instr` at `pc` and a region-boundary
+    /// sentinel right after it (both virtual and kseg-masked physical, so the
+    /// gate's fetch + any fallback re-fetch see the same bytes) so the compiled
+    /// region is exactly this one instruction, then dispatches. The lockstep
+    /// brackets self-check `instr` against the interpreter as it runs. Replaces
+    /// the old `exec.exec(instr)`-with-nothing-in-memory pattern, which relied
+    /// on the removed standalone lockstep_check reading the decoded scratch
+    /// directly; the redesigned gate fetches the region from memory instead.
+    #[cfg(feature = "jitv2_lockstep")]
+    fn ls_exec_one(exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, mem: &MockMemory, pc: u64, instr: u32) {
+        let word_offset = ((pc & 0xFFF) >> 2) as u16;
+        let phys_base = pc & !(PAGE_SIZE as u64 - 1);
+        let store = |off: u16, raw: u32| {
+            mem.set_word(phys_base + (off as u64) * 4, raw);
+            mem.set_word((phys_base & 0x1FFF_FFFF) + (off as u64) * 4, raw);
+        };
+        store(word_offset, instr);
+        store(word_offset + 1, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL);
+        exec.exec(instr);
+    }
+
+    /// A lockstep divergence must PRINT a report and return a break signal
+    /// (EXEC_BREAKPOINT) — NOT panic/abort the process (an extern "C" callback
+    /// panic is a non-unwinding abort that loses the monitor and all state).
+    /// `test_force_lockstep_divergence` drives `lockstep_compare` with a
+    /// deliberately-mismatched reference and asserts it reports the divergence
+    /// (returns true) without unwinding/aborting — the whole point of the
+    /// print-and-break-into-monitor redesign.
+    #[cfg(feature = "jitv2_lockstep")]
+    #[test]
+    fn lockstep_divergence_reports_and_breaks_without_panicking() {
+        let (mut exec, _mem) = seeded_executor([0u64; 32], 0x1fc00434);
+        let diverged = exec.test_force_lockstep_divergence();
+        assert!(diverged, "a mismatched reference must be reported as a divergence");
+    }
+
     #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_branch_not_taken_with_alu_delay_slot() {
@@ -4574,15 +5046,16 @@ mod tests {
     /// `jitv2_lockstep` (observed live on a real IRIX boot: PROM's L1
     /// cache-init loop stuck re-executing one `CACHE Index_Store_Tag`
     /// indefinitely).
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_load_store_codegen_gap_still_advances_pc() {
         let pc = 0x1fc00434u64;
         // CACHE op=Index_Store_Tag(2), cache=PD(1) -> rt field = (2<<2)|1 = 9; base=v0(2), offset=0
         let cache_instr = make_i(crate::mips_isa::OP_CACHE, 2, 9, 0);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.install_jit_hooks();
 
-        exec.exec(cache_instr);
+        ls_exec_one(&mut exec, &mem, pc, cache_instr);
         assert_eq!(exec.core.pc, pc + 4, "CACHE (a codegen gap under jitv2_lockstep) must still advance pc — it must not be silently rolled back to pre-dispatch state");
     }
 
@@ -4593,6 +5066,7 @@ mod tests {
     /// a clean case. Not asserting anything beyond "doesn't panic" —
     /// lockstep_check itself is the assertion, same as the branch/load-store
     /// smoke tests above.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_add_s_matches_interpreter() {
         let pc = 0x1fc00434u64;
@@ -4602,14 +5076,14 @@ mod tests {
         // odd fs/ft/fd address the *upper* 32 bits of fpr[reg & !1], not
         // fpr[reg] directly) — even numbers keep this test's setup simple.
         let fadd_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 0, 4, crate::mips_isa::FUNCT_FADD);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[0] = (1.5f32).to_bits() as u64;
         exec.core.fpr[2] = (2.25f32).to_bits() as u64;
         exec.update_fpr_mode();
         exec.install_jit_hooks();
 
-        exec.exec(fadd_s);
+        ls_exec_one(&mut exec, &mem, pc, fadd_s);
         assert_eq!(exec.core.pc, pc + 4);
         assert_eq!(f32::from_bits(exec.core.fpr[4] as u32), 3.75f32, "FADD.S result must still be correct — not just non-divergent");
     }
@@ -4628,6 +5102,7 @@ mod tests {
     /// plain `emit_bail`) — the CU1 arm now returns a real, already-vectored
     /// PC, which the bottom path's fresh interpreter comparison verifies
     /// against directly, same as any other real JIT result.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_cu1_unusable_matches_interpreter_no_false_divergence() {
         let pc = 0x1fc00434u64;
@@ -4646,7 +5121,7 @@ mod tests {
         // itself is the assertion (see lockstep_check_fpu's jit.pc ==
         // before.pc guard). Confirm the real, expected outcome too: a
         // genuine EXC_CPU delivered by the interpreter, not silently eaten.
-        exec.exec(cfc1);
+        ls_exec_one(&mut exec, &mem, pc, cfc1);
         assert_ne!(exec.core.pc, pc, "CU1-unusable CFC1 must still vector via handle_exception");
         assert_eq!((exec.core.cp0_cause >> 2) & 0x1F, crate::mips_exec::EXC_CPU);
     }
@@ -4664,6 +5139,7 @@ mod tests {
     /// int result convert back to a different float than the original
     /// source?), passed via `fpu_update_fcsr_with_inexact_override` — see
     /// `exec_fround_l_s`'s doc comment for the full reasoning.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_cvt_w_s_exact_integer_value_no_spurious_inexact() {
         let pc = 0x1fc00434u64;
@@ -4671,7 +5147,7 @@ mod tests {
         // from the live-boot divergence (both even, so FR0 packing is a
         // non-issue here regardless).
         let cvt_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FCVT_W);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (79.0f32).to_bits() as u64;
         exec.update_fpr_mode();
@@ -4681,7 +5157,7 @@ mod tests {
         // on any JIT/interp divergence) — confirm the actual FCSR outcome
         // too, not just "didn't diverge", so a future regression that makes
         // both engines agreeably wrong wouldn't slip through silently.
-        exec.exec(cvt_w_s);
+        ls_exec_one(&mut exec, &mem, pc, cvt_w_s);
         assert_eq!(exec.core.pc, pc + 4);
         assert_eq!(exec.core.fpr[18] as i32, 79, "CVT.W.S of 79.0 must produce the integer 79");
         assert_eq!(exec.core.fpu_fcsr & 0x1004, 0, "CVT.W.S of an exact integer value must not set FCSR Inexact (Cause bit 12 or Flag bit 2)");
@@ -4691,17 +5167,18 @@ mod tests {
     /// genuinely isn't an integer, so the fix above isn't just "never sets
     /// Inexact" — `TRUNC.W.S` on `3.7` truncates to `3`, which does differ
     /// from the original source, and MIPS spec says that must set Inexact.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_trunc_w_s_non_integer_value_sets_inexact() {
         let pc = 0x1fc00434u64;
         let trunc_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FTRUNC_W);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (3.7f32).to_bits() as u64;
         exec.update_fpr_mode();
         exec.install_jit_hooks();
 
-        exec.exec(trunc_w_s);
+        ls_exec_one(&mut exec, &mem, pc, trunc_w_s);
         assert_eq!(exec.core.pc, pc + 4);
         assert_eq!(exec.core.fpr[18] as i32, 3, "TRUNC.W.S of 3.7 must produce the integer 3");
         assert_ne!(exec.core.fpu_fcsr & 0x1004, 0, "TRUNC.W.S of a non-integer value must set FCSR Inexact");
@@ -4721,18 +5198,19 @@ mod tests {
     /// FCSR.RM dynamically (previously a separate, already-documented spec
     /// gap — [[project_fpu_rounding_spec_gap]] — closed in the same pass
     /// since it's the same root cause).
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_cvt_w_d_65535_5_honors_fcsr_rm_toward_zero() {
         let pc = 0x1fc00434u64;
         let cvt_w_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 6, 4, crate::mips_isa::FUNCT_FCVT_W);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[6] = 65535.5f64.to_bits();
         exec.core.fpu_fcsr = 1; // RM = round toward zero
         exec.update_fpr_mode();
         exec.install_jit_hooks();
 
-        exec.exec(cvt_w_d);
+        ls_exec_one(&mut exec, &mem, pc, cvt_w_d);
         assert_eq!(exec.core.pc, pc + 4);
         assert_eq!(exec.core.fpr[4] as i32, 65535, "CVT.W.D under FCSR.RM=toward-zero must truncate, not round-half-away-from-zero");
     }
@@ -4742,6 +5220,7 @@ mod tests {
     /// vs interpreter agreement for every mode), the explicit expected
     /// values additionally confirm both engines are agreeably *correct*,
     /// not just agreeably consistent.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_cvt_w_d_all_rounding_modes() {
         let pc = 0x1fc00434u64;
@@ -4754,14 +5233,14 @@ mod tests {
             (3, 65535), // toward -inf
         ];
         for (rm, expected) in cases {
-            let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+            let (mut exec, mem) = seeded_executor([0u64; 32], pc);
             exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
             exec.core.fpr[6] = 65535.5f64.to_bits();
             exec.core.fpu_fcsr = rm;
             exec.update_fpr_mode();
             exec.install_jit_hooks();
 
-            exec.exec(cvt_w_d);
+            ls_exec_one(&mut exec, &mem, pc, cvt_w_d);
             assert_eq!(exec.core.pc, pc + 4);
             assert_eq!(exec.core.fpr[4] as i32, expected, "CVT.W.D(65535.5) under FCSR.RM={rm} expected {expected}");
         }
@@ -4773,6 +5252,7 @@ mod tests {
     /// regime of `emit_round_to_int_mode` (magnitude in [0.5, 1.0)) that
     /// `lockstep_fpu_cvt_w_d_all_rounding_modes` never touched (that test
     /// only used 65535.5, magnitude >> 1).
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_cvt_w_d_magnitude_between_half_and_one() {
         let pc = 0x1fc00434u64;
@@ -4793,14 +5273,14 @@ mod tests {
             (0.5, 0, 0),
         ];
         for (src, rm, expected) in cases {
-            let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+            let (mut exec, mem) = seeded_executor([0u64; 32], pc);
             exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
             exec.core.fpr[10] = src.to_bits();
             exec.core.fpu_fcsr = rm;
             exec.update_fpr_mode();
             exec.install_jit_hooks();
 
-            exec.exec(cvt_w_d);
+            ls_exec_one(&mut exec, &mem, pc, cvt_w_d);
             assert_eq!(exec.core.pc, pc + 4);
             assert_eq!(exec.core.fpr[10] as i32, expected, "CVT.W.D({src}) under FCSR.RM={rm} expected {expected}");
         }
@@ -4812,18 +5292,19 @@ mod tests {
     /// Exercised under a non-default RM specifically because that's exactly
     /// the ambient condition that exposed the host-rounding-instruction
     /// MXCSR sensitivity bug in the first place.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_round_w_s_ignores_fcsr_rm() {
         let pc = 0x1fc00434u64;
         let round_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FROUND_W);
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[16] = 65535.5f32.to_bits() as u64;
         exec.core.fpu_fcsr = 1; // RM = toward zero -- must NOT affect ROUND.W.S
         exec.update_fpr_mode();
         exec.install_jit_hooks();
 
-        exec.exec(round_w_s);
+        ls_exec_one(&mut exec, &mem, pc, round_w_s);
         assert_eq!(exec.core.pc, pc + 4);
         assert_eq!(exec.core.fpr[18] as i32, 65536, "ROUND.W.S ties-to-even must still round to 65536 regardless of FCSR.RM");
     }
@@ -4832,10 +5313,11 @@ mod tests {
     /// wins over whatever the dynamic register says) — swept under RM=2
     /// (toward +inf) so a bug that accidentally let FCSR.RM leak into these
     /// fixed-mode handlers would show up as a wrong answer here.
+    #[cfg(feature = "jitv2_lockstep")]
     #[test]
     fn lockstep_fpu_trunc_ceil_floor_ignore_fcsr_rm() {
         let pc = 0x1fc00434u64;
-        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (2.5f32).to_bits() as u64;
         exec.core.fpu_fcsr = 2; // RM = toward +inf -- must not affect any of these
@@ -4843,17 +5325,780 @@ mod tests {
         exec.install_jit_hooks();
 
         let trunc_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FTRUNC_W);
-        exec.exec(trunc_w_s);
+        ls_exec_one(&mut exec, &mem, pc, trunc_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 2, "TRUNC.W.S(2.5) must truncate to 2 regardless of FCSR.RM");
 
         exec.core.pc = pc;
         let ceil_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FCEIL_W);
-        exec.exec(ceil_w_s);
+        ls_exec_one(&mut exec, &mem, pc, ceil_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 3, "CEIL.W.S(2.5) must round up to 3 regardless of FCSR.RM");
 
         exec.core.pc = pc;
         let floor_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FFLOOR_W);
         exec.exec(floor_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 2, "FLOOR.W.S(2.5) must round down to 2 regardless of FCSR.RM");
+    }
+
+    // ---- Interpreter-fallback-inside-a-region tests --------------------
+    //
+    // SPEC (not yet implemented): an analyzer-`Excluded` instruction in the
+    // middle of a region must NOT end the region. Instead codegen keeps the
+    // region going and, at the excluded word, emits: the normal per-instruction
+    // int-check/cycle preamble, then a call to `core.interp_fallback_fn`
+    // (`interp_dispatch_one` — runs the excluded instruction through the real
+    // interpreter handler), then:
+    //   - if the returned status != EXEC_COMPLETE, return it directly (the
+    //     handler already delivered whatever exception/fault it raised);
+    //   - otherwise fall through to the successor word.
+    //
+    // The load-bearing insight: `interp_dispatch_one` leaves `core.pc` and
+    // `core.in_delay_slot` exactly as the interpreter's own `step()` would —
+    // i.e. authoritative external state — so the successor is in the *identical*
+    // position to a fresh external entry and must materialize pc+bd from `core`
+    // rather than trusting any compile-time constant. That is what makes a
+    // fallback's successor "entry-like" and is the crux these tests pin down.
+    //
+    // Lockstep/trace verify can't reach this path (lockstep compiles one
+    // instruction standalone and skips analyzer-excluded words; a boot trace
+    // hits it only incidentally), so correctness rests entirely on these unit
+    // tests — hence they are written as the spec, ahead of the implementation.
+    // They are RED until the analyzer/codegen changes land.
+
+    /// A benign `Excluded` instruction that the interpreter retires with a
+    /// plain PC+4 (no exception, minimal privilege requirements): MTC0 to a
+    /// CP0 register. `exec_mtc0` needs no kernel/CU0 check (unlike CACHE) and
+    /// ends in `handle_exec_complete`, so it is the cleanest stand-in for "an
+    /// unsupported-but-normally-retiring instruction" in a fall-through test.
+    /// `rt`/`rd` are chosen so both engines apply the identical CP0 write.
+    fn benign_excluded_mtc0() -> u32 {
+        // MTC0 rt=1 -> rd=4 (CP0 Context): `write_cp0(4, ..)` is a plain field
+        // assignment with no timer/scheduling side effects (unlike Count(9)/
+        // Compare(11)), so it is a clean, effect-observable stand-in. Value
+        // comes from gpr[1], set by the caller. Both engines write it
+        // identically; `cp0_context` is outside `CoreSnapshot`, so it never
+        // introduces a spurious divergence in the snapshot-comparison tests.
+        make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_MTC0, 1, 4, 0, 0)
+    }
+
+    /// TEST 1 — pc+bd left correct after a fallback.
+    ///
+    /// A lone excluded instruction as the region's single head. After the JIT
+    /// runs it via the fallback path, `core.pc` must be advanced past it (PC+4)
+    /// and `core.in_delay_slot` false — exactly what a bare interpreter step
+    /// produces. This is Primitive A's core contract in isolation.
+    #[test]
+    fn fallback_leaves_pc_and_bd_like_interpreter() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x1234_5678;
+
+        let page = [(entry_word, benign_excluded_mtc0())];
+        // steps=1: MTC0 retires in a single interpreter dispatch (PC+4).
+        // max_instrs=1: the excluded head is the whole region.
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 1, 1);
+    }
+
+    /// TEST 2 — successor materializes pc+bd, does not assume them.
+    ///
+    /// Region `[normal, EXCLUDED, normal]`. The third word must derive its PC
+    /// from live `core` state (which the fallback updated), not from its
+    /// compile-time word constant. A happy-path boot would pass even if the
+    /// successor wrongly trusted the constant (the two agree there), so the
+    /// full three-instruction snapshot comparison — GPR effects of both normal
+    /// instructions plus final PC — is what catches a successor that skips
+    /// materialization. Interpreter dispatches: ADDIU, MTC0, ADDIU = 3 steps.
+    #[test]
+    fn successor_of_fallback_is_entry_like() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x40; // MTC0 source; also base for the ADDIUs' operands
+
+        // word0: ADDIU r2 = r1 + 0x11   (pre-fallback normal instruction)
+        // word1: MTC0  r1 -> CP0[9]     (excluded -> interpreter fallback)
+        // word2: ADDIU r3 = r1 + 0x22   (post-fallback "entry-like" successor)
+        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let mtc0 = benign_excluded_mtc0();
+        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 0x22);
+        let page = [
+            (entry_word, addiu0),
+            (entry_word + 1, mtc0),
+            (entry_word + 2, addiu2),
+        ];
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 3, 3);
+    }
+
+    /// TEST 2b — successor after fallback works when pc is NOT on page 0.
+    ///
+    /// Same shape as TEST 2 but at a high page base, guarding specifically
+    /// against a successor that reconstructs its address from a zeroed/assumed
+    /// vbase instead of the live `core.pc` the fallback left behind. (The
+    /// harness already threads the real page_base through the analyzer; this
+    /// makes the off-page-successor case an explicit, named regression.)
+    #[test]
+    fn successor_of_fallback_off_page_zero() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8ABC_D000u64 + 0x40; // deep into a high page
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x7;
+
+        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let mtc0 = benign_excluded_mtc0();
+        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 0x22);
+        let page = [
+            (entry_word, addiu0),
+            (entry_word + 1, mtc0),
+            (entry_word + 2, addiu2),
+        ];
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 3, 3);
+    }
+
+    /// TEST 3 — a non-EXEC_COMPLETE fallback short-circuits the region.
+    ///
+    /// The excluded instruction raises an exception (SYSCALL). The compiled
+    /// unit must return the handler's status immediately and NOT run the
+    /// successor — the successor's GPR side effect must be absent. Both engines
+    /// end at the exception vector with matching EPC/Cause/Status; the
+    /// successor ADDIU (word2) never executes on either side.
+    ///
+    /// Interpreter steps=2: word0 ADDIU retires, then SYSCALL vectors (one
+    /// dispatch that ends in `handle_exception`); the interpreter's `core.pc`
+    /// is left at the exception vector and the successor is never fetched — so
+    /// the JIT, which returns right after the fallback, must match exactly.
+    #[test]
+    fn fallback_exception_status_short_circuits_successor() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x100;
+
+        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let syscall = make_r(crate::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::mips_isa::FUNCT_SYSCALL);
+        // Successor: if it ever runs, r3 becomes nonzero — the snapshot would
+        // then diverge from the interpreter, which never reaches it.
+        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 0, 3, 0x55);
+        let page = [
+            (entry_word, addiu0),
+            (entry_word + 1, syscall),
+            (entry_word + 2, addiu2),
+        ];
+        // steps=2: ADDIU + SYSCALL(-vectoring). max_instrs=3 so the walker is
+        // free to (wrongly, pre-fix) try to include word2 — the test asserts
+        // it must not run at execution time regardless of what was walked.
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 2, 3);
+
+        // Belt-and-suspenders: prove the successor's write is actually absent
+        // in the JIT result (not merely that both engines agree). r3 must be 0.
+        let jit = run_jit_page(&page, gpr, pc, entry_word, 3, &[])
+            .expect("region containing a fallback must still compile");
+        assert_eq!(jit.gpr[3], 0,
+            "successor after an exception-raising fallback must not execute");
+    }
+
+    /// TEST 4 — a word reachable BOTH as a normal fallthrough AND as a
+    /// fallback-successor executes correctly on both paths.
+    ///
+    /// This is the "two versions if necessary" case: a word that is entered
+    /// once as an ordinary in-region fallthrough (pc+bd compile-time-known) and
+    /// also as the successor of a fallback (pc+bd from `core`) needs an
+    /// entry-like variant without breaking the ordinary-edge variant. Layout:
+    ///
+    ///   word0: BEQ r0,r0 -> word3     (taken; skips the excluded word)
+    ///   word1: <delay slot: NOP/ADDIU>
+    ///   word2: MTC0 (excluded)        (fallthrough into word3 via fallback)
+    ///   word3: ADDIU r3 = r1 + 1      (target of the branch AND successor of
+    ///                                  the word2 fallback)
+    ///
+    /// The branch path reaches word3 as a normal taken-target (never touching
+    /// word2); a straight-line entry at word2 reaches word3 as a fallback
+    /// successor. Both must land word3 with identical results. We run the two
+    /// entries separately (entry_word=0 for the branch path, entry_word=2 for
+    /// the fallback-successor path) and compare each against the interpreter.
+    #[test]
+    fn dual_reachable_successor_word_has_both_variants() {
+        let _fb = fallback_on_guard();
+        let pc_base = 0xFFFF_FFFF_8000_1000u64;
+        let entry0 = ((pc_base & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x10;
+
+        // BEQ r0,r0,+2 (from word0, delay slot word1, target word3).
+        // word4 is the region-boundary sentinel terminating the region for BOTH
+        // entry paths deterministically (no delay slot, never executed), so the
+        // interpreter's step count and the JIT's run-to-exit stop at the same pc
+        // (word4, just past word3).
+        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
+        let nop = 0u32;
+        let mtc0 = benign_excluded_mtc0();
+        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 1);
+        let page = [
+            (entry0, beq),
+            (entry0 + 1, nop),
+            (entry0 + 2, mtc0),
+            (entry0 + 3, addiu3),
+            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        // Path A: enter at the branch. Interpreter dispatches: BEQ (arms delay),
+        // NOP slot (retires -> target word3), ADDIU3 = 3 dispatches, landing at
+        // word4 (the boundary, never executed). JIT runs to the same boundary.
+        assert_jit_matches_interpreter_page(&page, gpr, pc_base, entry0, 3, 5);
+
+        // Path B: enter straight-line at the excluded word. Interpreter: MTC0
+        // (fallback), ADDIU3 = 2 dispatches, landing at word4. Same word3,
+        // reached the other way; same boundary exit.
+        let pc_b = pc_base + 2 * 4;
+        assert_jit_matches_interpreter_page(&page, gpr, pc_b, entry0 + 2, 2, 5);
+    }
+
+    /// TEST 5 — the int-check fires on the fallback instruction itself.
+    ///
+    /// The fallback word must run its own per-instruction int-check before
+    /// calling the interpreter — the property that distinguishes it from
+    /// today's entry instruction, which relies on `step()` having already
+    /// checked. We enter the region **directly at the excluded word** with an
+    /// interrupt already pending, so the only thing that can stop the fallback
+    /// from running is the fallback word's own preamble. The compiled unit must
+    /// bail at the excluded word's own PC (interrupt still pending, for the
+    /// interpreter's `step()` to deliver) and the fallback's side effect (the
+    /// CP0 write) must be absent.
+    ///
+    /// (A mid-region variant — interrupt latched only after a preceding word
+    /// retires — can't be expressed against a single native region call, which
+    /// runs start-to-finish atomically; entering at the excluded word isolates
+    /// the fallback-word preamble as the sole gate, which is exactly the
+    /// property under test.)
+    ///
+    /// Uses the executor path directly (not `assert_jit_matches_interpreter_page`,
+    /// whose interpreter side has no interrupt-delivery step wired) so we can
+    /// assert the precise exit PC and the absence of the fallback's effect.
+    #[test]
+    fn fallback_performs_int_check_before_running() {
+        let _fb = fallback_on_guard();
+        // Excluded word deliberately NOT at word 0, so "bailed at entry" and
+        // "bailed at the excluded word" are distinguishable PCs.
+        let excluded_word: u16 = 5;
+        let page_base_v = 0xFFFF_FFFF_8000_1000u64;
+        let pc = page_base_v + (excluded_word as u64) * 4; // enter at the excluded word
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xDEAD_BEEF;
+
+        let mtc0 = benign_excluded_mtc0();
+        let page = [(excluded_word, mtc0)];
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page { page_words[w as usize] = raw; }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 1);
+        assert!(non_empty, "a lone excluded word must be a compilable (fallback) region");
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
+            .expect("region containing a fallback must still compile");
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        for &(w, raw) in &page { mem.set_word(page_base as u64 + (w as u64) * 4, raw); }
+        exec.install_jit_hooks();
+        // Latch a pending interrupt so the fallback word's own preamble bails
+        // before the fallback runs. The preamble predicate mirrors step()'s
+        // own `hot.interrupts` load.
+        exec.core.hot.interrupts.store(1 << 10, std::sync::atomic::Ordering::Relaxed);
+        // benign_excluded_mtc0 writes gpr[1] into CP0 Context (reg 4). Seed a
+        // distinct sentinel so a run of the fallback would be unmistakable.
+        exec.core.cp0_context = 0;
+        let cp0_before = exec.core.cp0_context; // MTC0 target; must stay unchanged
+
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+
+        let excluded_pc = page_base_v | ((excluded_word as u64) * 4);
+        assert_eq!(exec.core.pc, excluded_pc,
+            "region must bail at the excluded word's own PC so the interpreter delivers the pending IRQ");
+        assert_eq!(exec.core.cp0_context, cp0_before,
+            "the excluded instruction's CP0 write must not have run — int-check must precede the fallback");
+    }
+
+    /// TEST 7 — a fallback that MOVES PC (returns EXEC_COMPLETE but pc !=
+    /// fallback_pc + 4) must NOT fall through to the compile-time successor.
+    ///
+    /// The successor-is-entry-like rule ("if fallback returns EXEC_COMPLETE,
+    /// continue to the next word") is only safe when the fallback actually
+    /// advanced PC by one word. Some Excluded instructions retire with
+    /// EXEC_COMPLETE yet relocate PC: ERET (-> EPC), BC1 (taken CP1 branch).
+    /// For those the successor block's compile-time PC assumption is wrong, and
+    /// blindly running it would execute the wrong instruction with the wrong
+    /// architectural PC. The fallback continuation must therefore check
+    /// `core.pc == fallback_pc + 4` and, if not, return EXEC_COMPLETE so the
+    /// interpreter re-dispatches at wherever PC now points.
+    ///
+    /// The entry instruction path does NOT already cover this: it only checks
+    /// `core.in_delay_slot` (the foreign-slot case), and it never runs a prior
+    /// instruction that could have moved PC — so this is genuinely new to the
+    /// fallback continuation, not inherited from entry semantics.
+    ///
+    /// ERET is the cleanest vehicle: Excluded, returns EXEC_COMPLETE (via
+    /// `exec_complete_pc_set`), and sets `core.pc = EPC`. We enter at the ERET
+    /// word with EPC pointed at a distinct address and a successor that writes a
+    /// GPR; the unit must exit with `core.pc == EPC` and the successor's write
+    /// absent.
+    #[test]
+    fn fallback_that_moves_pc_does_not_run_successor() {
+        let _fb = fallback_on_guard();
+        let excluded_word: u16 = 3;
+        let page_base_v = 0xFFFF_FFFF_8000_1000u64;
+        let pc = page_base_v + (excluded_word as u64) * 4; // enter at the ERET word
+        let epc = 0xFFFF_FFFF_9000_2000u64; // distinct target, different page
+        let gpr = [0u64; 32];
+
+        // word3: ERET (excluded; retires EXEC_COMPLETE, pc <- EPC)
+        // word4: ADDIU r5 = r0 + 0x77  (must NOT run — PC moved to EPC)
+        let eret = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_TLB, 0, 0, 0, crate::mips_isa::FUNCT_ERET);
+        let addiu_succ = make_i(crate::mips_isa::OP_ADDIU, 0, 5, 0x77);
+        let page = [(excluded_word, eret), (excluded_word + 1, addiu_succ)];
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page { page_words[w as usize] = raw; }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 2);
+        assert!(non_empty, "a region entered at an excluded (fallback) word must compile");
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
+            .expect("region containing a fallback must still compile");
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        // interp_dispatch_one re-fetches the fallback word from the bus, which
+        // sees the *physical* (kseg-masked) address — store code there, not at
+        // the unmasked virtual page base (a native-emitter region never
+        // re-fetches, so run_jit_page's unmasked store is only harmless there).
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(w, raw) in &page { mem.set_word(phys_base + (w as u64) * 4, raw); }
+        exec.install_jit_hooks();
+        // Put the CPU at exception level with EPC set so ERET returns to EPC.
+        // A reset core has STATUS_ERL set (mips_core.rs's reset:
+        // BEV|ERL) — exec_eret checks ERL *first* and would return to
+        // ErrorEPC(0), so clear ERL and set EXL to exercise the EPC path.
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status |= crate::mips_core::STATUS_EXL;
+        exec.core.cp0_epc = epc;
+
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+
+        assert_eq!(exec.core.pc, epc,
+            "ERET fallback must leave pc at EPC, and the unit must exit there — not fall through to the successor");
+        assert_eq!(exec.core.gpr[5], 0,
+            "successor must not run after a fallback that relocated pc (pc != fallback_pc+4)");
+    }
+
+    /// TEST 8 — LL/SC CAS loop verbatim from a live IRIX boot that faulted with
+    /// fallback ON (`compare_and_swap_ptr`, reached via mutex_lock). LL and SC
+    /// are both `Classify::Excluded` -> fallback heads, and the loop has a
+    /// backward branch (`beq v0,zero,-5`) landing on the LL fallback head, plus
+    /// a forward `bne` exit and a `jr ra` exit — a fallback-density/structure
+    /// the earlier synthetic tests never covered. Runs the "swap succeeds first
+    /// try" path (LL loads the expected value, BNE not taken, SC stores, BEQ not
+    /// taken, JR exits) through both engines and asserts identical state. This
+    /// is the reduced repro for the live s3-corruption regression.
+    #[test]
+    fn ll_sc_cas_loop_matches_interpreter_with_fallback() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+
+        // Data word CAS operates on. Same base/mem_init convention as the LW/SW
+        // equiv tests (proven to translate correctly under PassthroughTlb).
+        let data_vaddr = 0xFFFF_FFFF_8010_0000u64;
+        let mut gpr = [0u64; 32];
+        gpr[4] = data_vaddr;   // a0 = &word
+        gpr[5] = 0;            // a1 = expected (compare value); memory holds 0 too
+        gpr[6] = 0x1234_5678;  // a2 = new value to store
+        gpr[31] = pc + 0x400;  // ra = off-region return target
+
+        // Verbatim encodings from the boot trace (compare_and_swap_ptr):
+        let ll   = 0xc08c0000u32; // ll   t4, 0(a0)      Excluded -> fallback
+        let bne  = 0x15850006u32; // bne  t4, a1, +6     (not taken when equal)
+        let or_  = 0x00c01025u32; // or   v0, a2, zero   (bne's delay slot)
+        let sc   = 0xe0820000u32; // sc   v0, 0(a0)      Excluded -> fallback
+        let beq  = 0x1040fffbu32; // beq  v0, zero, -5   (retry; not taken on success)
+        let nop  = 0x00000000u32;
+        let jr   = 0x03e00008u32; // jr   ra
+        let page = [
+            (entry0,     ll),
+            (entry0 + 1, bne),
+            (entry0 + 2, or_),
+            (entry0 + 3, sc),
+            (entry0 + 4, beq),
+            (entry0 + 5, nop),
+            (entry0 + 6, jr),
+            (entry0 + 7, nop), // jr's delay slot
+        ];
+
+        // Interpreter dispatch count for the success path: ll(1), bne(2, arms
+        // delay), or-slot(3), sc(4), beq(5, arms delay), nop-slot(6), jr(7,
+        // arms delay), nop-slot(8) = 8. JIT runs to the jr exit.
+        let mem_init = &[(data_vaddr, 0u32)];
+        let interp = run_interpreter_page(&page, gpr, pc, 8);
+        let jit = run_jit_page(&page, gpr, pc, entry0, 8, mem_init)
+            .expect("LL/SC CAS region must compile with fallback on");
+        assert_eq!(jit, interp,
+            "JIT (fallback on) diverged from interpreter on the LL/SC CAS loop");
+    }
+
+    /// TEST 8c — the FULL live repro: caller -> mutex_lock -> compare_and_swap_ptr,
+    /// three functions on three different physical pages, driven through the real
+    /// `step()` dispatch gate so every cross-page jal/jr flows through the
+    /// interpreter exactly as it does live. compare_and_swap_ptr is the LL/SC
+    /// CAS loop (fallback heads); mutex_lock and the caller hold callee-saved
+    /// registers (s3, ra, sp) live across the calls. Reproduces the exact
+    /// structure of the live s3-corruption panic and asserts the JIT (fallback
+    /// on, inline compile) matches a pure interpreter run bit-for-bit.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn full_mutex_lock_cas_call_chain_matches_interpreter() {
+        let _fb = fallback_on_guard();
+
+        // Real kseg0 virtual addresses from the boot trace, so cross-page
+        // classification (J/JAL absolute target, RegJump return) matches live.
+        let cas_base    = 0xFFFF_FFFF_8000_FE00u64; // compare_and_swap_ptr
+        let mutex_base  = 0xFFFF_FFFF_800E_A388u64; // mutex_lock
+        let caller_base = 0xFFFF_FFFF_8023_7350u64; // synthetic caller
+
+        // compare_and_swap_ptr (verbatim).
+        let cas = [
+            (cas_base + 0x00, 0xc08c0000u32), // ll   t4, 0(a0)
+            (cas_base + 0x04, 0x15850006u32), // bne  t4, a1, +6  -> cas+0x20 (off-region here)
+            (cas_base + 0x08, 0x00c01025u32), // or   v0, a2, zero (slot)
+            (cas_base + 0x0c, 0xe0820000u32), // sc   v0, 0(a0)
+            (cas_base + 0x10, 0x1040fffbu32), // beq  v0, zero, -5 (retry -> cas)
+            (cas_base + 0x14, 0x00000000u32), // nop
+            (cas_base + 0x18, 0x03e00008u32), // jr   ra
+            (cas_base + 0x1c, 0x00000000u32), // nop (slot)
+            // bne's off-region target (cas+0x20): return-ish path — just jr ra.
+            (cas_base + 0x20, 0x03e00008u32), // jr ra
+            (cas_base + 0x24, 0x00000000u32), // nop (slot)
+        ];
+
+        // mutex_lock (verbatim, jal target rewritten to our cas_base's low 28b —
+        // JAL is absolute-in-256MB, and cas_base is in the same 256MB region).
+        let jal_cas = 0x0c00_0000u32 | (((cas_base & 0x0FFF_FFFF) >> 2) as u32);
+        let mutex = [
+            // Real code has `lw a2, -24552(zero)` (a kernel global); that
+            // address doesn't map in this harness and would fault both engines
+            // into the exception vector (uncharted all-zero memory) — noise for
+            // this test. a2 only feeds cas's `or v0,a2,zero` store value, which
+            // is irrelevant to equivalence, so substitute `or a2,zero,zero`.
+            (mutex_base + 0x00, 0x00003025u32), // or a2, zero, zero  (was: lw a2,-24552(zero))
+            (mutex_base + 0x04, 0x27bdffe0u32), // addiu sp, sp, -32
+            (mutex_base + 0x08, 0xffa40000u32), // sd a0, 0(sp)
+            (mutex_base + 0x0c, 0xffa50008u32), // sd a1, 8(sp)
+            (mutex_base + 0x10, 0xffbf0010u32), // sd ra, 16(sp)
+            (mutex_base + 0x14, jal_cas),       // jal compare_and_swap_ptr
+            (mutex_base + 0x18, 0x00002825u32), // or a1, zero, zero (slot)
+            (mutex_base + 0x1c, 0x10400004u32), // beq v0, zero, +4 -> mutex+0x30
+            (mutex_base + 0x20, 0xdfa40000u32), // ld a0, 0(sp)
+            (mutex_base + 0x24, 0xdfbf0010u32), // ld ra, 16(sp)
+            (mutex_base + 0x28, 0x03e00008u32), // jr ra
+            (mutex_base + 0x2c, 0x27bd0020u32), // addiu sp, sp, 32 (slot)
+            (mutex_base + 0x30, 0x03e00008u32), // jr ra (the beq-taken path)
+            (mutex_base + 0x34, 0x27bd0020u32), // addiu sp, sp, 32 (slot)
+        ];
+
+        // Synthetic caller: mirrors the trace's shape around 0x88237354 — set up
+        // a1, jal mutex_lock, then the faulting `lw t6, 84(s3)`, then a clean
+        // sentinel exit (jr ra to a fixed return address the driver stops at).
+        let jal_mutex = 0x0c00_0000u32 | (((mutex_base & 0x0FFF_FFFF) >> 2) as u32);
+        let caller = [
+            (caller_base + 0x00, 0x24050014u32), // addiu a1, zero, 20
+            (caller_base + 0x04, 0x02c02025u32), // or a0, s6, zero
+            (caller_base + 0x08, jal_mutex),     // jal mutex_lock
+            (caller_base + 0x0c, 0x24050018u32), // addiu a1, zero, 24 (slot)
+            (caller_base + 0x10, 0x8e6e0054u32), // lw t6, 84(s3)   <-- the live fault site
+            (caller_base + 0x14, 0x03e00008u32), // jr ra  (return to sentinel)
+            (caller_base + 0x18, 0x00000000u32), // nop (slot)
+        ];
+
+        let mut code: Vec<(u64, u32)> = Vec::new();
+        code.extend_from_slice(&cas);
+        code.extend_from_slice(&mutex);
+        code.extend_from_slice(&caller);
+
+        // Data: a valid stack, a valid s3 with [s3+84] populated, and the mutex
+        // word cas operates on. The `lw a2,-24552(zero)` global cas reads is
+        // left unset (reads 0 on both engines — its exact value is irrelevant to
+        // equivalence, only that both see the same thing).
+        let stack_top = 0xFFFF_FFFF_8020_0000u64;
+        let s3_ptr    = 0xFFFF_FFFF_8021_0000u64;
+        let mutex_wrd = 0xFFFF_FFFF_8022_0000u64;
+        let data = [
+            (s3_ptr + 84, 0x0000_0042u32),  // [s3+84] — the lw the fault site reads
+            (mutex_wrd, 0x0000_0000u32),    // mutex starts unlocked (== a1 expected)
+        ];
+
+        let mut gpr = [0u64; 32];
+        gpr[19] = s3_ptr;                 // s3 (callee-saved, live across calls)
+        gpr[22] = mutex_wrd;              // s6 -> a0 (the mutex pointer)
+        gpr[29] = stack_top;              // sp
+        gpr[31] = 0xFFFF_FFFF_8000_0000u64; // ra sentinel (top-level return target)
+
+        let pc = caller_base;
+        // Generous step budget; both engines quiesce at the ra sentinel (an
+        // all-zero page — they'll just spin on NOPs identically past that, which
+        // is fine since we compare final state after a fixed count).
+        let steps = 60;
+        let interp = run_multipage(&code, &data, gpr, pc, steps, false);
+        let jit    = run_multipage(&code, &data, gpr, pc, steps, true);
+        assert_eq!(jit, interp,
+            "JIT (fallback on) diverged from interpreter on the full mutex_lock/CAS call chain");
+    }
+
+    /// BC1 (branch on CP1 condition) is `Classify::Excluded`, so with fallback
+    /// on it's a fallback head — AND it's a *branch*: running it through the
+    /// interpreter arms a delay slot. Its successor (the slot) must be treated
+    /// as an entry-like word (honor the pending `delay_slot_target`), or the
+    /// branch transfer is silently dropped. Drives a region entered at the BC1
+    /// fallback through the real `step()` gate and compares JIT vs interpreter,
+    /// including the target transfer, for taken / not-taken-non-likely /
+    /// likely-annul. `run_multipage` seeds no FPU state, so this builds the
+    /// executors directly to set CU1 + a condition code.
+    #[cfg(not(feature = "lightning"))]
+    fn assert_bc1_fallback_matches(bc1: u32, cc0: bool, steps: usize) {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        // word0: BC1 cc0 +2 (fallback, branch). target = word0+1+2 = word3.
+        // word1: ADDIU r1,r0,0x11   BC1's delay slot (runs unless likely-annulled)
+        // word2: ADDIU r2,r0,0x22   not-taken fallthrough
+        // word3: ADDIU r3,r0,0x33   taken target
+        // word4: JR ra              shared exit — both paths funnel here
+        // word5: NOP                jr's delay slot
+        // Not-taken (word2) falls through to word3 then word4; taken jumps to
+        // word3 then word4 — both quiesce at `ra`, so a fixed step count lands
+        // both engines in the same place regardless of which arm ran. The
+        // difference the test actually checks is which of r1/r2/r3 got set.
+        let addiu1 = make_i(crate::mips_isa::OP_ADDIU, 0, 1, 0x11);
+        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 0, 2, 0x22);
+        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 0, 3, 0x33);
+        let jr = make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR);
+        // `ra` lands on a `jr $ra`-to-SELF (ra points at the jr itself), whose
+        // delay slot is a nop. This pins pc at `ra` and, being a RegJump (always
+        // a region boundary), exits the JIT region every dispatch — so `step()`
+        // returns each time and the fixed step count lands both engines pinned
+        // at `ra` identically, instead of spinning forward through NOP memory at
+        // different rates (a BEQ self-loop, by contrast, compiles to an infinite
+        // in-region loop the JIT never exits within one step() — it hangs).
+        let ra = pc + 0x400;
+        let code = [
+            (pc + 0x00, bc1),
+            (pc + 0x04, addiu1),
+            (pc + 0x08, addiu2),
+            (pc + 0x0c, addiu3),
+            (pc + 0x10, jr),
+            (pc + 0x14, 0),
+            (ra + 0x00, jr),  // jr $ra, and $ra == ra -> self loop, exits region each dispatch
+            (ra + 0x04, 0),   // jr's delay slot
+        ];
+
+        let build = |jit: bool| -> CoreSnapshot {
+            let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
+            let mut gpr = [0u64; 32];
+            gpr[31] = ra;
+            let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+            let mut exec = Box::new(exec);
+            let store = |vaddr: u64, val: u32| { mem.set_word(vaddr, val); mem.set_word(vaddr & 0x1FFF_FFFF, val); };
+            for &(vaddr, raw) in &code { store(vaddr, raw); }
+            exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+            exec.core.set_fpu_cc(0, cc0);
+            exec.update_fpr_mode();
+            if jit { exec.jitv2_inline_compile = true; exec.install_jit_hooks(); }
+            // Step until BOTH engines settle at `ra` with no transfer pending
+            // (pc == ra && !in_delay_slot) — a fixed step count would capture
+            // the two engines at different sub-steps of `ra`'s jr-self 2-dispatch
+            // cycle (jr then slot), a quiescence artifact, not a real divergence.
+            // `steps` is a safety cap.
+            for _ in 0..steps {
+                if exec.core.pc == ra && !exec.core.in_delay_slot { break; }
+                exec.step();
+            }
+            CoreSnapshot::capture(&exec.core)
+        };
+        let interp = build(false);
+        let jit = build(true);
+        assert_eq!(jit, interp,
+            "BC1 fallback (cc0={}) diverged from interpreter — the delay-slot transfer must be preserved", cc0);
+    }
+
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn bc1_fallback_taken_matches_interpreter() {
+        let _fb = fallback_on_guard();
+        // BC1T cc0, +2 (target = word0+1+2 = word3). cc0=true -> taken.
+        let bc1t = 0x45010002u32;
+        assert_bc1_fallback_matches(bc1t, true, 12);
+    }
+
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn bc1_fallback_not_taken_matches_interpreter() {
+        let _fb = fallback_on_guard();
+        // BC1T cc0, +2. cc0=false -> not taken (non-likely): slot still runs.
+        let bc1t = 0x45010002u32;
+        assert_bc1_fallback_matches(bc1t, false, 12);
+    }
+
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn bc1_fallback_likely_annul_matches_interpreter() {
+        let _fb = fallback_on_guard();
+        // BC1TL cc0, +2 (likely). cc0=false -> not taken -> slot ANNULLED (pc+8).
+        // rt = (cc<<2)|(likely<<1)|tf = (0<<2)|(1<<1)|1 = 3.
+        let bc1tl = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | (3u32 << 16) | 2;
+        assert_bc1_fallback_matches(bc1tl, false, 12);
+    }
+
+    /// TEST 8b — a backward branch whose TARGET is a fallback head, taken
+    /// multiple times (the CAS retry loop's structure: `beq ... , -N` landing
+    /// on the LL fallback). Exercises re-entering a fallback head via an
+    /// in-region back-edge repeatedly — distinct from TEST 8's single pass.
+    /// Uses a plain countdown so the iteration count is deterministic (no
+    /// SC-fail nondeterminism needed): word0 is a benign excluded MTC0
+    /// (fallback head + loop top), word1 decrements the counter, word2 is a
+    /// backward BNE to word0 while the counter is nonzero.
+    #[test]
+    fn backward_branch_target_is_fallback_head_looped() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 3; // loop counter
+
+        // word0: MTC0 (Excluded -> fallback head; also the loop-top / branch
+        //        target). Benign write to CP0 Context (reg 4).
+        // word1: addiu r1, r1, -1   (decrement counter)
+        // word2: bne  r1, zero, -3  (target = 2+1+(-3) = word0)
+        // word3: nop (bne's delay slot)
+        // word4: region-boundary sentinel (clean end)
+        let mtc0 = benign_excluded_mtc0();
+        let dec  = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
+        let bne  = make_i(crate::mips_isa::OP_BNE, 1, 0, (-3i16) as u16);
+        let page = [
+            (entry0,     mtc0),
+            (entry0 + 1, dec),
+            (entry0 + 2, bne),
+            (entry0 + 3, 0),
+            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        // Interpreter dispatches per iteration: mtc0(1) + dec(2) + bne(3, arms
+        // delay) + nop-slot(4) = 4. r1: 3->2->1->0; the bne re-takes while
+        // r1!=0 (2 retakes) then falls through on r1==0. 3 iterations * 4 = 12,
+        // landing at word4 (the boundary, never executed).
+        let interp = run_interpreter_page(&page, gpr, pc, 12);
+        let jit = run_jit_page(&page, gpr, pc, entry0, /*max_instrs=*/8, &[])
+            .expect("looping-fallback region must compile with fallback on");
+        assert_eq!(jit, interp,
+            "JIT (fallback on) diverged on a backward branch into a fallback head");
+    }
+
+    /// TEST 7b — the PC-advance check must compare against THIS instruction's
+    /// page, not the post-fallback page. Regression for a real bug: step (4)
+    /// originally computed the expected-successor address from a fresh
+    /// `emit_word_addr(word+1)`, which reads live `core.pc` — already relocated
+    /// by the fallback. If the fallback moves pc to a *different page* whose
+    /// in-page offset happens to equal `(word+1)*4`, that stale-vbase compare
+    /// would spuriously match and wrongly run the successor. Here ERET lands on
+    /// EPC on a different page with low bits `== (excluded_word+1)*4`; the
+    /// unit must still detect "pc moved" (via `own_pc + 4`) and exit at EPC
+    /// without running the successor. TEST 7 passed only because its EPC low
+    /// bits differed from the successor offset, so it never exercised this.
+    #[test]
+    fn fallback_pc_move_to_aliasing_offset_on_other_page() {
+        let _fb = fallback_on_guard();
+        let excluded_word: u16 = 3;
+        let page_base_v = 0xFFFF_FFFF_8000_1000u64;
+        let pc = page_base_v + (excluded_word as u64) * 4;
+        // EPC: a DIFFERENT page, but low bits == (excluded_word+1)*4 — i.e. the
+        // exact in-page offset the buggy stale-vbase compare would alias to.
+        let epc = 0xFFFF_FFFF_9000_0000u64 | (((excluded_word as u64) + 1) * 4);
+        let gpr = [0u64; 32];
+
+        let eret = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_TLB, 0, 0, 0, crate::mips_isa::FUNCT_ERET);
+        let addiu_succ = make_i(crate::mips_isa::OP_ADDIU, 0, 5, 0x77);
+        let page = [(excluded_word, eret), (excluded_word + 1, addiu_succ)];
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page { page_words[w as usize] = raw; }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 2);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
+            .expect("region containing a fallback must still compile");
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(w, raw) in &page { mem.set_word(phys_base + (w as u64) * 4, raw); }
+        exec.install_jit_hooks();
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status |= crate::mips_core::STATUS_EXL;
+        exec.core.cp0_epc = epc;
+
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+
+        assert_eq!(exec.core.pc, epc,
+            "must exit at EPC even though EPC's in-page offset aliases the successor's");
+        assert_eq!(exec.core.gpr[5], 0,
+            "successor must not run — the aliasing offset must not fool the PC-advance check");
+    }
+
+    /// TEST 6 — an excluded instruction in a branch's DELAY SLOT.
+    ///
+    /// This is the genuinely-new placement: a slot can't "fall through to the
+    /// next block" (its contract is to continue into the branch's own target
+    /// logic in the same block — see `emit_slot_semantics`). The eventual
+    /// implementation must handle it like a nested-branch slot (exit the
+    /// function after the fallback), OR — for a first cut — deliberately keep
+    /// treating an excluded slot as a hard region boundary (declining to
+    /// compile the branch), which is rare and loses little.
+    ///
+    /// Marked `#[ignore]` for now: it documents the slot case as a known,
+    /// separately-scoped follow-up rather than asserting a behavior the first
+    /// implementation cut is expected to provide. Remove the ignore when the
+    /// slot-position fallback lands. Encodes the interpreter's own reference
+    /// result via the executor so it's ready to compare once un-ignored.
+    #[test]
+    #[ignore = "delay-slot-position fallback is a separately-scoped follow-up"]
+    fn fallback_in_delay_slot() {
+        let _fb = fallback_on_guard();
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x10;
+
+        // word0: BEQ r0,r0,+2 (target word3)
+        // word1: MTC0 (excluded) IN THE DELAY SLOT
+        // word3: ADDIU r3 = r1 + 1 (branch target)
+        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
+        let mtc0 = benign_excluded_mtc0();
+        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 1);
+        let page = [
+            (entry_word, beq),
+            (entry_word + 1, mtc0),
+            (entry_word + 3, addiu3),
+        ];
+        // Interpreter: BEQ (arms delay), MTC0 slot (retires, advances to
+        // target), ADDIU3 = 3 dispatches.
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 3, 4);
     }
 }

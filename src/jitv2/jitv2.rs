@@ -181,6 +181,20 @@ pub struct JitEntry {
     pub code_size: u32,
     #[cfg(feature = "developer")]
     pub call_count: AtomicU64,
+    /// Dev-only diagnostic (`j2 pcp`): saturating count of how many distinct
+    /// compiled regions have *included this word* (visited it during their
+    /// reachability walk), incremented once per word per successful compile in
+    /// `comp::handle_request`/`handle_request_deferred`. Unlike `instr_count`
+    /// (a property of the region rooted *at this offset*) this accumulates
+    /// across every region that walks *through* this offset from any entry —
+    /// so a word covered by several overlapping blocks reads high, giving a
+    /// direct picture of block overlap / redundant recompilation of the same
+    /// straight-line code from different entry points. Saturating `u8`: the
+    /// exact count past 255 doesn't matter, "pegged" is the signal. Atomic
+    /// because the async compile thread and the inline-compile CPU-thread path
+    /// can both write it, and `j2 pcp` reads it from the monitor thread.
+    #[cfg(feature = "developer")]
+    pub block_include_count: AtomicU8,
 }
 
 impl Default for JitEntry {
@@ -195,6 +209,8 @@ impl Default for JitEntry {
             code_size: 0,
             #[cfg(feature = "developer")]
             call_count: AtomicU64::new(0),
+            #[cfg(feature = "developer")]
+            block_include_count: AtomicU8::new(0),
         }
     }
 }
@@ -353,6 +369,18 @@ pub struct JitStats {
     /// in this codebase for high-water-mark tracking).
     #[cfg(feature = "developer")]
     pub batch_max_pending: AtomicU64,
+    /// Interpreter-fallback words compiled into published regions
+    /// (`comp::handle_request`, incremented once per `is_fallback` word). The
+    /// direct answer to "did the fallback path actually run this session?" — a
+    /// clean boot with `j2 fallback on` means nothing if this is 0 (the flag was
+    /// flipped after the boot-critical regions already compiled without it).
+    /// Also `fallback_regions`: published regions that contained at least one
+    /// fallback word, so you can tell a few big fallback loops from many tiny
+    /// ones.
+    #[cfg(feature = "developer")]
+    pub fallback_words: AtomicU64,
+    #[cfg(feature = "developer")]
+    pub fallback_regions: AtomicU64,
 }
 
 /// Why `flush_pending_batch` was called — see `JitStats::batch_flushes_page_cross`/
@@ -564,6 +592,7 @@ impl PhysicalCodePage {
                 entry.instr_count = 0;
                 entry.code_size = 0;
                 entry.call_count.store(0, std::sync::atomic::Ordering::Relaxed);
+                entry.block_include_count.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -843,6 +872,27 @@ impl PhysicalCodePage {
         let bit = offset_word & 63;
         let prev = self.saved_bits[word].fetch_or(1 << bit, std::sync::atomic::Ordering::Relaxed);
         prev & (1 << bit) == 0
+    }
+
+    /// Dev-only (`j2 pcp`): saturating-increment `offset_word`'s
+    /// `block_include_count` (see the field's doc). Called once per visited
+    /// word by `comp::handle_request`/`handle_request_deferred` after a
+    /// successful compile, so overlapping regions accumulate. Saturates at
+    /// `u8::MAX` rather than wrapping — the exact count past 255 is
+    /// uninteresting, "pegged" is the signal.
+    #[cfg(feature = "developer")]
+    #[inline]
+    pub fn note_block_include(&self, offset_word: usize) {
+        let c = &self.entries[offset_word].block_include_count;
+        // Relaxed CAS loop: this is a diagnostic counter with no ordering
+        // relationship to any other state, and contention is effectively nil
+        // (compiles for a given page are serialized), so a plain
+        // fetch_update-style saturating add is all that's needed.
+        let _ = c.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| Some(v.saturating_add(1)),
+        );
     }
 }
 

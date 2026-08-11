@@ -673,12 +673,26 @@ impl Machine {
             // nothing is popping). `j2 inline on` reverses this later by
             // stopping the queue and reclaiming its Codegen for the inline
             // path (see that command's own handler).
-            let mut guard = jit.lock();
-            let codegen = guard.codegen.get_mut().take()
-                .expect("Machine::new: Jitv2::codegen must be Some before the compile queue has ever started");
-            let stats = guard.stats.clone();
-            let bus: Arc<dyn BusDevice> = phys.clone();
-            guard.compile_queue.start(bus, codegen, stats);
+            //
+            // EXCEPT under jitv2_lockstep: the dispatch gate forces inline
+            // compile there (see exec_decoded's `inline_compile`), and inline
+            // compile takes the Codegen from `Jitv2::codegen` on every compile.
+            // If the queue owned it instead, inline's `.take()` would get `None`
+            // and NOTHING would ever compile — the whole run silently degrades
+            // to pure interpreter with lockstep never firing (observed: a
+            // lockstep boot showing `codegen owned by async compile thread`,
+            // `compiles: 0`, running at interpreter speed). So leave the queue
+            // stopped under lockstep and keep the Codegen in `Jitv2::codegen`
+            // for inline to use.
+            #[cfg(not(feature = "jitv2_lockstep"))]
+            {
+                let mut guard = jit.lock();
+                let codegen = guard.codegen.get_mut().take()
+                    .expect("Machine::new: Jitv2::codegen must be Some before the compile queue has ever started");
+                let stats = guard.stats.clone();
+                let bus: Arc<dyn BusDevice> = phys.clone();
+                guard.compile_queue.start(bus, codegen, stats);
+            }
         }
 
         // Setup DevLog (must be before Monitor so log command is available)

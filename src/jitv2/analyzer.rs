@@ -19,6 +19,62 @@ use crate::mips_isa::*;
 /// indexing (§2.4).
 pub type WordOffset = u16;
 
+/// Runtime toggle for interpreter-fallback region admission (`j2 fallback
+/// [on|off]`). When `false` (the default), an `Classify::Excluded` instruction
+/// ends the region exactly as it did before fallback existed (the caller
+/// records the boundary on its own edge, the excluded word is never visited);
+/// when `true`, it's admitted as an `is_fallback` head and codegen runs it
+/// through `interp_fallback_fn` (see `analyzer::visit` and
+/// `codegen::emit_interp_fallback_head`). A process global (matching
+/// `Codegen`'s own speed global) rather than a threaded param: the analyzer has
+/// no other per-call config, and this only ever changes from the monitor
+/// console, followed by a `mega_flush` so already-compiled regions are
+/// rebuilt under the new policy. Defaults **off** while the fallback path is
+/// still being validated against live boots.
+static FALLBACK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable interpreter-fallback region admission (see
+/// [`FALLBACK_ENABLED`]). The caller is responsible for flushing already-
+/// compiled regions afterward (`Jitv2::mega_flush`) so the change takes effect.
+pub fn set_fallback_enabled(on: bool) {
+    FALLBACK_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether interpreter-fallback region admission is currently on.
+pub fn fallback_enabled() -> bool {
+    FALLBACK_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The single process-wide lock serializing every test (in any module) that
+/// forces [`FALLBACK_ENABLED`] on — one mutex, shared, so an analyzer-module
+/// fallback test and an equiv_test-module fallback test can never run
+/// concurrently and stomp each other's flag. Both modules acquire this exact
+/// static via [`test_fallback_guard`]; two separate locks would not be mutually
+/// exclusive (the bug this consolidation fixes).
+#[cfg(test)]
+pub(crate) static FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII test helper (any module): hold [`FALLBACK_TEST_LOCK`] and force
+/// fallback ON for the guard's lifetime, restoring OFF on drop (incl. panic).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn test_fallback_guard() -> TestFallbackGuard {
+    let lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_fallback_enabled(true);
+    TestFallbackGuard { _lock: lock }
+}
+
+#[cfg(test)]
+pub(crate) struct TestFallbackGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+#[cfg(test)]
+impl Drop for TestFallbackGuard {
+    fn drop(&mut self) {
+        set_fallback_enabled(false);
+    }
+}
+
 const WORDS_PER_PAGE: u16 = (PAGE_SIZE / 4) as u16;
 
 /// Byte offset 0xFFC — the last word of a page. A branch/jump here has its
@@ -57,6 +113,14 @@ pub enum Classify {
     /// arithmetic/move/compare/load/store ops classify as `Sequential`
     /// instead (see `classify`'s doc comment for the rationale).
     Excluded,
+    /// The `JIT_REGION_BOUNDARY_SENTINEL` word — a hard region end that is
+    /// never visited, never compiled, and never run through the interpreter
+    /// fallback (unlike `Excluded`, which is now kept in the region as a
+    /// fallback head). Behaves exactly like `Excluded` did before
+    /// interpreter-fallback existed: the walk stops at the predecessor's edge.
+    /// A test/tooling device (see `mips_isa::JIT_REGION_BOUNDARY_SENTINEL`), not
+    /// something a real guest binary contains.
+    RegionBoundary,
 }
 
 /// Decode `raw` (a 32-bit MIPS instruction word) into its reachability
@@ -69,6 +133,11 @@ pub enum Classify {
 /// position independence (see `jump_target`'s doc comment) and J/JAL was
 /// moved to the same always-page-leaving treatment as RegJump.
 pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
+    // Test/tooling region-boundary sentinel — checked before opcode decode so
+    // no real opcode arm can ever shadow it (see the constant's doc comment).
+    if raw == JIT_REGION_BOUNDARY_SENTINEL {
+        return Classify::RegionBoundary;
+    }
     let op = (raw >> 26) & 0x3F;
     let rs = (raw >> 21) & 0x1F;
     let rt = (raw >> 16) & 0x1F;
@@ -123,6 +192,23 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         OP_LWC2 | OP_LDC2 | OP_SWC2 | OP_SDC2 => Classify::Excluded, // CP2, unimplemented — treat as excluded
         _ => sequential_or_excluded(raw),
     }
+}
+
+/// Whether an `Classify::Excluded` instruction is a **control-transfer** that
+/// arms a delay slot when run through the interpreter fallback — i.e. one whose
+/// `interp_dispatch_one` can leave `core.in_delay_slot = true` with a pending
+/// `delay_slot_target`, so its successor (the delay slot) must be treated as an
+/// entry-like word (honor the pending transfer) rather than a plain fallthrough.
+/// Today the only such excluded opcode is `BC1` (branch on CP1 condition):
+/// SYSCALL/BREAK/COP2/CACHE/LL/SC don't transfer control; ERET/COP0 move `core.pc`
+/// but never arm a delay slot (the fallback's off-page / pc-moved check already
+/// handles those). Kept as a standalone predicate (not a `CompiledInstr` field)
+/// so codegen can call it directly from `ctx.raw`; the analyzer only needs to
+/// tag the *successor* word (`is_branch_fallback_successor`).
+pub fn is_fallback_branch(raw: u32) -> bool {
+    let op = (raw >> 26) & 0x3F;
+    let rs = (raw >> 21) & 0x1F;
+    op == OP_COP1 && rs == RS_BC1
 }
 
 /// `Sequential` if `codegen.rs` actually has an emitter for `raw`
@@ -273,6 +359,32 @@ pub struct CompiledInstr {
     /// started out slot-only, gets promoted — see `visit`'s doc comment —
     /// and this flips to `false`). Meaningless when `visited` is `false`.
     pub is_slot_only: bool,
+    /// `true` iff this word is an `Classify::Excluded` instruction that the
+    /// walker kept in the region as an **interpreter-fallback** head (rather
+    /// than ending the region on contact, the pre-fallback behavior). Codegen
+    /// emits its int-check preamble, then a call to `core.interp_fallback_fn`
+    /// (running the excluded instruction through the real interpreter handler),
+    /// then either returns the handler's non-`EXEC_COMPLETE` status or — if the
+    /// handler advanced `core.pc` by exactly one word — falls through to the
+    /// successor, which becomes "entry-like" (materializes pc/bd from `core`,
+    /// see codegen). Its `fallthrough_exit` follows the same rule as a
+    /// `Sequential`'s (set iff the successor exits the region). Only ever set
+    /// on a *head* fallback: an excluded instruction in a delay-slot position
+    /// still declines the whole branch (`visit_slot` returns `false`), a
+    /// separately-scoped follow-up. Meaningless when `visited` is `false`.
+    pub is_fallback: bool,
+    /// `true` iff this word is the immediate successor (in program order) of a
+    /// **branch** interpreter-fallback (`is_fallback_branch`, i.e. a `BC1`) —
+    /// so it is that branch's delay slot. Codegen must emit it as an
+    /// entry-like word (the same `core.in_delay_slot`/`delay_slot_target`
+    /// foreign-slot check the region's real entry word does), because after the
+    /// branch fallback runs the interpreter, this word is reached with
+    /// `in_delay_slot = true` and a pending transfer armed — a plain
+    /// fallthrough here would silently drop the branch (found: BC1 taken/
+    /// not-taken-non-likely lose the transfer). A non-branch fallback's
+    /// successor never has this set and stays a plain fallthrough.
+    /// Meaningless when `visited` is `false`.
+    pub is_branch_fallback_successor: bool,
 }
 
 impl CompiledInstr {
@@ -287,7 +399,7 @@ impl CompiledInstr {
 
 impl Default for CompiledInstr {
     fn default() -> Self {
-        Self { visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false }
+        Self { visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false }
     }
 }
 
@@ -416,7 +528,11 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
     }
     let raw = page[offset as usize];
     let class = classify(raw, offset, page_base);
-    if class == Classify::Excluded {
+    if class == Classify::Excluded || class == Classify::RegionBoundary {
+        // Excluded: an excluded instruction can never be a delay slot (a
+        // fallback runs it via the interpreter, which needs it in head
+        // position, not inlined); the branch is declined. RegionBoundary: a
+        // hard end, same treatment.
         return false;
     }
 
@@ -433,7 +549,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
         instrs[offset as usize] = CompiledInstr {
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: Some(StopReason::ForeignPageSlot),
-            is_slot_only: true,
+            is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
         };
         return true;
     }
@@ -452,7 +568,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
 
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
-        fallthrough_exit: None, taken_exit: None, is_slot_only: true,
+        fallthrough_exit: None, taken_exit: None, is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
     };
     true
 }
@@ -503,8 +619,58 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     let raw = page[offset as usize];
     let class = classify(raw, offset, page_base);
 
+    if class == Classify::RegionBoundary {
+        // Hard region end (test/tooling sentinel): never visited, never a
+        // fallback — the caller records the boundary on its own edge, exactly
+        // as it did for every Excluded word before interpreter-fallback existed.
+        return false;
+    }
+
+    if class == Classify::Excluded && !fallback_enabled() {
+        // Fallback disabled (the default): an excluded instruction ends the
+        // region here, exactly as it always did — never visited, the caller
+        // records StopReason::Excluded on its own edge.
+        return false;
+    }
+
     if class == Classify::Excluded {
-        return false; // never visited; caller records the exit on itself
+        // Interpreter-fallback head: keep the excluded instruction *in* the
+        // region rather than ending it here (the pre-fallback behavior was
+        // `return false`, making the caller record StopReason::Excluded on
+        // itself). It behaves exactly like a `Sequential` for reachability —
+        // one fall-through edge to offset+1 — but is tagged `is_fallback` so
+        // codegen emits the interpreter-fallback path instead of native
+        // semantics. Charged against the budget like any other head. Promotion
+        // (`already_visited`) can never land here: an excluded word reached
+        // only as a slot was never marked visited (`visit_slot` returns false
+        // and declines the branch), so there's nothing to promote.
+        debug_assert!(!already_visited, "an excluded word cannot have been visited as a slot (visit_slot declines it)");
+        instrs[offset as usize] = CompiledInstr {
+            visited: true, word: offset, raw, block_id: None,
+            fallthrough_exit: None, taken_exit: None, is_slot_only: false,
+            is_fallback: true, is_branch_fallback_successor: false,
+        };
+        budget.remaining -= 1;
+        // Same fall-through recursion as Sequential (finish_visit's Sequential
+        // arm), inlined here so finish_visit's `class` stays a real
+        // (non-Excluded) Classify and its `unreachable!` on Excluded holds.
+        let successor_in_region = visit(instrs, page, page_base, offset + 1, budget);
+        if !successor_in_region {
+            let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
+            instrs[offset as usize].fallthrough_exit = Some(reason);
+        } else if is_fallback_branch(raw) {
+            // A branch fallback (BC1) arms a delay slot when run: its successor
+            // is that slot and, on a taken/not-taken-non-likely arm, is reached
+            // with core.in_delay_slot=true + a pending delay_slot_target. Mark
+            // it so codegen gives it the entry-word foreign-slot treatment
+            // (honor the pending transfer) instead of a plain fallthrough.
+            // Note: OR into the flag — a word reached both this way AND some
+            // other way stays flagged, and codegen's entry-word check is a
+            // superset that's correct for a plain arrival too (in_delay_slot
+            // false -> falls through normally).
+            instrs[(offset + 1) as usize].is_branch_fallback_successor = true;
+        }
+        return true;
     }
 
     if already_visited {
@@ -557,7 +723,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
 
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
-        fallthrough_exit: None, taken_exit: None, is_slot_only: false,
+        fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false,
     };
     budget.remaining -= 1;
 
@@ -588,7 +754,7 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
                 instrs[offset as usize].fallthrough_exit = Some(reason);
             }
         }
-        Classify::Excluded => unreachable!("handled above"),
+        Classify::Excluded | Classify::RegionBoundary => unreachable!("handled above"),
         Classify::RegJump => instrs[offset as usize].taken_exit = Some(StopReason::RegJump),
         Classify::Branch { target } => {
             // Slot already walked above (excluded-free, checked before this
@@ -655,7 +821,7 @@ fn finish_visit_foreign_page_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE]
         Classify::Jump { .. } | Classify::RegJump => {
             instrs[offset as usize].taken_exit = Some(StopReason::ForeignPageSlot);
         }
-        Classify::Sequential | Classify::Excluded => unreachable!("is_0xffc_branch guarantees a branch/jump/regjump class"),
+        Classify::Sequential | Classify::Excluded | Classify::RegionBoundary => unreachable!("is_0xffc_branch guarantees a branch/jump/regjump class"),
     }
     true
 }
@@ -664,6 +830,12 @@ fn finish_visit_foreign_page_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE]
 mod tests {
     use super::*;
     use crate::mips_isa::*;
+
+    /// Delegates to the crate-wide [`super::test_fallback_guard`] so this
+    /// module's fallback tests share the one lock with every other module's.
+    fn fallback_on_guard() -> super::TestFallbackGuard {
+        super::test_fallback_guard()
+    }
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
@@ -814,38 +986,43 @@ mod tests {
     }
 
     #[test]
-    fn walk_excluded_entry_produces_empty_region() {
-        // §6.4 "excluded-first-instruction": entry itself is excluded -> the
-        // whole region is empty, nothing gets marked visited.
+    fn walk_excluded_entry_is_a_one_instruction_fallback_region() {
+        let _fb = fallback_on_guard();
+        // Interpreter-fallback: an excluded entry is no longer an empty region.
+        // It's a one-instruction region with the excluded word visited and
+        // tagged `is_fallback` — codegen runs it via core.interp_fallback_fn.
+        // (Pre-fallback this reported non_empty=false / nothing visited.)
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0);
+        page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // clean region end after the fallback
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk(&page, 0, 0);
-        assert!(!non_empty, "excluded entry must report an empty region");
-        assert_eq!(instrs_linear(result).count(), 0);
-        assert!(!result[0].visited, "the excluded entry instruction itself must never be marked visited");
+        assert!(non_empty, "excluded entry is now a compilable fallback region");
+        assert_eq!(instrs_linear(result).count(), 3, "fallback head + JR successor + JR's delay slot");
+        assert!(result[0].visited, "the excluded entry is now visited as a fallback head");
+        assert!(result[0].is_fallback, "excluded head must be tagged is_fallback");
     }
 
     #[test]
-    fn walk_branch_taken_target_excluded_marks_branch_as_exit() {
-        // word 0: BEQ r1,r2, +2 (target = 0+1+2 = 3). Fall-through path (word
-        // 2) is a plain regjump so it terminates cleanly; the taken path's
-        // target (word 3) is excluded, so the branch's taken_exit must record
-        // that instead of being left None — a None here with no block
-        // allocated for word 3 is exactly what made codegen's
-        // emit_target_edge panic (block_for_word.get(&3) was empty).
+    fn walk_branch_taken_target_excluded_continues_into_fallback() {
+        let _fb = fallback_on_guard();
+        // word 0: BEQ r1,r2, +2 (target = 0+1+2 = 3). The taken target (word 3)
+        // is excluded — with interpreter-fallback it's now visited as a
+        // fallback head and the branch *continues into* it (taken_exit None),
+        // rather than the branch recording StopReason::Excluded and exiting.
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = i_type(OP_BEQ, 1, 2, 2);
         page[1] = 0; // delay slot
         page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // fall-through path ends here
-        page[3] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // taken target: excluded
+        page[3] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // taken target: excluded -> fallback
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk(&page, 0, 0);
         assert!(non_empty);
         let branch = result[0];
         assert!(branch.visited);
-        assert_eq!(branch.taken_exit, Some(StopReason::Excluded), "excluded taken target must be recorded, not left None");
-        assert!(!result[3].visited, "the excluded target itself must never be marked visited");
+        assert_eq!(branch.taken_exit, None, "taken arm now continues into the fallback word, no exit");
+        assert!(result[3].visited, "excluded taken target is now visited as a fallback head");
+        assert!(result[3].is_fallback);
     }
 
     #[test]
@@ -876,21 +1053,24 @@ mod tests {
     }
 
     #[test]
-    fn walk_excluded_successor_attributes_stop_to_predecessor() {
+    fn walk_excluded_successor_is_a_fallback_head_in_region() {
+        let _fb = fallback_on_guard();
         // word 0 is a plain sequential instruction whose fall-through (word 1)
-        // is excluded. The region must end AT word 0 with stop=Excluded; word
-        // 1 (the excluded instruction) must never be visited/compiled.
+        // is excluded. With interpreter-fallback the region no longer ends at
+        // word 0: word 1 is visited as a fallback head, so word 0's fallthrough
+        // continues into it (no exit). (Word 1's own fall-through to word 2, a
+        // nop, continues on — the region keeps growing normally.)
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = 0; // nop, falls through to word 1
-        page[1] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // excluded
+        page[1] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // excluded -> fallback
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // clean region end
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk(&page, 0, 0);
         assert!(non_empty);
-        let v: Vec<_> = instrs_linear(result).collect();
-        assert_eq!(v.len(), 1, "only word 0 should be in the region");
-        assert_eq!(v[0].word, 0);
-        assert_eq!(v[0].fallthrough_exit, Some(StopReason::Excluded));
-        assert!(!result[1].visited, "the excluded successor must never be marked visited");
+        assert_eq!(result[0].fallthrough_exit, None, "word 0 now continues into the fallback word");
+        assert!(result[1].visited, "the excluded successor is now visited as a fallback head");
+        assert!(result[1].is_fallback);
+        assert!(!result[1].is_slot_only);
     }
 
     #[test]
@@ -915,24 +1095,28 @@ mod tests {
     }
 
     #[test]
-    fn walk_branch_not_taken_arm_excluded_marks_branch_as_exit() {
-        // BEQ's not-taken side (fall-through past the delay slot, word 2)
-        // is excluded. The branch itself must become the region exit —
-        // same treatment as Sequential's fall-through being excluded — even
-        // though the taken arm (word 4) is a perfectly good in-page target.
+    fn walk_branch_not_taken_arm_excluded_continues_into_fallback() {
+        let _fb = fallback_on_guard();
+        // BEQ's not-taken side (fall-through past the delay slot, word 2) is
+        // excluded. With interpreter-fallback the not-taken arm continues into
+        // word 2 as a fallback head (no exit) instead of the branch becoming a
+        // region boundary. The taken arm (word 3) is a good in-page target as
+        // before. NOTE: word 2's fall-through target is word 3 (the JR), so the
+        // two arms converge — fine.
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = i_type(OP_BEQ, 1, 2, 2); // target = 0+1+2 = 3
         page[1] = 0; // delay slot
-        page[2] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // not-taken arm: excluded
-        page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // taken arm: fine
+        page[2] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // not-taken arm: excluded -> fallback
+        page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // taken arm / fallback's successor
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk(&page, 0, 0);
         assert!(non_empty);
-        assert_eq!(result[0].fallthrough_exit, Some(StopReason::Excluded));
+        assert_eq!(result[0].fallthrough_exit, None, "not-taken arm now continues into the fallback word");
         assert_eq!(result[0].taken_exit, None, "taken arm continues into compiled code, no exit needed");
         assert!(result[1].visited, "delay slot is still compiled");
-        assert!(!result[2].visited, "excluded not-taken word must never be visited");
-        assert!(result[4].visited, "taken arm is still walked despite the not-taken exclusion");
+        assert!(result[2].visited, "excluded not-taken word is now visited as a fallback head");
+        assert!(result[2].is_fallback);
+        assert!(result[3].visited, "taken arm is still walked");
     }
 
     #[test]
@@ -1084,14 +1268,18 @@ mod tests {
     }
 
     #[test]
-    fn walk_excluded_entry_is_empty_even_when_bounded() {
-        // §6.4 "excluded-first-instruction" must still short-circuit before
-        // the budget is even consulted (mirrors walk_excluded_entry_produces_empty_region).
+    fn walk_excluded_entry_bounded_is_a_one_instruction_fallback_region() {
+        let _fb = fallback_on_guard();
+        // Interpreter-fallback: an excluded entry is a fallback head charged
+        // against the budget like any other head. A budget of 1 admits exactly
+        // the one fallback instruction (mirrors
+        // walk_excluded_entry_is_a_one_instruction_fallback_region, bounded).
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0);
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk_bounded(&page, 0, 0, 1);
-        assert!(!non_empty);
-        assert_eq!(instrs_linear(result).count(), 0);
+        assert!(non_empty, "excluded entry is now a compilable fallback region");
+        assert_eq!(instrs_linear(result).count(), 1);
+        assert!(result[0].visited && result[0].is_fallback);
     }
 }

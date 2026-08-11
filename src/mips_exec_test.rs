@@ -148,14 +148,10 @@ mod tests {
     /// `gen_ptr`, is what actually keeps jitv2 out of this file's tests now.
     #[cfg(feature = "jitv2")]
     fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>) {
+        // jitv2_dispatch_enabled=false turns the whole JIT dispatch gate off,
+        // which is what drives lockstep now — so this alone keeps jitv2 (and its
+        // lockstep instrumentation) out of these interpreter-only tests.
         exec.jitv2_dispatch_enabled = false;
-        #[cfg(feature = "jitv2_lockstep")]
-        {
-            exec.lockstep_enabled.alu = false;
-            exec.lockstep_enabled.branch = false;
-            exec.lockstep_enabled.load_store = false;
-            exec.lockstep_enabled.fpu = false;
-        }
     }
     #[cfg(not(feature = "jitv2"))]
     fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(_exec: &mut MipsExecutor<T, C>) {}

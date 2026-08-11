@@ -142,6 +142,19 @@ struct EmitCtx<'a, 'b> {
     /// unconditionally at the exception-exit call site itself rather than
     /// trusted from whatever's already live in `core.in_delay_slot`.
     bd: bool,
+    /// `true` iff an exception raised while emitting with this `ctx` must
+    /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
+    /// `exception_entry_word_block`) rather than overwriting them from the
+    /// compile-time `word`/`bd` (`exception_other_word_block`). Set for the
+    /// entry word (state set by the interpreter dispatch that reached it) and
+    /// for a *branch-fallback successor* — the delay slot of a BC1
+    /// interpreter-fallback, reached with `core.pc = slot_addr` and
+    /// `in_delay_slot = true` already correct from the fallback's interpreter
+    /// run; overwriting them (BD would become the compile-time `false`) would
+    /// give a faulting slot the wrong `Cause.BD`/EPC. Distinct from `bd`: `bd`
+    /// is a compile-time literal for the *other-word* path; this bool selects
+    /// *which* path entirely.
+    trust_live_pc_bd_on_exc: bool,
     exit_block: Block,
     /// Two-stage shared exception-raise blocks (see their own doc comments
     /// on `BlockSkeleton`) — `emit_exception_exit` picks which outer stage
@@ -503,7 +516,7 @@ impl Codegen {
         let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, exit_core_ptr, word_offset_param);
+        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param);
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
@@ -670,6 +683,13 @@ impl Codegen {
         // contract — every visited instruction must have a semantics or
         // branch/jump emitter, full stop.
         for instr in instrs_linear(instrs) {
+            // A fallback head (analyzer-Excluded, kept in the region) has no
+            // native emitter by definition — it runs through the interpreter
+            // (emit_interp_fallback_head), so it's exempt from the
+            // must-have-an-emitter rule below.
+            if instr.is_fallback {
+                continue;
+            }
             if lookup_semantics(instr.raw).is_none()
                 && lookup_branch_or_jump(instr.raw).is_none()
                 && lookup_regjump(instr.raw).is_none()
@@ -782,7 +802,7 @@ impl Codegen {
         // own body, emitted before its terminating jump to entry_word_block.
         let has_fpu = instrs_linear(instrs).any(|i| lookup_cp1_semantics(i.raw).is_some());
         if has_fpu {
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
             emit_fpu_entry_guard(&mut guard_ctx, entry_word, compiled_for_fr1);
         }
         // Skip straight to entry_word_body_block (bypassing the preamble)
@@ -795,7 +815,7 @@ impl Codegen {
         builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
 
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, exit_core_ptr, word_offset_param);
+        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param);
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
@@ -833,7 +853,14 @@ impl Codegen {
             builder.switch_to_block(block);
 
             let raw = instrs[word as usize].raw;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+            // A branch-fallback successor (BC1 slot) arrives with correct live
+            // pc/in_delay_slot from the fallback's interpreter run, same as the
+            // entry word — both must trust those on an exception (see the field
+            // doc). Set at ctx construction so every emit_exception_exit within
+            // this word's emission (including a faulting slot instruction) picks
+            // the right exception outer stage.
+            let trust_live_pc_bd_on_exc = word == entry_word || instrs[word as usize].is_branch_fallback_successor;
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
 
             if word == entry_word && entry_word_body_block.is_some() {
                 // entry_word_block is reached only by internal in-region
@@ -899,6 +926,40 @@ impl Codegen {
             // the timer check — there's no per-instruction cp0_count advance
             // to mirror anymore (Count is virtual, materialized on read).
             emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
+            // Developer per-instruction hook (dt traceback + PC breakpoints),
+            // right after the interrupt check — the same per-instruction point
+            // the interpreter's step() does its trace/breakpoint work, so a
+            // compiled region's instructions are visible in `dt` (tagged with
+            // their real arrival class) and can hit breakpoints. Emitted in
+            // whichever block the preamble runs in: for the entry word under
+            // skip_entry_preamble that's entry_word_block (internal back-edges
+            // ONLY — step()'s external dispatch bypasses this whole block, so
+            // every call reaching here for word==entry_word is a back-edge, not
+            // double-recording the external entry step() already logged).
+            // is_branch_fallback_successor is reached here for both its
+            // external arrival (straight from the fallback's own interpreter
+            // run) and any internal back-edge — the foreign-slot runtime check
+            // right below can't be resolved until after this call, so both
+            // collapse to one FALLBACK_SUCCESSOR tag rather than paying for a
+            // second runtime branch just to split a diagnostic tag further.
+            // A fallback head's own dispatch is recorded separately, tagged
+            // FallbackWord, by interp_dispatch_one itself when
+            // emit_interp_fallback_head below actually calls into the
+            // interpreter — skip this call entirely for one, or the word
+            // gets double-recorded (once here as a misleading Jit/back-edge
+            // tag before the interpreter ever runs it, once correctly after)
+            // and traceback lookups keyed on pc find the wrong, earlier one.
+            #[cfg(feature = "developer")]
+            if !instrs[word as usize].is_fallback {
+                let origin = if word == entry_word {
+                    dev_trace_origin::JIT_ENTRY_BACK_EDGE
+                } else if instrs[word as usize].is_branch_fallback_successor {
+                    dev_trace_origin::FALLBACK_SUCCESSOR
+                } else {
+                    dev_trace_origin::JIT
+                };
+                emit_dev_trace_bp(&mut ctx, origin);
+            }
             // Past the preamble: this instruction is actually going to
             // execute (the preamble didn't bail to the interpreter for this
             // word), matching step()'s per-instruction cycle count exactly —
@@ -916,17 +977,115 @@ impl Codegen {
                 }
             }
 
-            if let Some(branch) = lookup_branch_or_jump(raw) {
+            if instrs[word as usize].is_fallback {
+                // Interpreter-fallback head (analyzer kept an Excluded word in
+                // the region). Takes priority over the branch/regjump/semantics
+                // lookups below: an excluded word's raw bits may superficially
+                // resemble a branch/regjump shape, but it has no native emitter
+                // by definition — it runs through the interpreter. The int-check
+                // preamble already ran above (compile_region's loop), so this is
+                // the whole body. Note: entry-word special handling below is
+                // skipped for a fallback head — a fallback calls the interpreter,
+                // which handles any foreign-slot state itself.
+                emit_interp_fallback_head(&mut ctx, exit_block, &block_for_word, instrs[word as usize].fallthrough_exit);
+            } else if let Some(branch) = lookup_branch_or_jump(raw) {
                 emit_branch_or_jump(&mut ctx, exit_block, &block_for_word, instrs, branch, fr_mode);
             } else if let Some(regjump) = lookup_regjump(raw) {
                 emit_regjump(&mut ctx, instrs, regjump, fr_mode);
             } else {
+                // jitv2_lockstep: bracket this straight-line (Sequential/CP1)
+                // instruction — run the interpreter reference before, compare
+                // the JIT's result after. Branch/jump/regjump aren't bracketed
+                // (their inlined-slot / single-dispatch model mismatch needs
+                // separate handling); fallback has its own semantics below.
+                //
+                // Skip the entry word: its core.pc/in_delay_slot come from
+                // OUTSIDE (the interpreter dispatch that reached this region set
+                // them, possibly as a foreign delay slot with in_delay_slot=true
+                // — see the word==entry_word handling below). The lockstep
+                // brackets materialize pc/bd from compile-time constants, which
+                // would clobber that inherited state; and the entry instruction
+                // was already the interpreter's own dispatch target, so it needs
+                // no separate reference run.
+                // Also skip a region-ending Sequential (fallthrough_exit set):
+                // emit_lockstep_compare_seq materializes core.pc = word+1, but
+                // the region-exit stub right after re-derives pc from live
+                // core.pc's page base — at the 0xFFC boundary that word+1 write
+                // lands pc on the *next* page, which the exit's vbase re-derive
+                // then compounds by another page. The last instruction of a
+                // region is verified when it's re-entered as part of the next
+                // region anyway; skipping it here avoids the boundary hazard.
+                // An entry word or branch-fallback successor (BC1 delay slot)
+                // inherits core.pc/in_delay_slot/delay_slot_target from its
+                // arrival, and resolves its final pc in the foreign-slot check
+                // below (word+1 or delay_slot_target). It's lockstep-verified via
+                // the `trust_live` path: emit_lockstep_step(true) preserves the
+                // inherited state (LOCKSTEP_BD_LIVE sentinel), and the compare
+                // (emit_lockstep_compare_live) runs inside BOTH foreign-slot arms
+                // after pc is final. A plain straight-line head uses the ordinary
+                // path (emit_lockstep_step(false) + emit_lockstep_compare_seq,
+                // pc materialized to word+1). Region-ending words
+                // (fallthrough_exit set) are still skipped — the exit stub's own
+                // pc re-derivation collides with the compare's pc write (0xFFC
+                // boundary); they're verified when re-entered as the next
+                // region's head.
+                // Step (run the interpreter reference, stash its expected
+                // result) has nothing to do with whether this word's
+                // fallthrough happens to leave the region — that's purely a
+                // COMPARE-side concern (materializing pc=word+1 and, at the
+                // 0xFFC page boundary, avoiding emit_bail's own re-derivation
+                // double-applying the page-crossing offset — see
+                // emit_lockstep_compare_seq's `region_ending` doc comment).
+                // The two were previously tied to the same `fallthrough_exit
+                // .is_none()` condition, which meant a region-ending
+                // entry/branch-fallback-successor word never got its
+                // interpreter reference run AT ALL — not skipped-but-safe,
+                // just silently unverified (found live: badaddr_val's own
+                // entry, the last word on its page, diverged from the
+                // interpreter with zero lockstep coverage — the ADDIU that
+                // computed `sp` was never cross-checked once).
+                // No exclusion anymore: every word, region-ending or not,
+                // gets a real interpreter reference + compare. The live-boot
+                // hang this exclusion used to work around was the divergence
+                // path only ever restoring `core.pc`, never `in_delay_slot`/
+                // `delay_slot_target` alongside it — a stale slot flag left
+                // over from the JIT's wrong run could make the interpreter
+                // misinterpret a plain instruction as mid-delay-slot after a
+                // break. `lockstep_compare` (mips_exec.rs) now restores all
+                // three as one unit from `ls_before`/`ls_delay_target_before`,
+                // so there's no remaining reason to special-case a
+                // region-ending word out of lockstep coverage — the
+                // page-boundary double-jump hazard on the *non-divergent*
+                // continuing path is still handled below (see
+                // `emit_lockstep_compare_seq`'s `region_ending` restore and
+                // the `plain_block` arm's matching one).
+                #[cfg(feature = "jitv2_lockstep")]
+                let region_ending = instrs[word as usize].fallthrough_exit.is_some();
+                #[cfg(feature = "jitv2_lockstep")]
+                let ls_live = word == entry_word || instrs[word as usize].is_branch_fallback_successor;
+                #[cfg(feature = "jitv2_lockstep")]
+                let ls_bracket = !ls_live;
+                #[cfg(feature = "jitv2_lockstep")]
+                if ls_bracket { emit_lockstep_step(&mut ctx, false); }
+                #[cfg(feature = "jitv2_lockstep")]
+                if ls_live { emit_lockstep_step(&mut ctx, true); }
+
                 if let Some(emit) = lookup_semantics(raw) {
                     emit(&mut ctx);
                 } else {
                     let emit = lookup_cp1_semantics(raw).expect("checked above");
                     emit(&mut ctx, fr_mode);
                 }
+
+                // region_ending: emit_lockstep_compare_seq does nothing useful
+                // (no materialize, no compare) — plain_fallthrough's Some(_)
+                // arm below routes through emit_bail instead, whose shared
+                // target block writes core.pc for real and runs the compare
+                // right after, since that's the only point core.pc is
+                // genuinely final for a region-ending word. See
+                // emit_lockstep_compare_seq's own doc comment.
+                #[cfg(feature = "jitv2_lockstep")]
+                if ls_bracket && !region_ending { emit_lockstep_compare_seq(&mut ctx); }
 
                 let fallthrough_word = word + 1;
                 let plain_fallthrough = |ctx: &mut EmitCtx| {
@@ -944,32 +1103,31 @@ impl Codegen {
                     }
                 };
 
-                if word == entry_word {
-                    // The entry word — and only the entry word (see EmitCtx's
-                    // doc comment on `entry_word`) — can be reached two ways:
-                    // as an ordinary dispatch, or because the interpreter's
-                    // previous dispatch landed here via `branch_delay` (some
-                    // *other* instruction's delay slot, with `in_delay_slot`/
-                    // `delay_slot_target` already armed) and this exact word
-                    // just happened to also get compiled as a standalone
-                    // entry (e.g. the `entry_offset == 0` always-probe in
-                    // exec_decoded's dispatch gate — this is also what makes
-                    // word 0 itself safe as an entry despite potentially
-                    // inheriting a delay slot from the *previous* page's
-                    // branch at 0xFFC: this same check closes that case too,
-                    // page-agnostically). A plain Sequential
-                    // instruction's compile-time fallthrough_word has no way
-                    // to know about that pending transfer — unlike a branch/
-                    // jump's own delay slot, which `emit_slot_semantics`
-                    // manages explicitly, this word's compilation is
-                    // completely unaware it might be running as someone
-                    // else's slot. Must check `core.in_delay_slot` at runtime
-                    // and, if set, exit via `core.delay_slot_target` instead
-                    // — exactly mirroring `handle_exec_complete` — or the
-                    // pending transfer is silently discarded (found live: the
-                    // IRIX PROM reset vector's own `j realstart`, delay slot
-                    // compiled standalone, landed on the next sequential word
-                    // instead of realstart).
+                // The entry word — and now also a *branch-fallback successor*
+                // (the delay slot of a BC1 interpreter-fallback,
+                // `is_branch_fallback_successor`) — can be reached with a
+                // pending delay-slot transfer already armed (`in_delay_slot`/
+                // `delay_slot_target` set): the entry word because the
+                // interpreter's previous dispatch landed here as some *other*
+                // branch's slot (the `entry_offset == 0` always-probe, or a
+                // cross-page 0xFFC slot); the branch-fallback successor because
+                // the BC1 fallback just ran the interpreter, which armed the
+                // slot and left this word as its target's delay slot. Both need
+                // the identical runtime check: after this word's semantics run,
+                // if `core.in_delay_slot` is set, consume `core.delay_slot_target`
+                // (exit there, clear the flag) — exactly mirroring
+                // `handle_exec_complete` — instead of the compile-time-known
+                // plain fallthrough, or the pending transfer is silently
+                // discarded (found live: the IRIX PROM reset vector's `j
+                // realstart` slot compiled standalone; and BC1-as-fallback,
+                // this fix). The check is a runtime superset that's correct for
+                // an ordinary (no-pending-slot) arrival too — `in_delay_slot`
+                // false falls through normally — so one block serves both the
+                // pending-transfer and plain arrival paths (the entry word never
+                // needed two static versions here either).
+                let needs_foreign_slot_check =
+                    word == entry_word || instrs[word as usize].is_branch_fallback_successor;
+                if needs_foreign_slot_check {
                     let mem = MemFlagsData::trusted();
                     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
                     let in_delay_slot = ctx.builder.ins().load(ir::types::I8, mem, ctx.core_ptr, flag_off);
@@ -979,16 +1137,45 @@ impl Codegen {
                     let plain_block = ctx.builder.create_block();
                     ctx.builder.ins().brif(is_foreign_slot, foreign_slot_block, &[], plain_block, &[]);
 
+                    // Foreign-slot arm: consume the pending transfer (pc <-
+                    // delay_slot_target, clear flag). Under lockstep (ls_live),
+                    // materialize pc now so it's final, run the compare, then
+                    // exit to the target.
                     ctx.builder.switch_to_block(foreign_slot_block);
                     ctx.builder.seal_block(foreign_slot_block);
                     let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
                     let target = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, target_off);
                     let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
                     ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+                    #[cfg(feature = "jitv2_lockstep")]
+                    if ls_live {
+                        let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+                        ctx.builder.ins().store(mem, target, ctx.core_ptr, pc_off);
+                        emit_lockstep_compare_live(&mut ctx);
+                    }
                     emit_absolute_pc_exit(&mut ctx, target);
 
+                    // Plain arm: no pending transfer. Under lockstep (ls_live),
+                    // materialize pc = word+1 (the JIT didn't advance it) and
+                    // compare before the ordinary fallthrough — except when
+                    // region_ending, where materializing here would create the
+                    // exact double-page-jump emit_lockstep_compare_seq's doc
+                    // comment describes (plain_fallthrough below is about to
+                    // route through emit_bail, whose shared target block
+                    // writes core.pc for real and runs the compare right
+                    // after — the only point core.pc is genuinely final for a
+                    // region-ending word). Skip entirely in that case; nothing
+                    // here would be more than a throwaway value emit_bail's
+                    // own vbase re-derivation would then double-cross.
                     ctx.builder.switch_to_block(plain_block);
                     ctx.builder.seal_block(plain_block);
+                    #[cfg(feature = "jitv2_lockstep")]
+                    if ls_live && !region_ending {
+                        let next_pc = emit_word_addr(&mut ctx, word + 1);
+                        let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+                        ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
+                        emit_lockstep_compare_live(&mut ctx);
+                    }
                     plain_fallthrough(&mut ctx);
                 } else {
                     plain_fallthrough(&mut ctx);
@@ -1339,10 +1526,12 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset: u16) {
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
-    sig.params.push(AbiParam::new(ir::types::I16)); // entry_offset
+    sig.params.push(AbiParam::new(ir::types::I32)); // entry_offset
     let sig_ref = ctx.builder.import_signature(sig);
 
-    let offset_val = ctx.builder.ins().iconst(ir::types::I16, entry_offset as i64);
+    // I32, not I16 — see kill_entry_fn's doc comment (narrow extern "C"
+    // params aren't reliably zero-extended by every caller/ABI).
+    let offset_val = ctx.builder.ins().iconst(ir::types::I32, entry_offset as i64);
     ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, offset_val]);
 }
 
@@ -1399,6 +1588,389 @@ fn emit_interp_fallback_exit(ctx: &mut EmitCtx, word_offset: WordOffset) {
     ctx.builder.ins().return_(&[status]);
 }
 
+/// Emit an interpreter-fallback **head** (`CompiledInstr::is_fallback`): an
+/// analyzer-`Excluded` instruction the walker kept in the region instead of
+/// ending it (see `analyzer::visit`'s `Classify::Excluded` arm). Runs after
+/// this word's normal per-instruction preamble (int-check + cycle increment,
+/// emitted by `compile_region`'s loop like every head), so the int-check has
+/// already had its chance to bail — that is what gives a fallback the
+/// per-instruction interrupt check the old entry instruction relied on
+/// `step()` for (`fallback_performs_int_check_before_running`).
+///
+/// Shape:
+///   1. materialize `core.pc = word*4 | vbase` (this instruction's own
+///      address) so `interp_fallback_fn` (`interp_dispatch_one`) fetches and
+///      dispatches *this* excluded instruction through the real interpreter
+///      handler;
+///   2. call it, take its `ExecStatus`;
+///   3. if status != EXEC_COMPLETE, `return status` — the handler already
+///      delivered whatever exception/fault it raised (SYSCALL/BREAK/COP2/
+///      CACHE-fault, etc.); falling through would run the successor after an
+///      exception (`fallback_exception_status_short_circuits_successor`);
+///   4. else check `core.pc == word*4+4 | vbase`. A fallback can retire
+///      EXEC_COMPLETE yet *relocate* PC (ERET -> EPC, taken BC1) — for those
+///      the successor block's compile-time PC assumption is wrong, so
+///      `return EXEC_COMPLETE` and let the interpreter re-dispatch at the new
+///      PC (`fallback_that_moves_pc_does_not_run_successor`). This check is NOT
+///      inherited from entry semantics (entry only checks in_delay_slot and
+///      never runs a prior instruction that could move PC);
+///   5. else `core.pc`/`core.in_delay_slot` are exactly what a normal
+///      interpreter step leaves (pc = this+4, in_delay_slot false — see
+///      `handle_exec_complete`), i.e. the successor is already in the
+///      identical state to a fresh external entry ("entry-like successor").
+///      Continue: jump to the successor's block if it's in-region, or
+///      `return EXEC_COMPLETE` if the fallback's fallthrough exits the region
+///      (pc already correct, no `emit_bail` recompute needed).
+///
+/// Terminates the current block on every path.
+fn emit_interp_fallback_head(
+    ctx: &mut EmitCtx,
+    exit_block: Block,
+    block_for_word: &std::collections::HashMap<WordOffset, Block>,
+    fallthrough_exit: Option<crate::jitv2::analyzer::StopReason>,
+) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let word = ctx.word;
+
+    // (1) core.pc = this instruction's own address. `own_pc` is captured here,
+    // BEFORE the fallback call, and reused for the step-(4) advance check —
+    // deriving the expected successor address from the *post-call* core.pc
+    // (via a fresh emit_word_addr) would be wrong: the fallback may have moved
+    // core.pc to a different page (ERET -> EPC, a taken branch), so its vbase
+    // no longer names this instruction's page. `own_pc + 4` is the one true
+    // "advanced by exactly one word on this page" address.
+    let own_pc = emit_word_addr(ctx, word);
+    ctx.builder.ins().store(mem, own_pc, ctx.core_ptr, pc_off);
+    let expected_next = ctx.builder.ins().iadd_imm_s(own_pc, 4);
+
+    // (2) call core.interp_fallback_fn(jit_ctx) -> ExecStatus.
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let status = ctx.builder.inst_results(call)[0];
+
+    // (3) status != EXEC_COMPLETE -> return it directly.
+    let complete = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, EXEC_COMPLETE as i64);
+    let advanced_check_block = ctx.builder.create_block();
+    let not_complete_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(complete, advanced_check_block, &[], not_complete_block, &[]);
+
+    ctx.builder.switch_to_block(not_complete_block);
+    ctx.builder.seal_block(not_complete_block);
+    ctx.builder.ins().return_(&[status]);
+
+    // (4) EXEC_COMPLETE but did PC advance by exactly one word? Compare live
+    // core.pc against `own_pc + 4` captured before the call (see step (1)).
+    ctx.builder.switch_to_block(advanced_check_block);
+    ctx.builder.seal_block(advanced_check_block);
+    let live_pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+    let advanced_one = ctx.builder.ins().icmp(IntCC::Equal, live_pc, expected_next);
+    let continue_block = ctx.builder.create_block();
+    let moved_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(advanced_one, continue_block, &[], moved_block, &[]);
+
+    // PC moved elsewhere (ERET/BC1/...): pc is already correct for wherever the
+    // interpreter went; just return so the outer loop re-dispatches there.
+    ctx.builder.switch_to_block(moved_block);
+    ctx.builder.seal_block(moved_block);
+    let complete_status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().return_(&[complete_status]);
+
+    // (5) plain one-word advance: continue into the successor.
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+    match fallthrough_exit {
+        Some(_) => {
+            // Region ends here. core.pc is already this+4 (just verified), so
+            // return EXEC_COMPLETE directly — no emit_bail pc recompute needed.
+            let s = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+            ctx.builder.ins().return_(&[s]);
+        }
+        None => {
+            let next_block = *block_for_word.get(&(word + 1))
+                .expect("fallback fallthrough_exit is None -> analyzer guarantees the successor is in-region");
+            ctx.builder.ins().jump(next_block, &[]);
+        }
+    }
+}
+
+/// Developer-only per-instruction hook (`developer` builds): call
+/// Origin codes passed to `core.dev_trace_bp_fn`'s 4th (`bd`-shaped, now
+/// repurposed) parameter — must match `mips_exec::InstrOrigin::from_u32`
+/// exactly (that function is the single decode point; these are the encode
+/// side). Each `emit_dev_trace_bp` call site passes the constant matching
+/// its own arrival class, so `dt` can show exactly how an instruction was
+/// reached instead of a collapsed jit/interp bit. `u32`, not `u8` — see
+/// `MipsCore::dev_trace_bp_fn`'s doc comment: a narrow `extern "C"` param
+/// isn't reliably zero-extended by every caller/ABI, and this was in fact
+/// silently broken as `u8` (the hook fired millions of times per
+/// `j2 stats`, but `dt` showed no tags at all on a live boot — found live).
+#[cfg(feature = "developer")]
+mod dev_trace_origin {
+    pub const JIT: u32 = 1;
+    pub const JIT_ENTRY_BACK_EDGE: u32 = 2;
+    pub const JIT_DELAY_SLOT: u32 = 3;
+    pub const FALLBACK_SUCCESSOR: u32 = 5;
+    pub const FALLBACK_SUCCESSOR_BACK_EDGE: u32 = 6;
+}
+
+/// `core.dev_trace_bp_fn(jit_ctx, pc, raw, origin)` with this instruction's
+/// synthesized address, compile-time-known `raw`, and `origin` (one of
+/// `dev_trace_origin`'s constants, identifying which arrival class this call
+/// site is — plain body, entry-word back-edge, delay slot, fallback
+/// successor, etc.), so it lands in the `dt` traceback tagged with that
+/// origin and can hit PC breakpoints — the visibility the interpreter's
+/// `step()` has that a compiled region otherwise runs straight past. On a
+/// breakpoint hit (hook returns `EXEC_BREAKPOINT`) this materializes
+/// `core.pc = pc` and `core.in_delay_slot = bd` and returns
+/// `EXEC_BREAKPOINT`, stopping the monitor *before* the instruction executes
+/// with state correct for resume; otherwise control falls through to the
+/// instruction's own semantics. Emitted right after the interrupt preamble
+/// (`emit_pending_interrupt_preamble`) — the same per-instruction point the
+/// interpreter does its trace/breakpoint work — and NOT on the entry word's
+/// external-dispatch arm (`step()` already recorded that PC; only the
+/// preamble-bearing internal-edge block reaches this — see `compile_region`).
+///
+/// Does not terminate the current block on the common (no-breakpoint) path —
+/// caller continues emitting the instruction's semantics after it. Terminates
+/// only the cold breakpoint arm (its own block).
+#[cfg(feature = "developer")]
+fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let word = ctx.word;
+
+    let pc_val = emit_word_addr(ctx, word);
+    let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
+    let origin_val = ctx.builder.ins().iconst(ir::types::I32, origin as i64);
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_dev_trace_bp_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));         // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I64)); // pc
+    sig.params.push(AbiParam::new(ir::types::I32)); // raw
+    sig.params.push(AbiParam::new(ir::types::I32)); // origin
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, pc_val, raw_val, origin_val]);
+    let status = ctx.builder.inst_results(call)[0];
+
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
+
+    // Cold: a breakpoint hit is rare and interactive.
+    ctx.builder.switch_to_block(bp_block);
+    ctx.builder.set_cold_block(bp_block);
+    ctx.builder.seal_block(bp_block);
+    // core.pc/in_delay_slot already correct for resume: pc = this word, bd =
+    // ctx.bd. (pc_val recomputed rather than threaded — trivial and keeps this
+    // self-contained.)
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let pc_again = emit_word_addr(ctx, word);
+    ctx.builder.ins().store(mem, pc_again, ctx.core_ptr, pc_off);
+    let bd_store = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
+    ctx.builder.ins().store(mem, bd_store, ctx.core_ptr, flag_off);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    ctx.builder.ins().return_(&[bp_status]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// `jitv2_lockstep` per-instruction STEP bracket (`emit_lockstep_step`): under
+/// lockstep only, materialize this instruction's starting `core.pc`/
+/// `in_delay_slot` (the JIT doesn't keep `core.pc` live for straight-line
+/// instructions, so lockstep does — see the module doc) and call
+/// `core.lockstep_step_fn(jit_ctx, pc, raw, bd)`, which runs the interpreter
+/// reference for this instruction and leaves the starting state restored for
+/// the JIT to run against. Emitted right after the interrupt preamble, before
+/// the instruction's own semantics. Not a terminator.
+/// `trust_live`: for an entry word or delay slot (branch-fallback successor),
+/// `core.pc`/`in_delay_slot`/`delay_slot_target` are already correct from the
+/// arrival and must NOT be materialized from compile-time constants — pass the
+/// `LOCKSTEP_BD_LIVE` sentinel so the callback preserves the live state, and
+/// skip the pc/bd stores. For a plain straight-line head (`trust_live=false`)
+/// the JIT doesn't keep core.pc live, so materialize it here as before.
+#[cfg(feature = "jitv2_lockstep")]
+fn emit_lockstep_step(ctx: &mut EmitCtx, trust_live: bool) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let word = ctx.word;
+
+    let pc_val = emit_word_addr(ctx, word);
+    let bd_arg = if trust_live {
+        // Trust live pc/in_delay_slot — don't overwrite them.
+        crate::mips_exec::LOCKSTEP_BD_LIVE
+    } else {
+        // Plain head: materialize the starting pc/in_delay_slot so both engines
+        // are anchored (the JIT doesn't keep core.pc live for straight-line ops).
+        let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+        ctx.builder.ins().store(mem, pc_val, ctx.core_ptr, pc_off);
+        let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+        let bd_v = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
+        ctx.builder.ins().store(mem, bd_v, ctx.core_ptr, flag_off);
+        ctx.bd as u32
+    };
+
+    // I32, not I8, for the call param — see LOCKSTEP_BD_LIVE's doc comment
+    // (a narrow extern "C" param isn't reliably zero-extended by every
+    // caller/ABI; core.in_delay_slot's own I8 STORE above is unrelated and
+    // stays I8, it's real memory, not a call argument).
+    let bd_val = ctx.builder.ins().iconst(ir::types::I32, bd_arg as i64);
+    let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_step_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));         // jit_ctx
+    sig.params.push(AbiParam::new(ir::types::I64)); // pc
+    sig.params.push(AbiParam::new(ir::types::I32)); // raw
+    sig.params.push(AbiParam::new(ir::types::I32)); // bd
+    let sig_ref = ctx.builder.import_signature(sig);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, pc_val, raw_val, bd_val]);
+}
+
+/// `jitv2_lockstep` compare bracket for an entry word / delay slot, called
+/// *after* the foreign-slot check has resolved the final `core.pc` (to
+/// `word+1` on a plain arrival, or `delay_slot_target` on a pending-transfer
+/// one). Unlike `emit_lockstep_compare_seq` it does NOT materialize pc — the
+/// caller already set it correctly on the current arm — it just runs the
+/// compare hook and, on a divergence (`EXEC_BREAKPOINT`), returns that (pc is
+/// already at the right place for the monitor). Both arms of the foreign-slot
+/// check call this. Terminates the current block only on the divergence arm.
+#[cfg(feature = "jitv2_lockstep")]
+fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let status = ctx.builder.inst_results(call)[0];
+
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(bp_block);
+    ctx.builder.set_cold_block(bp_block);
+    ctx.builder.seal_block(bp_block);
+    // pc is already final for this arm — leave it, just return the break.
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    ctx.builder.ins().return_(&[bp_status]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// `jitv2_lockstep` per-instruction COMPARE bracket (`emit_lockstep_compare`):
+/// under lockstep only, materialize the JIT's final `core.pc = pc + 4` for a
+/// straight-line instruction that didn't write pc itself (so the pc compare is
+/// direct against the interpreter's advanced pc), then call
+/// `core.lockstep_compare_fn(jit_ctx)` which compares JIT vs the interpreter
+/// reference `lockstep_step` stashed and panics on divergence. Emitted after
+/// the instruction's own semantics, before the fallthrough edge. Only used for
+/// straight-line (Sequential/CP1) instructions here — branch/jump/regjump and
+/// fallback manage pc/control themselves and are bracketed (or skipped)
+/// separately.
+///
+/// If the compare hook returns `EXEC_BREAKPOINT` (a divergence — it already
+/// printed the report), this materializes `core.pc = word` (the divergent
+/// instruction's own address, so the monitor stops there / resume re-runs it)
+/// and returns `EXEC_BREAKPOINT` from the compiled function — a cold terminator
+/// arm. The no-divergence path falls through to the instruction's own
+/// fallthrough edge (not a terminator).
+///
+/// `region_ending`: `true` when this word's fallthrough exits the region
+/// (`instrs[word].fallthrough_exit.is_some()`). This function does NOTHING at
+/// all in that case — no materialize, no compare call — and the caller must
+/// skip calling it (see the `ls_bracket && !region_ending` guard at the call
+/// site). The compare still happens, just not here: `plain_fallthrough`'s
+/// `Some(_)` arm calls `emit_bail`, whose shared target block
+/// (`emit_exit_block_body`) writes `core.pc` to its one true final value AND
+/// runs the compare right after, since that's the only place `core.pc` is
+/// genuinely final for a region-ending word — anywhere in *this* function is
+/// necessarily before that real write. An earlier version of this function
+/// wrote a second, throwaway `core.pc = word+1` here purely to give the
+/// compare something to check, then tried to undo it before falling through
+/// to `emit_bail` — but `emit_bail`'s own vbase re-derivation reads
+/// *whatever's currently in `core.pc`* to figure out which page it's on, so
+/// that throwaway write (and the undo's own reload of the same,
+/// already-clobbered cell) doubled the page-crossing instead of just
+/// happening once (found live:
+/// `sequential_pair_ending_at_0xffc_falls_through_to_next_page`). Not
+/// materializing anything here at all is what actually closes that class of
+/// bug, rather than trying to get the undo's bookkeeping right.
+#[cfg(feature = "jitv2_lockstep")]
+fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let word = ctx.word;
+
+    // Straight-line instruction: the interpreter advanced pc to word+1, but the
+    // JIT's semantics didn't touch core.pc. Materialize pc+4 so the compare's
+    // pc field matches. in_delay_slot: a plain Sequential/CP1 op never changes
+    // it, and the interpreter leaves it false after a non-slot retire — the
+    // start bracket already set it to ctx.bd (false for a non-slot head), so
+    // it's already correct.
+    let next_pc = emit_word_addr(ctx, word + 1);
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
+
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let status = ctx.builder.inst_results(call)[0];
+
+    // On a divergence, bail to the monitor: EXEC_BREAKPOINT. core.pc/
+    // in_delay_slot/delay_slot_target are already back at the divergent
+    // instruction's own starting values — lockstep_compare (mips_exec.rs)
+    // restores all three from `ls_before`/`ls_delay_target_before` itself,
+    // in Rust, before returning — codegen has nothing left to fix up here.
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(bp_block);
+    ctx.builder.set_cold_block(bp_block);
+    ctx.builder.seal_block(bp_block);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    ctx.builder.ins().return_(&[bp_status]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
 /// Body of the shared exit-to-interpreter block (`BlockSkeleton::exit_block`),
 /// emitted once by `build_block_skeleton`: materialize `core.pc = vbase |
 /// (word_offset * 4)` (the exiting instruction's own address) and return
@@ -1410,7 +1982,26 @@ fn emit_interp_fallback_exit(ctx: &mut EmitCtx, word_offset: WordOffset) {
 /// `core.pc & !0xFFF` rather than threaded as a separate parameter (§2.2's
 /// vbase and the exiting instruction's own current page base are the same
 /// value by construction, since the whole compiled region is one page).
-fn emit_exit_block_body(builder: &mut FunctionBuilder, core_ptr: Value, word_offset: Value) {
+///
+/// Under `jitv2_lockstep`: the compare runs HERE, after `exit_pc` is written,
+/// not at the per-instruction bracket site — this is the one place `core.pc`
+/// is genuinely final for every bail alike, preamble or post-semantics. A
+/// per-instruction bracket (`emit_lockstep_compare_seq`) only needs to
+/// materialize `core.pc` itself for a *plain, in-region* fallthrough, where
+/// nothing else will ever write it; a bail already has real control-flow
+/// (this function) writing the true final `core.pc`, so materializing a
+/// second, throwaway value earlier — as an older version of this code did,
+/// purely to give the compare something to check — created exactly the
+/// double-page-jump this design avoids: that throwaway write and this
+/// function's own vbase re-derivation from *whatever's currently in core.pc*
+/// would stack two page-crossings when the throwaway value had already
+/// crossed the boundary once (found live:
+/// `sequential_pair_ending_at_0xffc_falls_through_to_next_page`). Comparing
+/// here means the compare never needs its own pc write at all — it reads
+/// whatever this function already wrote for real. A preamble bail (nothing
+/// staged this dispatch) is a harmless no-op, same as every other lockstep
+/// compare call.
+fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, core_ptr: Value, word_offset: Value) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
@@ -1429,6 +2020,41 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, core_ptr: Value, word_off
     // IRIX 5.3 boot trace.)
     let exit_pc = builder.ins().iadd(vbase, byte_offset);
     builder.ins().store(mem, exit_pc, core_ptr, pc_off);
+
+    #[cfg(feature = "jitv2_lockstep")]
+    {
+        let ptr_ty = module.target_config().pointer_type();
+        let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+        let jit_ctx = builder.ins().load(ptr_ty, mem, core_ptr, jit_ctx_off);
+        let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
+        let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+        sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+        let sig_ref = builder.import_signature(sig);
+        let call = builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+        let cmp_status = builder.inst_results(call)[0];
+
+        // Divergence: lockstep_compare (mips_exec.rs) already restored
+        // core.pc/in_delay_slot/delay_slot_target to the divergent
+        // instruction's own starting values from `ls_before`/
+        // `ls_delay_target_before` before returning — nothing left to fix up
+        // here, just propagate the breakpoint status instead of EXEC_COMPLETE.
+        let is_bp = builder.ins().icmp_imm_s(IntCC::Equal, cmp_status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let bp_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(bp_block);
+        builder.set_cold_block(bp_block);
+        builder.seal_block(bp_block);
+        let bp_status = builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        builder.ins().return_(&[bp_status]);
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+    }
+
     let status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[status]);
 }
@@ -1566,6 +2192,12 @@ fn core_offset_of_write64_masked_fn() -> i32 { std::mem::offset_of!(MipsCore, wr
 fn core_offset_of_handle_exception_fn() -> i32 { std::mem::offset_of!(MipsCore, handle_exception_fn) as i32 }
 fn core_offset_of_interp_fallback_fn() -> i32 { std::mem::offset_of!(MipsCore, interp_fallback_fn) as i32 }
 fn core_offset_of_kill_entry_fn() -> i32 { std::mem::offset_of!(MipsCore, kill_entry_fn) as i32 }
+#[cfg(feature = "developer")]
+fn core_offset_of_dev_trace_bp_fn() -> i32 { std::mem::offset_of!(MipsCore, dev_trace_bp_fn) as i32 }
+#[cfg(feature = "jitv2_lockstep")]
+fn core_offset_of_lockstep_step_fn() -> i32 { std::mem::offset_of!(MipsCore, lockstep_step_fn) as i32 }
+#[cfg(feature = "jitv2_lockstep")]
+fn core_offset_of_lockstep_compare_fn() -> i32 { std::mem::offset_of!(MipsCore, lockstep_compare_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_jit_mem_exc() -> i32 { std::mem::offset_of!(MipsCore, jit_mem_exc) as i32 }
 #[cfg(feature = "jitv2")]
@@ -1798,6 +2430,33 @@ fn emit_check_mem_exc(ctx: &mut EmitCtx) {
     // case relative to plain success).
     ctx.builder.set_cold_block(retry_block);
     ctx.builder.seal_block(retry_block);
+    // EXEC_BREAKPOINT (a real memory watchpoint hit, or — under jitv2_lockstep
+    // — a lockstep_jit_read/write divergence) must NOT go through emit_bail:
+    // emit_bail's target (the shared exit_block) unconditionally returns
+    // EXEC_COMPLETE regardless of what status sent it there (see
+    // emit_exit_block_body), so the breakpoint status would be silently
+    // discarded and the run loop would never stop — it would just re-dispatch
+    // this same compiled unit fresh next step() (harmless-looking for a
+    // watchpoint whose condition re-fires, but for a lockstep divergence it
+    // re-runs the same already-diverged instruction with no diagnostic ever
+    // reaching the caller). Hard-return EXEC_BREAKPOINT directly instead, same
+    // as the exception path's terminator — core.pc is already this
+    // instruction's own address (loads/stores never advance it), so the
+    // monitor lands exactly here.
+    let is_breakpoint = ctx.builder.ins().icmp_imm_s(IntCC::Equal, exc, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let breakpoint_block = ctx.builder.create_block();
+    let true_retry_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_breakpoint, breakpoint_block, &[], true_retry_block, &[]);
+
+    ctx.builder.switch_to_block(breakpoint_block);
+    ctx.builder.set_cold_block(breakpoint_block);
+    ctx.builder.seal_block(breakpoint_block);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    ctx.builder.ins().return_(&[bp_status]);
+
+    ctx.builder.switch_to_block(true_retry_block);
+    ctx.builder.set_cold_block(true_retry_block);
+    ctx.builder.seal_block(true_retry_block);
     emit_bail(ctx, ctx.exit_block, ctx.word);
 
     ctx.builder.switch_to_block(continue_block);
@@ -2307,11 +2966,13 @@ fn emit_exception_entry_word_block_body(
 /// emitting a given call site — see `BlockSkeleton`'s doc comment for why
 /// this avoids the runtime check a single fully-shared block would need).
 fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
-    if ctx.word == ctx.entry_word {
-        // entry_word is always this region's own head — never itself
-        // inlined as some other instruction's delay slot within the same
-        // region — so ctx.bd is always false here; exception_entry_word_block
-        // correctly never looks at it (see its own doc comment).
+    if ctx.trust_live_pc_bd_on_exc {
+        // entry_word (state set by the interpreter dispatch that reached it)
+        // or a branch-fallback successor (state set by the BC1 fallback's
+        // interpreter run) — `core.pc`/`core.in_delay_slot` are already
+        // correct and must NOT be overwritten from the compile-time word/bd
+        // (which would clobber a slot's BD=true), so route through
+        // exception_entry_word_block, which trusts the live values.
         ctx.builder.ins().jump(ctx.exception_entry_word_block, &[
             ir::BlockArg::Value(ctx.core_ptr),
             ir::BlockArg::Value(status),
@@ -2382,7 +3043,7 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
     // core.pc save/restore around the same call.
     ctx.raw = slot_raw;
     ctx.word = slot_word;
-    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode, target_addr);
     ctx.raw = raw;
     ctx.word = word;
     if slot_terminated {
@@ -2855,10 +3516,19 @@ fn emit_branch_or_jump(
     // the slot's — restored after each use, mirroring emit_slot_semantics'
     // own core.pc save/restore around the same call. Never called at all
     // when `foreign_page_slot` — every call site below checks that first.
-    let emit_slot = |ctx: &mut EmitCtx| -> bool {
+    // `target`: this branch's real delay_slot_target for jitv2_lockstep's
+    // benefit (see emit_slot_semantics' doc comment) — the branch's actual
+    // destination for Always/taken, or the taken-vs-fallthrough `select` for
+    // a non-annulling conditional (§6.1.4: its slot runs exactly once,
+    // unconditionally, *before* the condition's taken/not-taken split is
+    // even materialized as separate blocks, so this must already reflect
+    // both outcomes as one runtime value — real hardware's `branch_delay`
+    // likewise arms the slot's target before the branch's own commit,
+    // using whichever destination the condition resolved to).
+    let emit_slot = |ctx: &mut EmitCtx, target: Value| -> bool {
         ctx.raw = slot_raw;
         ctx.word = slot_word;
-        let terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+        let terminated = emit_slot_semantics(ctx, instrs, fr_mode, target);
         ctx.raw = raw;
         ctx.word = word;
         terminated
@@ -2876,8 +3546,11 @@ fn emit_branch_or_jump(
             // `finish_visit_foreign_page_slot`) arms the pending transfer
             // instead, exactly like `emit_jump_taken_edge`'s `ForeignPageSlot`
             // arm.
-            if !foreign_page_slot && emit_slot(ctx) {
-                return;
+            if !foreign_page_slot {
+                let target_addr = emit_jump_target_addr(ctx, word, raw);
+                if emit_slot(ctx, target_addr) {
+                    return;
+                }
             }
             emit_jump_taken_edge(ctx, exit_block, block_for_word, instrs[word as usize].taken_exit, word, raw);
         }
@@ -2888,8 +3561,13 @@ fn emit_branch_or_jump(
             // (already computed, but never consumed) never matters — the
             // nested transfer already won. Skipped entirely when
             // `foreign_page_slot` (no slot to inline).
-            if !foreign_page_slot && emit_slot(ctx) {
-                return;
+            if !foreign_page_slot {
+                let taken_addr = emit_branch_target_addr(ctx, word, raw);
+                let fallthrough_addr = emit_word_addr(ctx, word + 2);
+                let target = ctx.builder.ins().select(cond_val, taken_addr, fallthrough_addr);
+                if emit_slot(ctx, target) {
+                    return;
+                }
             }
 
             let taken_block = ctx.builder.create_block();
@@ -2937,7 +3615,16 @@ fn emit_branch_or_jump(
             // If the slot is a nested branch/regjump, it already exited
             // (own final core.pc) — this branch's own taken target never
             // takes effect, same nested-supersedes-outer rule as above.
-            if foreign_page_slot || !emit_slot(ctx) {
+            // Likely's slot only ever runs here, on the taken arm, so its
+            // target is unconditionally the real branch destination (no
+            // select needed, unlike the non-annulling arm above).
+            let slot_terminated = if foreign_page_slot {
+                false
+            } else {
+                let taken_addr = emit_branch_target_addr(ctx, word, raw);
+                emit_slot(ctx, taken_addr)
+            };
+            if foreign_page_slot || !slot_terminated {
                 emit_branch_taken_edge(ctx, exit_block, block_for_word, instrs[word as usize].taken_exit, word, raw);
             }
 
@@ -3128,7 +3815,7 @@ fn emit_target_edge(
 /// emit its own condition-test/exit-wiring after this call would trigger
 /// whenever the slot itself branches, since nothing in this module used to
 /// need a slot to ever end the block early.
-fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], fr_mode: FrMode) -> bool {
+fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], fr_mode: FrMode, delay_slot_target: Value) -> bool {
     let slot_raw = ctx.raw;
     let slot_word = ctx.word;
     // From here until this function returns, ctx.word/raw are the slot's
@@ -3142,6 +3829,27 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     let one = ctx.builder.ins().iconst(ir::types::I8, 1);
     ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    // jitv2_lockstep only: arm core.delay_slot_target with the branch's real
+    // destination (already resolved by the caller — a register read for
+    // RegJump, the branch-target/fallthrough Value for a conditional/J/JAL)
+    // so the interpreter reference lockstep_step runs for this slot below
+    // sees the same value handle_exec_complete would use on a real dispatch.
+    // Without this, delay_slot_target is whatever was last written (often 0
+    // in a synthetic/first-dispatch test), and handle_exec_complete's
+    // `core.pc = core.delay_slot_target` on the slot's own retire produces a
+    // bogus reference pc — not a real JIT/interpreter divergence, just an
+    // uninitialized comparison target. Not needed outside lockstep: the
+    // non-lockstep JIT path never reads delay_slot_target for an inlined
+    // slot at all (the outer branch/regjump writes its own final core.pc
+    // directly via emit_absolute_pc_exit/emit_runtime_pc_exit, independent
+    // of this field).
+    #[cfg(feature = "jitv2_lockstep")]
+    {
+        let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
+        ctx.builder.ins().store(mem, delay_slot_target, ctx.core_ptr, target_off);
+    }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    let _ = delay_slot_target;
     // Save the region's real entry pc before overwriting it — every later
     // exit in this same compiled unit (emit_exit_block_body's `vbase = pc &
     // !(PAGE_SIZE-1)`, emit_bail's retry word, an outer branch/jump's own
@@ -3170,6 +3878,16 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // `emit_slot_semantics` call and its own increment).
     emit_increment_cycles(ctx);
 
+    // Developer per-instruction hook (dt traceback + PC breakpoints), same
+    // as the head-instruction loop's own emit_dev_trace_bp call — without
+    // this a delay slot (including a nested branch-in-slot, handled by the
+    // recursive calls below) is invisible to `dt` tagging entirely and can't
+    // hit a PC breakpoint, even though it's real, independently addressed
+    // architectural state (§6.1.4). ctx.word/raw/bd are already the slot's
+    // own (set above), matching what the hook needs to record.
+    #[cfg(feature = "developer")]
+    emit_dev_trace_bp(ctx, dev_trace_origin::JIT_DELAY_SLOT);
+
     if let Some(branch) = lookup_branch_or_jump(slot_raw) {
         emit_nested_branch_slot(ctx, instrs, slot_word, slot_raw, branch, fr_mode);
         return true; // every arm is a terminator; the restore below is unreachable from here
@@ -3179,12 +3897,79 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         return true; // emit_runtime_pc_exit is a terminator
     }
 
+    // jitv2_lockstep: bracket the slot's own instruction like any other
+    // ALU/load-store/FPU dispatch — this was the missing piece that let a
+    // slot's real memory access (e.g. a store using a stale/wrong address)
+    // through unverified: emit_mem_read/write's lockstep hooks compare
+    // unconditionally against whatever core.lockstep_mem currently holds,
+    // with no check that *this* instruction was ever step-bracketed, so an
+    // unbracketed slot compared against a stale leftover capture from
+    // whatever head instruction last ran lockstep_step — sometimes matching
+    // by coincidence, sometimes not, but never a real per-instruction check.
+    // `trust_live=true`: core.pc/in_delay_slot were just set to this slot's
+    // own address/true above (lines 3634/3652), exactly the state
+    // lockstep_step's LOCKSTEP_BD_LIVE contract expects (same as an entry
+    // word or branch-fallback successor). Not emitted for a nested
+    // branch/jump/regjump slot (returned above already) — those still need
+    // the two-dispatch model reconciliation this doesn't solve.
+    #[cfg(feature = "jitv2_lockstep")]
+    emit_lockstep_step(ctx, true);
+
     if let Some(emit) = lookup_semantics(slot_raw) {
         emit(ctx);
     } else {
         let emit = lookup_cp1_semantics(slot_raw)
             .expect("slot instruction must have a semantics emitter (checked in compile_region)");
         emit(ctx, fr_mode);
+    }
+
+    // Compare before the pc/bd restore below overwrites the fields the
+    // interpreter reference's snapshot needs to match against. Unlike a
+    // plain straight-line head (emit_lockstep_compare_seq's slot_word+1),
+    // this instruction retires FROM in_delay_slot=true: handle_exec_complete
+    // sends the interpreter's real pc to core.delay_slot_target, not
+    // slot_word+1 — so the expected post-state is `delay_slot_target` (the
+    // same value stored into core.delay_slot_target above) with
+    // in_delay_slot=false. Materialize that right before it gets overwritten
+    // anyway by the real restore-for-the-outer-branch below.
+    #[cfg(feature = "jitv2_lockstep")]
+    {
+        ctx.builder.ins().store(mem, delay_slot_target, ctx.core_ptr, pc_off);
+        let zero8 = ctx.builder.ins().iconst(ir::types::I8, 0);
+        ctx.builder.ins().store(mem, zero8, ctx.core_ptr, flag_off);
+
+        let ptr_ty = ctx.module.target_config().pointer_type();
+        let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+        let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+        let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
+        let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+        let mut sig = ctx.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ir::types::I32));
+        let sig_ref = ctx.builder.import_signature(sig);
+        let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+        let status = ctx.builder.inst_results(call)[0];
+
+        let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let bp_block = ctx.builder.create_block();
+        let continue_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
+
+        ctx.builder.switch_to_block(bp_block);
+        ctx.builder.set_cold_block(bp_block);
+        ctx.builder.seal_block(bp_block);
+        // pc already points at the slot's own next-instruction address on
+        // divergence's "left off here" semantics — same convention as
+        // emit_lockstep_compare_seq, back the pc up to the slot's own
+        // address so the monitor stops at the instruction that diverged,
+        // not the one after it.
+        let slot_addr_again = emit_word_addr(ctx, slot_word);
+        ctx.builder.ins().store(mem, slot_addr_again, ctx.core_ptr, pc_off);
+        let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        ctx.builder.ins().return_(&[bp_status]);
+
+        ctx.builder.switch_to_block(continue_block);
+        ctx.builder.seal_block(continue_block);
     }
 
     let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
@@ -3227,11 +4012,12 @@ fn emit_nested_branch_slot(
 
     // Recurse into the inner slot's own emission with ctx.raw/ctx.word
     // switched to its — restored after, same pattern as emit_branch_or_jump's
-    // own emit_slot closure.
-    let emit_inner_slot = |ctx: &mut EmitCtx| -> bool {
+    // own emit_slot closure. `target`: see that closure's doc comment —
+    // this nested branch's real delay_slot_target for jitv2_lockstep.
+    let emit_inner_slot = |ctx: &mut EmitCtx, target: Value| -> bool {
         ctx.raw = inner_slot_raw;
         ctx.word = inner_slot_word;
-        let terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+        let terminated = emit_slot_semantics(ctx, instrs, fr_mode, target);
         ctx.raw = raw;
         ctx.word = word;
         terminated
@@ -3242,15 +4028,18 @@ fn emit_nested_branch_slot(
             // A still-deeper nested branch/regjump in this slot already
             // exited with its own final core.pc — same nested-supersedes-
             // outer rule as emit_branch_or_jump's Always arm.
-            if emit_inner_slot(ctx) {
+            let target_addr = emit_jump_target_addr(ctx, word, raw);
+            if emit_inner_slot(ctx, target_addr) {
                 return;
             }
-            let target_addr = emit_jump_target_addr(ctx, word, raw);
             emit_absolute_pc_exit(ctx, target_addr);
         }
         _ if !branch.annul => {
             let cond_val = emit_cond(ctx, raw, branch.cond);
-            if emit_inner_slot(ctx) {
+            let taken_addr = emit_branch_target_addr(ctx, word, raw);
+            let fallthrough_addr = emit_word_addr(ctx, word + 2);
+            let target = ctx.builder.ins().select(cond_val, taken_addr, fallthrough_addr);
+            if emit_inner_slot(ctx, target) {
                 return;
             }
 
@@ -3260,12 +4049,10 @@ fn emit_nested_branch_slot(
 
             ctx.builder.switch_to_block(taken_block);
             ctx.builder.seal_block(taken_block);
-            let target_addr = emit_branch_target_addr(ctx, word, raw);
-            emit_absolute_pc_exit(ctx, target_addr);
+            emit_absolute_pc_exit(ctx, taken_addr);
 
             ctx.builder.switch_to_block(not_taken_block);
             ctx.builder.seal_block(not_taken_block);
-            let fallthrough_addr = emit_word_addr(ctx, word + 2);
             emit_absolute_pc_exit(ctx, fallthrough_addr);
         }
         _ => {
@@ -3279,8 +4066,8 @@ fn emit_nested_branch_slot(
 
             ctx.builder.switch_to_block(taken_block);
             ctx.builder.seal_block(taken_block);
-            if !emit_inner_slot(ctx) {
-                let target_addr = emit_branch_target_addr(ctx, word, raw);
+            let target_addr = emit_branch_target_addr(ctx, word, raw);
+            if !emit_inner_slot(ctx, target_addr) {
                 emit_absolute_pc_exit(ctx, target_addr);
             }
 
@@ -3315,7 +4102,7 @@ fn emit_nested_regjump_slot(
     let inner_slot_raw = instrs[inner_slot_word as usize].raw;
     ctx.raw = inner_slot_raw;
     ctx.word = inner_slot_word;
-    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode);
+    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode, target_addr);
     ctx.raw = raw;
     ctx.word = word;
     if slot_terminated {
@@ -5522,7 +6309,7 @@ mod tests {
             let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
 
             {
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -5532,7 +6319,7 @@ mod tests {
             builder.seal_block(entry_block);
 
             builder.switch_to_block(exit_block);
-            emit_exit_block_body(&mut builder, exit_core_ptr, exit_word_offset);
+            emit_exit_block_body(&mut builder, &mut codegen.module, exit_core_ptr, exit_word_offset);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);

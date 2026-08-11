@@ -367,10 +367,102 @@ const SOFT_RESET_BIT: u64 = 1u64 << 63;
 
 const TRACEBACK_SIZE: usize = 1048576; // 1M entries
 
+/// How a traceback entry's instruction was dispatched — finer-grained than a
+/// plain jit/interp bool so `dt` can show exactly which arrival path ran,
+/// not just "JIT or not": a divergence often depends on *which* of these an
+/// instruction is (an entry word reached as a back-edge has different live
+/// state than one reached externally; a fallback successor is architecturally
+/// a delay slot even though its own raw bits don't look like one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum InstrOrigin {
+    /// Dispatched by the interpreter's own `step()` — includes every entry
+    /// word's *external* arrival (step() records it before ever handing off
+    /// to JIT-compiled code, so the JIT never double-records it).
+    #[default]
+    Interp,
+    /// A plain (non-entry, non-slot) instruction inside a compiled region —
+    /// the common case, recorded by `emit_dev_trace_bp` in the pass-2 head
+    /// loop.
+    Jit,
+    /// A compiled region's entry word, reached via `exec_decoded`'s own
+    /// external JIT-hit dispatch (jumping straight into `jit_fn` for the
+    /// first time this exact PC was reached this way) — recorded by
+    /// `exec_decoded` itself, not the dev hook (which is internal-edge-only,
+    /// see `emit_dev_trace_bp`'s doc comment). Distinct from a plain `Jit`
+    /// interior instruction: this IS the entry, with its own foreign-slot/
+    /// exception handling, architecturally the JIT counterpart to what
+    /// `Interp` meant before this variant existed (a real external dispatch
+    /// landing on this exact word) — just resolved into a compiled function
+    /// instead of the interpreter.
+    JitEntry,
+    /// The region's entry word, but reached via an *internal* in-region edge
+    /// (a backward branch looping to the top of the same compiled function)
+    /// rather than step()'s external dispatch — still JIT-executed, still
+    /// worth distinguishing from a plain interior instruction since entry
+    /// words get special foreign-slot/exception handling.
+    JitEntryBackEdge,
+    /// A delay slot's own instruction, inlined into its branch/jump/regjump's
+    /// compiled unit (`emit_slot_semantics`) — architecturally a distinct
+    /// instruction from its branch, with its own address and (for lockstep)
+    /// its own verification.
+    JitDelaySlot,
+    /// An interpreter-fallback head (`Classify::Excluded`, kept in-region) —
+    /// runs through `interp_dispatch_one`, not native codegen, but still
+    /// inside a compiled region's dispatch, distinct from a plain step().
+    FallbackWord,
+    /// The word immediately after a fallback that is itself a branch (BC1) —
+    /// architecturally a delay slot (`is_branch_fallback_successor`), reached
+    /// externally the first time (from the fallback's own interpreter run).
+    FallbackSuccessor,
+    /// A fallback successor reached via an internal in-region back-edge,
+    /// same distinction as `JitEntryBackEdge` but for a fallback successor
+    /// word instead of the region's own entry word.
+    FallbackSuccessorBackEdge,
+}
+
+impl InstrOrigin {
+    fn tag(self) -> &'static str {
+        match self {
+            InstrOrigin::Interp => "",
+            InstrOrigin::Jit => " [jit]",
+            InstrOrigin::JitEntry => " [jit:entry]",
+            InstrOrigin::JitEntryBackEdge => " [jit:entry-backedge]",
+            InstrOrigin::JitDelaySlot => " [jit:slot]",
+            InstrOrigin::FallbackWord => " [fallback]",
+            InstrOrigin::FallbackSuccessor => " [fallback:successor]",
+            InstrOrigin::FallbackSuccessorBackEdge => " [fallback:successor-backedge]",
+        }
+    }
+
+    /// Decode the `origin` code `emit_dev_trace_bp`'s codegen call sites pass
+    /// (a compile-time constant baked in per call site — see
+    /// `codegen::core_offset_of_dev_trace_bp_fn`'s callers). `u32`,
+    /// deliberately not `u8` — see `MipsCore::dev_trace_bp_fn`'s doc comment.
+    /// Any value outside the known set (shouldn't happen — every call site
+    /// uses one of `dev_trace_origin`'s constants) falls back to `Jit` rather
+    /// than panicking, since this runs inside an `extern "C"` hook where
+    /// unwinding aborts the process.
+    #[cfg(all(feature = "jitv2", feature = "developer"))]
+    fn from_u32(v: u32) -> Self {
+        match v {
+            0 => InstrOrigin::Interp,
+            1 => InstrOrigin::Jit,
+            2 => InstrOrigin::JitEntryBackEdge,
+            3 => InstrOrigin::JitDelaySlot,
+            4 => InstrOrigin::FallbackWord,
+            5 => InstrOrigin::FallbackSuccessor,
+            6 => InstrOrigin::FallbackSuccessorBackEdge,
+            _ => InstrOrigin::Jit,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TracebackEntry {
     pc: u64,
     instr: u32,
+    origin: InstrOrigin,
 }
 
 struct TracebackBuffer {
@@ -388,8 +480,8 @@ impl TracebackBuffer {
         }
     }
 
-    fn push(&mut self, pc: u64, instr: u32) {
-        self.entries[self.head] = TracebackEntry { pc, instr };
+    fn push(&mut self, pc: u64, instr: u32, origin: InstrOrigin) {
+        self.entries[self.head] = TracebackEntry { pc, instr, origin };
         self.head = (self.head + 1) % TRACEBACK_SIZE;
         if self.count < TRACEBACK_SIZE {
             self.count += 1;
@@ -619,6 +711,25 @@ pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry 
 pub const EXEC_FALLBACK:           ExecStatus = 0x0000_0200; // jitv2+lightning's decode-skip fast path missed; caller must decode and dispatch normally
 pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
 
+/// `jitv2_lockstep`: sentinel `bd` value passed to `lockstep_step_fn` meaning
+/// "trust the live `core.pc`/`core.in_delay_slot`/`delay_slot_target` — do NOT
+/// overwrite them from the compile-time constants." Codegen passes it for an
+/// entry word or a delay slot (branch-fallback successor), whose state is
+/// inherited from the arrival and must be preserved. `0xFF` is safely outside
+/// the real bd range (0/1). `u32`, not `u8` — see `MipsCore::lockstep_step_fn`'s
+/// doc comment.
+#[cfg(feature = "jitv2_lockstep")]
+pub const LOCKSTEP_BD_LIVE: u32 = 0xFF;
+
+/// `jitv2_lockstep`: count of instructions actually lockstep-compared (a real
+/// JIT-vs-interpreter comparison ran, not a skipped class). Surfaced by
+/// `j2 stats` as positive proof lockstep is live — a stuck-at-0 here means the
+/// JIT never ran (e.g. the async queue stole the codegen so nothing compiled),
+/// i.e. verification is silently OFF. Process-global atomic to keep it off the
+/// per-instruction locking path.
+#[cfg(feature = "jitv2_lockstep")]
+pub static LOCKSTEP_VERIFICATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // Exception flags
 pub const EXEC_IS_EXCEPTION:       ExecStatus = 1 << 27; // 0x0800_0000
 pub const EXEC_IS_TLB_REFILL:      ExecStatus = 1 << 28; // 0x1000_0000
@@ -829,47 +940,28 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     /// lazily rather than cached across a flush.
     #[cfg(feature = "jitv2")]
     pub(crate) pcp: *mut crate::jitv2::PhysicalCodePage,
-    /// Scratch analyzer/codegen for `jitv2_lockstep`'s per-instruction
-    /// inline-compile-and-compare (see `exec_decoded`'s lockstep check).
-    /// Kept alive across calls purely to reuse the Cranelift `JITModule`
-    /// (each fresh one allocates executable memory) — otherwise fully
-    /// throwaway state, never touched by the real jitv2 dispatch path.
+    /// Inline per-instruction lockstep scratch (`jit_lockstep_step`/
+    /// `jit_lockstep_compare`): `ls_before` is the pre-instruction state saved
+    /// so it can be restored after the interpreter's reference run, before the
+    /// JIT runs the same instruction; `ls_expected` is the interpreter's
+    /// resulting state, held for `jit_lockstep_compare` to check the JIT
+    /// against. `ls_delay_target_before`/`ls_delay_target_expected` preserve
+    /// `delay_slot_target` across the restore and for the compare respectively
+    /// (it's not in `LockstepSnapshot`'s comparable fields but must round-trip
+    /// alongside `pc`/`in_delay_slot` — the three are always read/restored
+    /// together, never individually: `lockstep_compare`'s divergence path uses
+    /// `ls_before`'s `pc`/`in_delay_slot` plus `ls_delay_target_before` as one
+    /// unit to put `core` back at the instruction that actually diverged).
+    /// All only live between one instruction's step and compare callbacks;
+    /// boxed `Option` so the not-yet-stepped state is unambiguous.
     #[cfg(feature = "jitv2_lockstep")]
-    pub(crate) lockstep_analyzer: crate::jitv2::analyzer::Analyzer,
+    pub(crate) ls_before: Option<LockstepSnapshot>,
     #[cfg(feature = "jitv2_lockstep")]
-    pub(crate) lockstep_codegen: crate::jitv2::codegen::Codegen,
-    /// Local compiled-fn cache for `lockstep_check`, keyed on (head
-    /// instruction raw word, delay-slot raw word, entry word offset, FR1
-    /// mode) — skips recompiling the same (head, slot) pair twice without
-    /// ever publishing into the real `page`/`entries` table (see
-    /// `lockstep_check`'s doc comment on why: publishing there would hand
-    /// this word off to the real dispatch gate permanently, so it would only
-    /// ever be verified once). `lockstep_check_alu` has no delay slot
-    /// dependency and always keys the second field `0`; `lockstep_check_branch`
-    /// must include its actual delay-slot raw word — two occurrences of the
-    /// same branch encoding at the same page offset (entirely plausible:
-    /// physical code pages get reused, and a common branch encoding like
-    /// `BNE $5,$0,+7` recurs) can carry completely different delay-slot
-    /// instructions, and without the slot word in the key a second visit
-    /// would silently reuse a function compiled for the first visit's slot
-    /// instruction (see rules/jitv2/ — a real divergence this caused,
-    /// bisected by this exact tool, before the slot word was added here).
+    pub(crate) ls_expected: Option<LockstepSnapshot>,
     #[cfg(feature = "jitv2_lockstep")]
-    pub(crate) lockstep_cache: std::collections::HashMap<(u32, u32, u16, bool), Option<crate::jitv2::JitFn>>,
-    /// Which `LockstepClass`es `lockstep_check` actually verifies — all four
-    /// by default. Monitor console: `j2 lockstep <alu|branch|loadstore|fpu>
-    /// [on|off]`. Exists because ALU/branch/load-store lockstep is expensive
-    /// enough (a Cranelift compile per never-before-seen word, on top of
-    /// running every instruction twice) to make a full IRIX boot run at a
-    /// small fraction of normal speed — useful when bisecting a boot-time
-    /// divergence, but overkill when the actual target is FPU correctness
-    /// specifically, which the OS barely exercises during boot at all.
-    /// Disabling the other three lets a workload that's deliberately
-    /// FPU-heavy (whetstone, an FPU torture test) run close to full speed
-    /// while still getting full FPU verification on every CP1 dispatch it
-    /// does make.
+    pub(crate) ls_delay_target_before: u64,
     #[cfg(feature = "jitv2_lockstep")]
-    pub(crate) lockstep_enabled: LockstepEnabled,
+    pub(crate) ls_delay_target_expected: u64,
     /// Runtime switch (not a Cargo feature) for how `exec_decoded`'s real
     /// jitv2 dispatch gate gets a fresh artifact on a miss: `false` hands a
     /// `CompileRequest` to the async `compile_queue` worker thread; `true`
@@ -1171,13 +1263,55 @@ unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: MipsCache>(ctx: *mut core::f
 /// semantics) — `jitv2_track_pcp` only re-derives `self.pcp` on a Fetch
 /// nanotlb miss, which a same-page guard check can't trigger.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_kill_entry<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, offset: u16) {
+unsafe extern "C" fn jit_kill_entry<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, offset: u32) {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     assert!(!exec.pcp.is_null(), "jit_kill_entry reached with no tracked PhysicalCodePage");
     let page = unsafe { &*exec.pcp };
     page.kill(offset as usize);
     #[cfg(feature = "developer")]
     exec.jitv2.lock().stats.kill_entry_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Developer per-instruction hook for compiled code (`core.dev_trace_bp_fn`,
+/// installed only under `developer`). Called from every instruction's block
+/// with the synthesized `pc`/`raw`/`bd`, right where the interrupt preamble
+/// runs (`codegen::emit_dev_trace_bp`) — so a compiled region's instructions
+/// show up in `dt` (tagged JIT-executed) and can hit PC breakpoints, exactly
+/// like the interpreter's own `step()`. Records the traceback entry and the
+/// trace-file record, then checks PC breakpoints against `pc`; returns
+/// `EXEC_BREAKPOINT` on a hit (compiled code bails to its exit with that
+/// status, `core.pc` left at `pc` for resume) or `EXEC_COMPLETE` otherwise.
+/// `bd` is `core.in_delay_slot` for this instruction — accepted for parity
+/// with the interpreter's record shape and future use; the traceback itself
+/// keys on pc/raw. Not emitted for the entry word's external-dispatch arm:
+/// `step()` already recorded that PC before dispatching into the JIT (only the
+/// preamble-bearing internal-edge block calls this — see
+/// `compile_region`'s placement).
+/// Proof-of-call counter for `jit_dev_trace_bp` — incremented unconditionally
+/// at hook entry (before the `lightning`-gated push), so `j2 stats` can show
+/// whether the hook is even being reached, independent of whether `dt`'s
+/// traceback ends up populated. Diagnostic only.
+#[cfg(all(feature = "jitv2", feature = "developer"))]
+pub static DEV_TRACE_BP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(feature = "jitv2", feature = "developer"))]
+unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, origin: u32) -> u32 {
+    DEV_TRACE_BP_CALLS.fetch_add(1, Ordering::Relaxed);
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    #[cfg(not(feature = "lightning"))]
+    {
+        exec.traceback.push(pc, raw, InstrOrigin::from_u32(origin));
+        if let Some(w) = exec.trace_writer.as_mut() {
+            let record = crate::trace::TraceRecord::capture(pc, raw, &exec.core);
+            let _ = w.push(&record);
+        }
+        // PC breakpoint, honoring the one-shot skip_breakpoints the monitor
+        // sets to resume past a hit (same as step()'s own pre-dispatch check).
+        if exec.bp_enabled() && exec.check_breakpoint::<{ BpType::Pc as u8 }>(pc) {
+            return EXEC_BREAKPOINT;
+        }
+    }
+    EXEC_COMPLETE
 }
 
 /// FPU status hooks: not generic over `<T,C>` (no executor context needed —
@@ -1195,6 +1329,32 @@ unsafe extern "C" fn jit_fpu_clear_status(_ctx: *mut core::ffi::c_void) {
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) {
     crate::platform::set_fpu_mode(rm as u8)
+}
+
+/// Inline lockstep step hook (`core.lockstep_step_fn`), called by compiled code
+/// at the START of every JIT instruction with its synthesized `pc`/`raw`/`bd`.
+/// Establishes the true per-instruction starting state, runs the instruction
+/// once through the real interpreter to get the reference result, then restores
+/// the starting state so the JIT can run the same instruction for real. See
+/// `MipsCore::lockstep_step_fn`. No-op (returns without comparing) for a
+/// `LockstepClass` that can't be compared per-dispatch (Branch/Other).
+#[cfg(feature = "jitv2_lockstep")]
+unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, bd: u32) {
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    exec.lockstep_step(pc, raw, bd);
+}
+
+/// Inline lockstep compare hook (`core.lockstep_compare_fn`), called by compiled
+/// code at the END of every JIT instruction. Compares the JIT's now-current
+/// state against the interpreter reference `lockstep_step` stashed. On a
+/// divergence it prints a full report and returns `EXEC_BREAKPOINT` so compiled
+/// code bails to the monitor (rather than aborting the process via a panic).
+/// Returns `EXEC_COMPLETE` when equal or when there was nothing to compare
+/// (disabled class / non-retiring reference).
+#[cfg(feature = "jitv2_lockstep")]
+unsafe extern "C" fn jit_lockstep_compare<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void) -> u32 {
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    if exec.lockstep_compare() { EXEC_BREAKPOINT } else { EXEC_COMPLETE }
 }
 
 /// MIPS FCSR.RM encoding, shared by the portable rounding primitive below
@@ -1522,13 +1682,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             pcp: std::ptr::null_mut(),
             #[cfg(feature = "jitv2_lockstep")]
-            lockstep_analyzer: crate::jitv2::analyzer::Analyzer::new(),
+            ls_before: None,
             #[cfg(feature = "jitv2_lockstep")]
-            lockstep_codegen: crate::jitv2::codegen::Codegen::new(),
+            ls_expected: None,
             #[cfg(feature = "jitv2_lockstep")]
-            lockstep_cache: std::collections::HashMap::new(),
+            ls_delay_target_before: 0,
             #[cfg(feature = "jitv2_lockstep")]
-            lockstep_enabled: LockstepEnabled::default(),
+            ls_delay_target_expected: 0,
             // Threaded compile is now the default — see Machine::new's
             // compile_queue.start() call, which must run whenever this is
             // `false` (an un-started queue would silently drop every
@@ -1618,9 +1778,16 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.handle_exception_fn = jit_handle_exception::<T, C>;
         self.core.interp_fallback_fn = jit_interp_fallback::<T, C>;
         self.core.kill_entry_fn = jit_kill_entry::<T, C>;
+        #[cfg(feature = "developer")]
+        { self.core.dev_trace_bp_fn = jit_dev_trace_bp::<T, C>; }
         self.core.fpu_get_status_fn = jit_fpu_get_status;
         self.core.fpu_clear_status_fn = jit_fpu_clear_status;
         self.core.fpu_set_mode_fn = jit_fpu_set_mode;
+        #[cfg(feature = "jitv2_lockstep")]
+        {
+            self.core.lockstep_step_fn = jit_lockstep_step::<T, C>;
+            self.core.lockstep_compare_fn = jit_lockstep_compare::<T, C>;
+        }
     }
 
     /// Probe the nanotlb for `va` using slot AT (Fetch=0, Read=1, Write=2).
@@ -2074,16 +2241,21 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 }
             }
             let d = unsafe { &*fetch.instr };
-            #[cfg(not(feature = "lightning"))]
-            self.traceback.push(pc, d.raw);
-            #[cfg(feature = "developer")]
-            if let Some(w) = self.trace_writer.as_mut() {
-                let record = crate::trace::TraceRecord::capture(pc, d.raw, &self.core);
-                // Capture is best-effort: a full disk mid-boot shouldn't take
-                // the emulator down. trace_stop's caller sees the real error
-                // when it goes to flush/close instead.
-                let _ = w.push(&record);
-            }
+            // Traceback/trace-file recording moved into exec_decoded's own
+            // dispatch decision (see its doc comment) instead of pushing
+            // here unconditionally: this call doesn't yet know whether pc
+            // is about to jump straight into a compiled function (any
+            // `is_entry_valid` offset, not just a region's own word 0 — a
+            // mid-region word independently published via an earlier
+            // back-edge visit counts too) or actually run through the
+            // interpreter. Pushing Interp here unconditionally, then
+            // separately also recording inside the JIT path, produced a
+            // real live bug: every JIT-hit dispatch got a spurious Interp
+            // entry in `dt` (not just the entry word — `wd93_hpc1init`'s
+            // whole straight-line body showed Interp despite genuinely
+            // running under JIT, confirmed via `lockstep_jit_write` firing
+            // for it — found live). Exactly one push per real dispatch now,
+            // decided by whichever path actually ran.
             self.exec_decoded(d)
         } else if fetch.status & EXEC_IS_EXCEPTION != 0 {
             self.handle_exception(fetch.status)
@@ -2237,6 +2409,27 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 bp.enabled = false;
             }
         }
+    }
+
+    /// Test-only: the last `n` traceback entries as `(pc, raw, jit)` tuples
+    /// (oldest-to-newest), so cross-module tests can assert on the traceback
+    /// (`TracebackEntry`/the `traceback` field are private). `jit` is true for
+    /// any compiled-code origin (`InstrOrigin::Interp`/`FallbackWord` are the
+    /// only two that map to `false` — a fallback still runs the interpreter
+    /// for real, so it's grouped with `Interp` here for this coarse view).
+    #[cfg(test)]
+    pub fn test_traceback_last(&self, n: usize) -> Vec<(u64, u32, bool)> {
+        self.traceback.get_last(n).into_iter()
+            .map(|e| (e.pc, e.instr, !matches!(e.origin, InstrOrigin::Interp | InstrOrigin::FallbackWord)))
+            .collect()
+    }
+
+    /// Same as `test_traceback_last` but with the full origin tag, for tests
+    /// that need to distinguish entry/slot/fallback-successor/back-edge
+    /// arrivals rather than just "was this JIT or not".
+    #[cfg(test)]
+    pub(crate) fn test_traceback_last_origin(&self, n: usize) -> Vec<(u64, u32, InstrOrigin)> {
+        self.traceback.get_last(n).into_iter().map(|e| (e.pc, e.instr, e.origin)).collect()
     }
 
     pub fn add_breakpoint(&mut self, id: usize, addr: u64, kind: BpType) {
@@ -3845,7 +4038,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let imm_val = d.immi64() as u32;            // sign-extended at decode, truncate to 32
         let rt_reg = d.rt as u32;
         // Wrapping add, then sign-extend to 64 bits
-        self.core.write_gpr(rt_reg, rs_val.wrapping_add(imm_val) as i32 as i64 as u64);
+        let result = rs_val.wrapping_add(imm_val) as i32 as i64 as u64;
+        self.core.write_gpr(rt_reg, result);
         self.handle_exec_complete()
     }
 
@@ -5987,13 +6181,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // the same way it already closes the same-page one, and entry
         // acceptance no longer needs to statically refuse word 0 to stay
         // correct.
-        // jitv2_lockstep takes over this whole gate (see lockstep_check
-        // below): it must never publish into page/entries or talk to the
-        // real compile queue, or the real gate here would start
-        // intercepting words lockstep already verified and running them
-        // with zero further comparison. So the real gate is compiled out
-        // entirely under jitv2_lockstep, and every dispatch goes through
-        // lockstep_check instead.
+        // jitv2_lockstep now uses this SAME real dispatch gate (redesigned from
+        // the old standalone-recompile lockstep_check): it forces inline
+        // compile (below) so every region compiles+publishes+runs
+        // synchronously on this thread, and codegen brackets every instruction
+        // with lockstep_step/lockstep_compare callbacks that run the
+        // interpreter reference and compare in-region (see
+        // MipsExecutor::lockstep_step). So the gate is NOT compiled out under
+        // lockstep anymore — publishing/running compiled regions is exactly
+        // what drives the per-instruction verification.
         //
         // `self.jitv2_inline_compile` (runtime, not a Cargo feature) selects
         // between the two ways a miss gets a fresh artifact: `false` (the
@@ -6018,7 +6214,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // the field can never actually be false here under `lightning`
         // anyway; this just lets the compiler know that statically instead
         // of leaving a dead runtime check on the hot path.
-        #[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
+        // Under lockstep the gate is on by default (it drives the inline
+        // per-instruction verification — `jitv2_dispatch_enabled` defaults
+        // true), but still honors that runtime switch so a pure-interpreter
+        // test harness (`run_interpreter`, which needs an uninstrumented
+        // reference run) can turn it off. The old design got interpreter-only
+        // for free by compiling the gate out under lockstep; now it's a runtime
+        // switch instead.
+        #[cfg(feature = "jitv2")]
         if cfg!(feature = "lightning") || self.jitv2_dispatch_enabled {
             assert!(!self.pcp.is_null(), "exec_decoded reached with no tracked PhysicalCodePage");
             let page = unsafe { &mut *self.pcp };
@@ -6026,6 +6229,22 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             let trigger = self.core.jit_trigger;
             if trigger || page.is_published(entry_offset) {
                 if page.is_entry_valid(entry_offset) {
+                    // This dispatch is about to jump straight into a
+                    // compiled function at pc — record it here, tagged
+                    // JitEntry (distinct from a plain interior Jit
+                    // instruction), instead of step()'s old unconditional
+                    // Interp push (see step()'s doc comment on why that was
+                    // wrong): this is this compiled unit's own entry,
+                    // reached externally, exactly the arrival
+                    // emit_dev_trace_bp's internal-edge-only contract
+                    // assumes step() already logged.
+                    #[cfg(not(feature = "lightning"))]
+                    self.traceback.push(self.core.pc, d.raw, InstrOrigin::JitEntry);
+                    #[cfg(feature = "developer")]
+                    if let Some(w) = self.trace_writer.as_mut() {
+                        let record = crate::trace::TraceRecord::capture(self.core.pc, d.raw, &self.core);
+                        let _ = w.push(&record);
+                    }
                     let func = page.entries[entry_offset].func;
                     debug_assert!(!func.is_null(), "valid bit set with null func");
                     #[cfg(feature = "developer")]
@@ -6056,7 +6275,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 // actually be true, so let the compiler see that statically
                 // and drop the inline-compile arm entirely instead of
                 // carrying a dead runtime check on the hot path.
-                let inline_compile = !cfg!(feature = "lightning") && self.jitv2_inline_compile;
+                // jitv2_lockstep forces inline compile: the whole verification
+                // model depends on every region compiling+running synchronously
+                // on this thread so the lockstep_step/compare callbacks fire
+                // in-region on the very next instructions, deterministically —
+                // an async worker-thread compile would let the interpreter run
+                // words unverified until the artifact lands.
+                let inline_compile = cfg!(feature = "jitv2_lockstep")
+                    || (!cfg!(feature = "lightning") && self.jitv2_inline_compile);
                 let below_call_threshold = !inline_compile
                     && !page.count_dispatch_and_check_threshold(entry_offset, crate::jitv2::min_calls_before_compile());
                 if !below_call_threshold {
@@ -6108,6 +6334,18 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                     // compile thread share a single instance rather than
                     // each owning a separate Cranelift memory arena.
                     let mut codegen = self.jitv2.lock().codegen.lock().take();
+                    // Under lockstep the whole point is that EVERY region
+                    // compiles+runs here so the lockstep_step/compare callbacks
+                    // fire. A `None` codegen means it's owned by the async
+                    // compile queue (which must never run under lockstep — see
+                    // Machine::new) — inline would silently skip, degrading the
+                    // whole run to unverified interpreter (exactly the false-
+                    // confidence bug that let "clean lockstep boots" verify
+                    // nothing). Fail loud instead of silent.
+                    #[cfg(feature = "jitv2_lockstep")]
+                    assert!(codegen.is_some(),
+                        "jitv2_lockstep: inline compile found no Codegen (async compile queue stole it?) — \
+                         verification would silently be OFF. The queue must not run under lockstep.");
                     let mut ran_out_of_memory = false;
                     if let Some(codegen) = codegen.as_mut() {
                         #[cfg(feature = "developer")]
@@ -6155,6 +6393,19 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                     // the interpreter and waiting for the next dispatch
                     // of this PC to pick it up via is_entry_valid above.
                     if page.is_entry_valid(entry_offset) {
+                        // Same as the other jit_fn call site above: record
+                        // this external entry as JitEntry before jumping in —
+                        // this is the very first dispatch of a page that
+                        // just got compiled+published inline (is_entry_valid
+                        // was false a few lines up, before handle_request
+                        // ran), so it never went through that call site.
+                        #[cfg(not(feature = "lightning"))]
+                        self.traceback.push(self.core.pc, d.raw, InstrOrigin::JitEntry);
+                        #[cfg(feature = "developer")]
+                        if let Some(w) = self.trace_writer.as_mut() {
+                            let record = crate::trace::TraceRecord::capture(self.core.pc, d.raw, &self.core);
+                            let _ = w.push(&record);
+                        }
                         let func = page.entries[entry_offset].func;
                         debug_assert!(!func.is_null(), "valid bit set with null func");
                         #[cfg(feature = "developer")]
@@ -6187,11 +6438,17 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             }
         }
 
-        #[cfg(feature = "jitv2_lockstep")]
-        if let Some(status) = self.lockstep_check(d) {
-            return status;
+        // Real interpreter dispatch: the JIT gate above fell through without
+        // an early return (denylisted page, codegen gap, below the
+        // min-calls threshold, or jitv2 not built) — record it here, tagged
+        // Interp, same shape as the JIT-hit push above but for this path.
+        #[cfg(not(feature = "lightning"))]
+        self.traceback.push(self.core.pc, d.raw, InstrOrigin::Interp);
+        #[cfg(feature = "developer")]
+        if let Some(w) = self.trace_writer.as_mut() {
+            let record = crate::trace::TraceRecord::capture(self.core.pc, d.raw, &self.core);
+            let _ = w.push(&record);
         }
-
         type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
         let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
         f(self, d)
@@ -6207,12 +6464,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// function on the next dispatch and bailing again, forever.
     ///
     /// Deliberately skips `step()`'s own per-instruction preamble (timer/
-    /// interrupt bookkeeping, breakpoint checks): compiled code's own
-    /// preamble (`emit_ip7_preamble`/`emit_pending_interrupt_preamble`/
-    /// `emit_increment_cycles`) already ran the equivalent checks for
-    /// this exact PC immediately before calling into the compiled function
-    /// that's now calling this — running them again here would double-count
-    /// (same reasoning as `compile_region`'s `skip_entry_preamble`).
+    /// interrupt bookkeeping, breakpoint checks, traceback): compiled code's
+    /// own preamble already ran the equivalent for this exact PC immediately
+    /// before calling in (`emit_pending_interrupt_preamble`/
+    /// `emit_increment_cycles`, and — in developer builds — the per-instruction
+    /// dev hook `emit_dev_trace_bp` which records the traceback entry and checks
+    /// breakpoints for *this* fallback word too, so there's nothing to do here;
+    /// same reasoning as `compile_region`'s `skip_entry_preamble`).
     #[cfg(feature = "jitv2")]
     fn interp_dispatch_one(&mut self) -> ExecStatus {
         let pc = self.core.pc;
@@ -6234,79 +6492,272 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // crashed a CU1-guard equivalence test).
         let slot = fetch.instr as *mut DecodedInstr;
         let d = unsafe { &mut *slot };
+        // SCRATCH cache-vs-physical-memory guard: compare what the cache
+        // model just handed back against a direct bus read of the same
+        // physical address (bypassing cache entirely, same primitive
+        // `j2 analyze` uses). Catches a cache line that's HIT + valid but
+        // holds bytes that disagree with real backing memory (found live:
+        // intrfast's entry word, 0x08022ab0, an L2 line reported
+        // DirtyExclusive/HIT with wrong cached content). Remove once the
+        // root cause is found.
+        {
+            let cached_raw = d.raw;
+            let tr = self.debug_translate(pc);
+            if !tr.is_exception() {
+                let phys_read = self.sysad.read32(tr.phys);
+                if phys_read.is_ok() && phys_read.data != cached_raw {
+                    eprintln!(
+                        "\n=== CACHE/MEMORY MISMATCH at pc={:#018x} phys={:#010x}: cache.raw={:#010x} bus.raw={:#010x} ===\n",
+                        pc, tr.phys, cached_raw, phys_read.data
+                    );
+                    self.core.pc = pc;
+                    return EXEC_BREAKPOINT;
+                }
+            }
+        }
         if d.flags != 0 {
             decode_into::<T, C>(d);
         }
+        // Record this fallback's own dispatch — without this, a fallback
+        // word (an Excluded instruction the analyzer keeps in-region, run
+        // through the real interpreter via this function) was completely
+        // invisible in `dt`: emit_dev_trace_bp only ever fires for native-
+        // codegen instructions, never for this path.
+        #[cfg(not(feature = "lightning"))]
+        self.traceback.push(pc, d.raw, InstrOrigin::FallbackWord);
         type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
         let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        f(self, d)
+        let status = f(self, d);
+        // jitv2_lockstep: a fallback runs the interpreter here, whose
+        // read_data/write_data may set core.lockstep_mem. That capture is the
+        // fallback's own committed access — it must NOT survive to be compared
+        // against a *later* memory instruction's JIT access in the same region
+        // (lockstep_jit_read/write would assert a spurious address/value
+        // mismatch). The fallback runs the real interpreter, so there's no
+        // separate JIT re-run to compare anyway; clear it. (Each bracketed
+        // Sequential instruction re-establishes lockstep_mem via its own
+        // lockstep_step before its JIT access.)
+        #[cfg(feature = "jitv2_lockstep")]
+        { self.core.lockstep_mem = None; }
+        status
     }
 
-    /// Reclaim `lockstep_codegen`'s executable memory once `lockstep_cache`
-    /// has grown past a threshold — same idea as the real engine's
-    /// `mega_flush` + `CompileQueue::stop()`/`start()` (see that pair's doc
-    /// comments), adapted for `Codegen::reset` (see its own doc comment for
-    /// why a plain `Codegen::new()` replacement wouldn't actually free
-    /// anything: Cranelift's `Memory` deliberately leaks on `Drop` to avoid
-    /// dangling `JitFn` pointers, so reclaiming requires the explicit
-    /// `unsafe` `JITModule::free_memory` call `reset` wraps).
-    /// `lockstep_cache` has no natural cap of its own (unlike the real
-    /// engine's fixed physical-page pool, it's keyed on raw instruction
-    /// words across the whole address space touched during a run) — left
-    /// unflushed, a long enough boot compiles one function per
-    /// never-before-seen (word, slot, entry_word, fr1) tuple forever and
-    /// eventually exhausts host memory (observed live: a 64MB Cranelift
-    /// allocation failing partway through an IRIX boot).
+    /// Inline lockstep STEP (`core.lockstep_step_fn`, via `jit_lockstep_step`):
+    /// called at the start of every JIT instruction. Establishes the true
+    /// per-instruction starting state (`core.pc = pc`, `in_delay_slot = bd` —
+    /// the JIT doesn't keep `core.pc` live for straight-line instructions, so
+    /// the callback carries it), snapshots that state, runs the instruction
+    /// once through the real interpreter to produce the reference result
+    /// (`ls_expected`), then restores the starting state (keeping
+    /// `core.lockstep_mem`, the record of any memory access the interpreter
+    /// just committed, so the JIT's own re-run compares against it via
+    /// `lockstep_jit_read`/`lockstep_jit_write` instead of double-accessing).
+    /// The matching `lockstep_compare` a moment later checks the JIT's result
+    /// against `ls_expected`.
     ///
-    /// # Safety of the `reset()` call
-    /// Every compiled `JitFn` `lockstep_codegen` has ever returned is
-    /// reachable *only* through `lockstep_cache` (never published into the
-    /// real `page`/`entries` table — see `lockstep_check_alu`'s doc comment
-    /// on why) — clearing the cache in the same operation, before any other
-    /// code can observe the stale pointers, is what makes `reset`'s
-    /// safety contract hold here.
+    /// If this instruction's `LockstepClass` can't be compared per-dispatch
+    /// (Branch/Other — see the classify call below),
+    /// or the interpreter's reference run didn't cleanly complete (retry/
+    /// breakpoint/exception with nothing to compare — mirrors the old
+    /// load-store check's skip), leaves `ls_expected = None` so `lockstep_compare`
+    /// is a no-op and the JIT just runs normally.
     #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_flush_if_grown(&mut self) {
-        const LOCKSTEP_CACHE_FLUSH_THRESHOLD: usize = 4096;
-        if self.lockstep_cache.len() < LOCKSTEP_CACHE_FLUSH_THRESHOLD {
+    fn lockstep_step(&mut self, pc: u64, raw: u32, bd: u32) {
+        self.ls_before = None;
+        self.ls_expected = None;
+
+        // Lockstep is always on when built (no runtime toggle): if you compiled
+        // with jitv2_lockstep, every verifiable instruction self-checks — it's
+        // driven from the JIT block itself. `lockstep_classify` is only
+        // consulted to skip the classes that can't be meaningfully compared by
+        // this per-instruction bracket: `Branch` (the JIT inlines the delay
+        // slot into one unit, so "one JIT instruction" != "one interpreter
+        // dispatch" — a whole separate reconciliation, deferred) and `Other`
+        // (opcodefusion producers whose fused dispatch does more than a
+        // standalone re-decode). Codegen only ever brackets straight-line
+        // Sequential/CP1 anyway, so this is belt-and-suspenders.
+        match lockstep_classify(raw) {
+            LockstepClass::Alu | LockstepClass::LoadStore | LockstepClass::Fpu => {}
+            LockstepClass::Branch | LockstepClass::Other => return,
+        }
+
+        // Establish the true starting state for this instruction. For a plain
+        // straight-line head the JIT doesn't keep core.pc live, so codegen's
+        // emit_lockstep_step materialized pc/in_delay_slot from compile-time
+        // constants and passes them here — set them so the interpreter
+        // reference run is anchored. For an entry word or delay slot
+        // (`bd == LOCKSTEP_BD_LIVE`), core.pc/in_delay_slot/delay_slot_target
+        // are already correct from the arrival (the interpreter dispatch or the
+        // BC1 fallback that reached this word) and MUST NOT be overwritten — a
+        // compile-time bd would clobber an inherited in_delay_slot=true and make
+        // the interpreter reference mishandle the pending transfer. Trust the
+        // live values in that case (`pc` is still the instruction's own address,
+        // which already equals live core.pc, so we can set it either way).
+        if bd != LOCKSTEP_BD_LIVE {
+            self.core.pc = pc;
+            self.core.in_delay_slot = bd != 0;
+        }
+        // Start each instruction with no captured memory access: a
+        // non-memory instruction's interpreter reference run leaves lockstep_mem
+        // untouched, so without this a stale Some(..) from an earlier memory
+        // instruction could survive and be compared against the *next* memory
+        // instruction's JIT access (a spurious address/value divergence).
+        self.core.lockstep_mem = None;
+
+        let before = LockstepSnapshot::capture(&self.core);
+        let delay_target_before = self.core.delay_slot_target;
+
+        // Run this exact instruction once through the real interpreter, using
+        // the `raw` the JIT was compiled from — decode it into the scratch slot
+        // and call its handler directly (NOT via exec_decoded, which would
+        // re-enter the JIT gate, nor via interp_dispatch_one, which re-fetches
+        // from the bus — the JIT probe's instruction is `raw`, which may not be
+        // sitting at core.pc in a direct jit_fn test's mock memory). The
+        // handler's read_data/write_data populate core.lockstep_mem for the JIT
+        // re-run to compare against.
+        self.ins.raw = raw;
+        self.ins.flags = FLAG_NOT_DECODED;
+        decode_into::<T, C>(&mut self.ins);
+        let d: *const DecodedInstr = &self.ins;
+        type Fn2<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
+        let handler: Fn2<T, C> = unsafe { std::mem::transmute((*d).handler) };
+        let interp_status = handler(self, unsafe { &*d });
+        let interp = LockstepSnapshot::capture(&self.core);
+        let delay_target_after = self.core.delay_slot_target;
+
+        // Nothing meaningful to compare when the interpreter didn't cleanly
+        // retire (bus retry, memory breakpoint, or an exception raised inside
+        // the cache layer that the JIT's translate-only mem hooks can't see —
+        // same skip the old lockstep_check_load_store made). Leave interp state
+        // live (it's the authoritative result) and disable the compare.
+        if interp_status != EXEC_COMPLETE {
+            self.ls_before = None;
+            self.ls_expected = None;
+            // core stays in interp's post-state (already live); the JIT is
+            // about to re-run from `before`, but the caller made this a no-op —
+            // actually restore `before` so the JIT runs cleanly and its own
+            // exception path (production mem hooks under lockstep still detect
+            // faults via jit_mem_exc) produces the real result the region uses.
+            before.restore_into(self, delay_target_before);
+            self.core.lockstep_mem = None;
             return;
         }
-        self.lockstep_cache.clear();
-        unsafe { self.lockstep_codegen.reset(); }
+
+        // Stash the interpreter reference, then restore the starting state so
+        // the JIT runs the same instruction against identical inputs. Keep
+        // core.lockstep_mem (the interpreter's committed access) for the JIT's
+        // compare-not-recommit mem hooks.
+        self.ls_expected = Some(interp);
+        self.ls_delay_target_expected = delay_target_after;
+        self.ls_before = Some(before);
+        self.ls_delay_target_before = delay_target_before;
+        let saved_mem = self.core.lockstep_mem;
+        before.restore_into(self, delay_target_before);
+        self.core.lockstep_mem = saved_mem;
     }
 
-    /// Temporary bisection tool. Under jitv2_lockstep the real jitv2 dispatch
-    /// gate above is compiled out entirely (see its own doc comment) so this
-    /// is the only jitv2 code path running: classify `d` into
-    /// alu/branch/load-store/fpu, and for the categories currently wired up
-    /// (alu, branch/jump), inline-compile just this one instruction (branch/
-    /// jump: plus its mandatory delay slot — see `lockstep_check_branch`)
-    /// standalone, run the compiled version against a snapshot of the
-    /// pre-instruction register state, restore real state, then run the
-    /// interpreter and compare. This lets a live-boot divergence be bisected
-    /// to a single failing instruction without chopping the whole boot into
-    /// recompiled binaries each time. Panics loudly on any mismatch — this is
-    /// a debugging aid, meant to be run under a debugger/backtrace, not
-    /// survived.
+    /// Test-only: force a lockstep divergence and return `lockstep_compare`'s
+    /// verdict. Snapshots the current `core` as the "interpreter reference"
+    /// (`ls_expected`), mutates one GPR so the live `core` (the "JIT result")
+    /// differs, then runs the compare — which must report a divergence
+    /// (`true`) and return without panicking (the whole point: a real
+    /// divergence bails to the monitor, it never aborts the process). Verifies
+    /// the redesigned "print + break, don't panic" behavior end to end.
+    #[cfg(all(test, feature = "jitv2_lockstep"))]
+    pub fn test_force_lockstep_divergence(&mut self) -> bool {
+        let snap = LockstepSnapshot::capture(&self.core);
+        self.ls_expected = Some(snap);
+        self.ls_before = Some(snap);
+        self.ls_delay_target_expected = self.core.delay_slot_target;
+        // Make the live ("JIT") state differ from the stashed ("interp") one.
+        self.core.gpr[5] = self.core.gpr[5].wrapping_add(0xDEAD);
+        self.lockstep_compare()
+    }
+
+    /// Inline lockstep COMPARE (`core.lockstep_compare_fn`, via
+    /// `jit_lockstep_compare`): called at the end of every JIT instruction,
+    /// after its own semantics ran. If `lockstep_step` stashed a reference
+    /// (`ls_expected`), compare the JIT's now-current state against it;
+    /// otherwise a no-op (disabled class, or the interpreter's reference run
+    /// didn't cleanly retire). Clears the scratch either way.
     ///
-    /// Returns `Some(status)` (the interpreter's real `ExecStatus`) when it
-    /// ran the comparison — the caller must use that result directly instead
-    /// of dispatching `d` again, since the interpreter handler already ran
-    /// exactly once as part of the comparison. Returns `None` when it
-    /// skipped the check entirely (not alu/branch/load-store, page
-    /// unreadable, analyzer excluded the word, or no codegen emitter yet) —
-    /// the caller must dispatch normally in that case, since nothing ran
-    /// yet.
+    /// Returns `true` on a divergence — the caller (`jit_lockstep_compare`)
+    /// turns that into an `EXEC_BREAKPOINT` return so compiled code bails to the
+    /// monitor instead of aborting the process. On divergence this prints a
+    /// full, human-readable report (which specific GPRs / CP0 / FPR fields
+    /// differ, jit vs interp) to stderr first, so the state is captured even if
+    /// the monitor is then used to poke around (the JIT already ran the wrong
+    /// instruction — `core` holds the JIT's post-state at the divergent PC).
     #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_check(&mut self, d: &DecodedInstr) -> Option<ExecStatus> {
-        self.lockstep_flush_if_grown();
-        match lockstep_classify(d.raw) {
-            LockstepClass::Alu if self.lockstep_enabled.alu => self.lockstep_check_alu(d),
-            LockstepClass::Branch if self.lockstep_enabled.branch => self.lockstep_check_branch(d),
-            LockstepClass::LoadStore if self.lockstep_enabled.load_store => self.lockstep_check_load_store(d),
-            LockstepClass::Fpu if self.lockstep_enabled.fpu => self.lockstep_check_fpu(d),
-            _ => None,
+    fn lockstep_compare(&mut self) -> bool {
+        let Some(expected) = self.ls_expected.take() else {
+            self.ls_before = None;
+            self.core.lockstep_mem = None;
+            return false;
+        };
+        let before = self.ls_before.take();
+        LOCKSTEP_VERIFICATIONS.fetch_add(1, Ordering::Relaxed); // a real compare is happening
+        let jit = LockstepSnapshot::capture(&self.core);
+        let jit_delay_target = self.core.delay_slot_target;
+
+        // Full compare including pc/in_delay_slot/delay_slot_target: the
+        // lockstep build makes the JIT materialize these per-instruction (see
+        // codegen), so they're directly comparable with no branch/slot-model
+        // reconciliation. compare_fpr/compare_delay_slot both true — unlike the
+        // old standalone checks that could only compare a subset per class,
+        // this runs the real instruction in-region so every field is live.
+        let mismatch = jit.mismatches(&expected, true, true)
+            || jit_delay_target != self.ls_delay_target_expected;
+        self.core.lockstep_mem = None;
+        if !mismatch {
+            return false;
         }
+
+        // Divergence: print a detailed, field-by-field report, then signal the
+        // caller to break into the monitor (do NOT panic — an extern "C"
+        // callback panic aborts the whole process, losing the monitor and all
+        // state you'd want to inspect).
+        let at_pc = before.map(|b| b.pc).unwrap_or(expected.pc);
+        // Back core.pc/in_delay_slot/delay_slot_target up to the divergent
+        // instruction's own starting values — captured in `before`/
+        // `ls_delay_target_before`, on the Rust side, before the interpreter
+        // reference ever ran, so no need for codegen to pre-materialize or
+        // restore any of the three around the compare call for this. The
+        // three are always handled as one unit (same as `restore_into`'s own
+        // contract) — never just `pc` alone, since a stale `in_delay_slot`/
+        // `delay_slot_target` left over from the JIT's wrong run would make
+        // the monitor misinterpret a plain instruction as mid-delay-slot (or
+        // vice versa) at the address it just landed on. Every OTHER field is
+        // left exactly as the JIT produced it — "JIT's wrong post-state is
+        // live" is deliberate, only these three need correcting so the break
+        // lands in the right place with a coherent slot state.
+        self.core.pc = at_pc;
+        if let Some(b) = before {
+            self.core.in_delay_slot = b.in_delay_slot;
+        }
+        self.core.delay_slot_target = self.ls_delay_target_before;
+        eprintln!("\n=== jitv2_lockstep DIVERGENCE at pc={:#018x} raw was executed by JIT ===", at_pc);
+        for r in 0..32 {
+            if jit.gpr[r] != expected.gpr[r] {
+                eprintln!("  gpr[{:2}] {:<5} jit={:#018x}  interp={:#018x}", r, crate::mips_dis::reg_name(r as u32), jit.gpr[r], expected.gpr[r]);
+            }
+        }
+        if jit.pc != expected.pc { eprintln!("  pc       jit={:#018x}  interp={:#018x}", jit.pc, expected.pc); }
+        if jit.in_delay_slot != expected.in_delay_slot { eprintln!("  in_delay_slot jit={}  interp={}", jit.in_delay_slot, expected.in_delay_slot); }
+        if jit_delay_target != self.ls_delay_target_expected { eprintln!("  delay_slot_target jit={:#018x}  interp={:#018x}", jit_delay_target, self.ls_delay_target_expected); }
+        if jit.hi != expected.hi { eprintln!("  hi       jit={:#018x}  interp={:#018x}", jit.hi, expected.hi); }
+        if jit.lo != expected.lo { eprintln!("  lo       jit={:#018x}  interp={:#018x}", jit.lo, expected.lo); }
+        if jit.status != expected.status { eprintln!("  cp0_status jit={:#010x}  interp={:#010x}", jit.status, expected.status); }
+        if jit.cause != expected.cause { eprintln!("  cp0_cause  jit={:#010x}  interp={:#010x}", jit.cause, expected.cause); }
+        if jit.epc != expected.epc { eprintln!("  cp0_epc  jit={:#018x}  interp={:#018x}", jit.epc, expected.epc); }
+        for r in 0..32 {
+            if jit.fpr[r] != expected.fpr[r] {
+                eprintln!("  fpr[{:2}]  jit={:#018x}  interp={:#018x}", r, jit.fpr[r], expected.fpr[r]);
+            }
+        }
+        if jit.fcsr != expected.fcsr { eprintln!("  fcsr     jit={:#010x}  interp={:#010x}", jit.fcsr, expected.fcsr); }
+        eprintln!("=== breaking into monitor; use `dt`, `r`, `d pc` to inspect (JIT's wrong post-state is live) ===\n");
+        true
     }
 
     /// Translate `va` for a lockstep memory-hook comparison — no bus access,
@@ -6374,8 +6825,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return 0;
         }
         let phys = translate_result.phys as u64;
-        assert_eq!(va, captured.addr, "jitv2_lockstep read: JIT computed a different virtual address than the interpreter's real read");
-        assert_eq!(phys, captured.phys, "jitv2_lockstep read: JIT's translated physical address disagrees with the interpreter's real read at va={:#x}", va);
+        if va != captured.addr || phys != captured.phys {
+            eprintln!("\n=== jitv2_lockstep DIVERGENCE at pc={:#018x}: read address mismatch ===", self.core.pc);
+            eprintln!("  va   jit={:#018x}  interp={:#018x}", va, captured.addr);
+            eprintln!("  phys jit={:#018x}  interp={:#018x}", phys, captured.phys);
+            eprintln!("=== breaking into monitor; use `dt`, `r`, `d pc` to inspect (JIT's wrong post-state is live) ===\n");
+            self.core.lockstep_mem = None;
+            self.core.jit_mem_exc = EXEC_BREAKPOINT;
+            return 0;
+        }
         self.core.jit_mem_exc = EXEC_COMPLETE;
         let mask: u64 = if SIZE == 8 { u64::MAX } else { (1u64 << (SIZE * 8)) - 1 };
         captured.value & mask
@@ -6407,531 +6865,34 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             return translate_result.status;
         }
         let phys = translate_result.phys as u64;
-        assert_eq!(va, captured.addr, "jitv2_lockstep write: JIT computed a different virtual address than the interpreter's real write");
-        assert_eq!(phys, captured.phys, "jitv2_lockstep write: JIT's translated physical address disagrees with the interpreter's real write at va={:#x}", va);
         let mask: u64 = if SIZE == 8 { u64::MAX } else { (1u64 << (SIZE * 8)) - 1 };
         let jit_masked = val & mask;
         let interp_masked = captured.value & mask;
-        assert_eq!(jit_masked, interp_masked, "jitv2_lockstep write: JIT computed a different value than the interpreter's real write at va={:#x} pc={:#x} SIZE={} mask={:#x} jit_val={:#x} interp_val={:#x} jit_masked={:#x} interp_masked={:#x}", va, self.core.pc, SIZE, mask, val, captured.value, jit_masked, interp_masked);
+        if va != captured.addr || phys != captured.phys || jit_masked != interp_masked {
+            eprintln!("\n=== jitv2_lockstep DIVERGENCE at pc={:#018x}: write mismatch ===", self.core.pc);
+            eprintln!("  va    jit={:#018x}  interp={:#018x}", va, captured.addr);
+            eprintln!("  phys  jit={:#018x}  interp={:#018x}", phys, captured.phys);
+            eprintln!("  value jit={:#018x}  interp={:#018x}  (SIZE={} mask={:#x})", jit_masked, interp_masked, SIZE, mask);
+            eprintln!("=== breaking into monitor; use `dt`, `r`, `d pc` to inspect (JIT's wrong post-state is live) ===\n");
+            self.core.lockstep_mem = None;
+            self.core.jit_mem_exc = EXEC_BREAKPOINT;
+            return EXEC_BREAKPOINT;
+        }
         self.core.jit_mem_exc = EXEC_COMPLETE;
         EXEC_COMPLETE
     }
-
-    /// ALU half of `lockstep_check` — see that function's doc comment.
-    #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_check_alu(&mut self, d: &DecodedInstr) -> Option<ExecStatus> {
-        // Progress print: this tool is slow enough (a Cranelift compile per
-        // never-before-seen ALU word) that a long-running boot can look
-        // hung. Print every probe, unthrottled.
-        //eprintln!("jitv2_lockstep: pc={:#x} raw={:#010x}", self.core.pc, d.raw);
-        if self.core.in_delay_slot {
-            // A delay-slot instruction's real completion resolves the
-            // pending branch (jump to delay_slot_target) instead of falling
-            // through to word+1 — behavior that depends on in_delay_slot/
-            // delay_slot_target, neither of which a standalone one-
-            // instruction compile-and-run can see or replicate. Not a
-            // divergence, just outside what this harness can compare.
-            return None;
-        }
-        assert!(!self.pcp.is_null(), "lockstep_check reached with no tracked PhysicalCodePage");
-        let page = unsafe { &*self.pcp };
-        let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
-        let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
-        let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
-
-        // Snapshot exactly the state an ALU instruction (including its
-        // overflow-trap arms — ADD/SUB/DADD/DSUB can raise an exception,
-        // touching cause/epc/status/pc) can read or write.
-        let before = LockstepSnapshot::capture(&self.core);
-        let delay_slot_target_before = self.core.delay_slot_target;
-
-        // Deliberately never touches page.publish/entries: the real jitv2
-        // dispatch gate is compiled out under jitv2_lockstep specifically so
-        // nothing ever intercepts a word before it reaches here (see that
-        // gate's own doc comment on why). Publishing into page/entries would
-        // reintroduce the same problem by another door — some *other*
-        // build's real gate isn't the risk here, but a published entry would
-        // still mean this word only ever gets run-and-compared once, then
-        // trusted forever after via is_entry_valid, with no further
-        // verification. Keeping a *local* cache instead still skips the
-        // Cranelift compile on a repeat, but every single dispatch still
-        // gets a fresh run-and-compare against the interpreter.
-        let key = (d.raw, 0u32, entry_word as u16, compiled_for_fr1);
-        let jit_fn: crate::jitv2::JitFn = match self.lockstep_cache.get(&key) {
-            Some(Some(f)) => *f,
-            Some(None) => return None, // codegen gap, already known — don't re-attempt
-            None => {
-                let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
-                words[entry_word] = d.raw;
-                let (walked, non_empty) = self.lockstep_analyzer.walk_bounded(&words, entry_word as u16, phys_base, 1);
-                if !non_empty {
-                    return None; // analyzer excluded this word (shouldn't happen for a classified-Alu op, but not this tool's job to assert that)
-                }
-                let mut instrs_owned = *walked;
-                // skip_entry_preamble=true: same as comp.rs::handle_request —
-                // we're inside exec_decoded, which step()'s dispatch loop
-                // only ever calls after already running the IP7/pending-
-                // interrupt checks for this exact PC (see exec_decoded's own
-                // doc comment on the real gate above).
-                let compiled = self.lockstep_codegen.compile_region(&mut instrs_owned, entry_word as u16, compiled_for_fr1, true);
-                self.lockstep_cache.insert(key, compiled);
-                match compiled {
-                    Some(f) => f,
-                    None => return None, // codegen gap: nothing to compare against yet
-                }
-            }
-        };
-
-        let jit_status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
-        let jit = LockstepSnapshot::capture(&self.core);
-
-        // Restore real state so the interpreter runs this instruction for
-        // real, exactly as if the JIT probe never happened.
-        before.restore_into(self, delay_slot_target_before);
-
-        type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let interp_status = f(self, d);
-        let interp = LockstepSnapshot::capture(&self.core);
-
-        assert!(
-            !jit.mismatches(&interp, false, false),
-            "jitv2_lockstep ALU divergence at pc={:#x} raw={:#010x}\n\
-             jit:    status={:#x} pc={:#x} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}\n\
-             interp: status={:#x} pc={:#x} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}",
-            before.pc, d.raw,
-            jit_status, jit.pc, jit.gpr, jit.hi, jit.lo, jit.cause, jit.epc,
-            interp_status, interp.pc, interp.gpr, interp.hi, interp.lo, interp.cause, interp.epc,
-        );
-        Some(interp_status)
-    }
-
-    /// FPU half of `lockstep_check` — structurally identical to
-    /// `lockstep_check_alu` (standalone-compile-and-compare-then-restore-
-    /// and-interpret), just for CP1 instructions instead: same reasoning on
-    /// why `in_delay_slot` is excluded (a standalone FPU op can't be in a
-    /// delay slot any more than an ALU op can), same local-cache-never-
-    /// published discipline, same `skip_entry_preamble=true` rationale. The
-    /// one real difference is `compare_fpr=true` — the entire point of this
-    /// check, since ALU never touches `fpr`/FCSR at all.
-    ///
-    /// Only covers CP1 arithmetic/convert/compare/move ops
-    /// (`lookup_cp1_semantics`'s table — `FADD.S`, `CVT.D.W`, `MFC1`, etc.);
-    /// `LWC1`/`SWC1`/`LDC1`/`SDC1` (FPU loads/stores) are classified
-    /// `LockstepClass::Fpu` too but aren't in that table, so they hit the
-    /// ordinary codegen-gap bail below like any other unimplemented
-    /// emitter — no special-casing needed here, though if FPU load/store
-    /// codegen is ever added it would need the same real-access-can't-be-
-    /// replayed-twice treatment `lockstep_check_load_store` already has for
-    /// the integer case, not this one.
-    #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_check_fpu(&mut self, d: &DecodedInstr) -> Option<ExecStatus> {
-        if self.core.in_delay_slot {
-            return None;
-        }
-        assert!(!self.pcp.is_null(), "lockstep_check_fpu reached with no tracked PhysicalCodePage");
-        let page = unsafe { &*self.pcp };
-        let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
-        let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
-        let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
-
-        let before = LockstepSnapshot::capture(&self.core);
-        let delay_slot_target_before = self.core.delay_slot_target;
-
-        let key = (d.raw, 0u32, entry_word as u16, compiled_for_fr1);
-        let jit_fn: crate::jitv2::JitFn = match self.lockstep_cache.get(&key) {
-            Some(Some(f)) => *f,
-            Some(None) => return None,
-            None => {
-                let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
-                words[entry_word] = d.raw;
-                let (walked, non_empty) = self.lockstep_analyzer.walk_bounded(&words, entry_word as u16, phys_base, 1);
-                if !non_empty {
-                    return None;
-                }
-                let mut instrs_owned = *walked;
-                let compiled = self.lockstep_codegen.compile_region(&mut instrs_owned, entry_word as u16, compiled_for_fr1, true);
-                self.lockstep_cache.insert(key, compiled);
-                match compiled {
-                    Some(f) => f,
-                    None => return None,
-                }
-            }
-        };
-
-        let jit_status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
-        let jit = LockstepSnapshot::capture(&self.core);
-
-        before.restore_into(self, delay_slot_target_before);
-
-        // The compiled region's FPU entry guard (`emit_fpu_entry_guard`) —
-        // present whenever the region contains any CP1 instruction, which a
-        // single-instruction FPU probe always does — checks STATUS_CU1/FR
-        // mode itself and, if either is wrong, bails straight back to the
-        // interpreter via emit_bail (core.pc set to *this exact word*,
-        // status EXEC_COMPLETE) rather than raising the exception itself:
-        // production's real dispatch gate lets the interpreter's own
-        // re-fetch of this PC hit `exec_cfc1`'s (etc.) own CU1 check and
-        // vector EXC_CPU for real, since single-implementation exception
-        // delivery lives only in the interpreter (§4.2). That bail is
-        // indistinguishable from the JIT "having nothing to say" here — no
-        // real instruction handler's *successful* completion ever leaves
-        // core.pc exactly where it started (every real completion advances
-        // it or vectors it to an exception handler) — so jit.pc == before.pc
-        // is a safe, unambiguous signal to treat this exactly like a
-        // codegen-gap `None`: skip the comparison, let the interpreter's
-        // real dispatch below be the only thing that ran.
-        if jit.pc == before.pc {
-            type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-            let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-            return Some(f(self, d));
-        }
-
-        type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let interp_status = f(self, d);
-        let interp = LockstepSnapshot::capture(&self.core);
-
-        assert!(
-            !jit.mismatches(&interp, true, false),
-            "jitv2_lockstep FPU divergence at pc={:#x} raw={:#010x}\n\
-             jit:    status={:#x} pc={:#x} gpr={:x?} fpr={:x?} fcsr={:#x} fccr={:#x} fexr={:#x} fenr={:#x} cause={:#x} epc={:#x}\n\
-             interp: status={:#x} pc={:#x} gpr={:x?} fpr={:x?} fcsr={:#x} fccr={:#x} fexr={:#x} fenr={:#x} cause={:#x} epc={:#x}",
-            before.pc, d.raw,
-            jit_status, jit.pc, jit.gpr, jit.fpr, jit.fcsr, jit.fccr, jit.fexr, jit.fenr, jit.cause, jit.epc,
-            interp_status, interp.pc, interp.gpr, interp.fpr, interp.fcsr, interp.fccr, interp.fexr, interp.fenr, interp.cause, interp.epc,
-        );
-        Some(interp_status)
-    }
-
-    /// Branch/jump half of `lockstep_check`. A standalone branch/jump can't
-    /// be compared the way a lone ALU op can: its real effect isn't complete
-    /// until its mandatory delay slot has also retired (`branch_delay` only
-    /// sets `core.in_delay_slot`/`delay_slot_target` and advances pc by 4 —
-    /// the actual jump to the target happens when the delay slot's own
-    /// `handle_exec_complete` resolves it), and the compiled side
-    /// (`codegen.rs`'s `emit_slot_semantics`) always compiles a branch/jump
-    /// fused with its delay slot as one unit, with a single IP7/pending-
-    /// interrupt preamble for the pair — never a second one before the slot.
-    /// So this mirrors that: `walk_bounded(..., max_instrs=1)` pulls in the
-    /// delay slot for free (the analyzer never charges a mandatory slot
-    /// against the head budget — see
-    /// `analyzer::walk_bounded_budget_excludes_delay_slot`), giving the same
-    /// two-word region `compile_region` would build for this PC in
-    /// production. On the interpreter side, after running the branch/jump's
-    /// own handler, if it left `core.in_delay_slot` set, the slot word is
-    /// fetched/decoded/executed directly (`fetch_instr` + `decode_into` +
-    /// the handler, not a real `step()` call) — deliberately skipping
-    /// `step()`'s cycle-counter/IP7/pending-interrupt/breakpoint bookkeeping
-    /// for this second instruction, exactly matching the compiled side never
-    /// emitting a second preamble for it.
-    #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_check_branch(&mut self, d: &DecodedInstr) -> Option<ExecStatus> {
-        if self.core.in_delay_slot {
-            // Same reasoning as lockstep_check_alu: a standalone compile of
-            // this word can't replicate landing here as someone else's delay
-            // slot. Not a divergence, just outside what this harness compares.
-            return None;
-        }
-        assert!(!self.pcp.is_null(), "lockstep_check_branch reached with no tracked PhysicalCodePage");
-        let page = unsafe { &*self.pcp };
-        let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
-        let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
-        let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
-        let branch_raw = d.raw;
-
-        // The delay slot's own raw word is needed both to classify it and,
-        // if the check proceeds, to compile it — same same-page assumption
-        // `emit_slot_semantics`/the real compiler already makes (a
-        // branch/jump at a page's last word is the 0xFFC hazard, excluded by
-        // the analyzer, not reachable here). Fetching the raw word here is a
-        // code read, not a data access — safe to do unconditionally, unlike
-        // actually executing it.
-        let slot_word = entry_word + 1;
-        if slot_word >= crate::jitv2::ENTRIES_PER_PAGE {
-            return None;
-        }
-        let slot_phys = phys_base + (slot_word as u32) * 4;
-        let r = self.sysad.read32(slot_phys);
-        if !r.is_ok() {
-            return None;
-        }
-        let slot_raw = r.data;
-        // A delay slot that loads/stores, touches CP1, or is otherwise
-        // unclassified has real side effects (memory writes, MMIO reads,
-        // FPU state) that this harness cannot safely replay twice — running
-        // it once via the compiled probe and again via the interpreter (see
-        // lockstep_check_alu's own load/store exclusion, same reasoning)
-        // would double them. Only compare when the slot is itself ALU-only
-        // (ordinary register/HI/LO/CP0-only semantics, safe to run twice and
-        // discard the first run's effects on restore).
-        if lockstep_classify(slot_raw) != LockstepClass::Alu {
-            return None;
-        }
-
-        // Snapshot everything the branch+slot pair (the slot's ALU op, plus
-        // the branch/jump's own link-register and PC/delay-slot writes) can
-        // read or write.
-        let before = LockstepSnapshot::capture(&self.core);
-        let delay_slot_target_before = self.core.delay_slot_target;
-        let key = (branch_raw, slot_raw, entry_word as u16, compiled_for_fr1);
-        let jit_fn: crate::jitv2::JitFn = match self.lockstep_cache.get(&key) {
-            Some(Some(f)) => *f,
-            Some(None) => return None, // codegen gap, already known — don't re-attempt
-            None => {
-                let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
-                words[entry_word] = branch_raw;
-                words[slot_word] = slot_raw;
-                let (walked, non_empty) = self.lockstep_analyzer.walk_bounded(&words, entry_word as u16, phys_base, 1);
-                if !non_empty {
-                    return None;
-                }
-                // taken_exit == None means the taken arm resolved to an
-                // *internal* edge rather than exiting the compiled region —
-                // only possible here (max_instrs=1, so no second head has
-                // budget to be walked as a fresh block) when the target is
-                // the entry word itself, i.e. a tight self-loop
-                // (`analyzer::visit`'s "real head already walked" case). The
-                // compiled function is then free to iterate that loop
-                // natively many times in one native call before it ever
-                // exits back to the interpreter, while this harness's
-                // interpreter side always runs exactly one branch+slot pair
-                // — not a divergence, just two engines legitimately doing
-                // different amounts of real work for the same input, which
-                // this harness has no way to compare fairly.
-                if walked[entry_word].taken_exit.is_none() {
-                    self.lockstep_cache.insert(key, None);
-                    return None;
-                }
-                let mut instrs_owned = *walked;
-                let compiled = self.lockstep_codegen.compile_region(&mut instrs_owned, entry_word as u16, compiled_for_fr1, true);
-                self.lockstep_cache.insert(key, compiled);
-                match compiled {
-                    Some(f) => f,
-                    None => return None,
-                }
-            }
-        };
-
-        let jit_status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
-        let jit = LockstepSnapshot::capture(&self.core);
-
-        // Restore real state so the interpreter runs the branch (and, if it
-        // takes one, its delay slot) for real, exactly as if the JIT probe
-        // never happened.
-        before.restore_into(self, delay_slot_target_before);
-
-        type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let mut interp_status = f(self, d);
-
-        // The MIPS delay slot always executes, taken or not — `in_delay_slot`
-        // is not the right thing to key off here: `branch_delay` (taken) sets
-        // it, but `handle_exec_complete`'s not-taken arm deliberately doesn't
-        // (there's no pending jump to resolve on the interpreter's *next*
-        // dispatch, since pc already sits at branch_pc+4 — the slot's own
-        // address — and just continues normally from there). Both arms leave
-        // pc at exactly branch_pc+4 on successful completion, so that alone
-        // is the real signal that there's a slot here still to run. The
-        // branch/jump's own handler only ever raises an exception itself for
-        // a misaligned target (branch_delay never faults) — in that case
-        // there's no delay slot to run, same as the compiled side's
-        // emit_cond exiting straight to emit_exception_exit without ever
-        // reaching emit_slot_semantics. Otherwise, mirror emit_slot_semantics
-        // unconditionally running the slot's semantics: fetch/decode/exec it
-        // directly, deliberately bypassing step()'s per-instruction
-        // cycle/IP7/interrupt/breakpoint bookkeeping (see this fn's doc
-        // comment).
-        if interp_status & EXEC_IS_EXCEPTION == 0 && self.core.pc == before.pc.wrapping_add(4) {
-            let slot_pc = self.core.pc;
-            let fetch = self.fetch_instr(slot_pc);
-            if fetch.status != EXEC_COMPLETE {
-                interp_status = fetch.status;
-            } else {
-                let slot = fetch.instr as *mut DecodedInstr;
-                let sd = unsafe { &mut *slot };
-                if sd.flags != 0 {
-                    decode_into::<T, C>(sd);
-                }
-                let sd = unsafe { &*fetch.instr };
-                type SlotFn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-                let sf: SlotFn<T, C> = unsafe { std::mem::transmute(sd.handler) };
-                interp_status = sf(self, sd);
-            }
-        }
-        let interp = LockstepSnapshot::capture(&self.core);
-
-        assert!(
-            !jit.mismatches(&interp, false, true),
-            "jitv2_lockstep branch divergence at pc={:#x} raw={:#010x}\n\
-             jit:    status={:#x} pc={:#x} in_delay_slot={} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}\n\
-             interp: status={:#x} pc={:#x} in_delay_slot={} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}",
-            before.pc, branch_raw,
-            jit_status, jit.pc, jit.in_delay_slot, jit.gpr, jit.hi, jit.lo, jit.cause, jit.epc,
-            interp_status, interp.pc, interp.in_delay_slot, interp.gpr, interp.hi, interp.lo, interp.cause, interp.epc,
-        );
-        Some(interp_status)
-    }
-
-    /// Load/store half of `lockstep_check`. Unlike ALU/branch (JIT probe
-    /// first, then interpreter re-run against restored state), this runs the
-    /// interpreter *first*: a load/store's real effect is a genuine bus
-    /// access (register file writes for a load, memory writes for a store),
-    /// and there is no safe way to issue that access twice — a load can hit
-    /// MMIO with side effects, a store would double-apply. So the
-    /// interpreter's dispatch here is the one and only real access; it also
-    /// populates `core.lockstep_mem` (via `read_data_impl`/`write_data_impl`'s
-    /// own capture, unconditional under `jitv2_lockstep`). The JIT then runs
-    /// against restored pre-state with its `read*_fn`/`write*_fn` hooks
-    /// swapped to `lockstep_jit_read`/`lockstep_jit_write` (see
-    /// `jit_read32`/`jit_write32` etc.'s `#[cfg(feature = "jitv2_lockstep")]`
-    /// branch) — those never touch the bus either, only comparing the JIT's
-    /// independently-computed address/value against what's already captured.
-    /// This verifies address translation and (for stores) value computation
-    /// without ever running a real access more than once.
-    #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_check_load_store(&mut self, d: &DecodedInstr) -> Option<ExecStatus> {
-        if self.core.in_delay_slot {
-            // Same reasoning as lockstep_check_alu: a standalone compile of
-            // this word can't replicate landing here as someone else's delay
-            // slot. Not a divergence, just outside what this harness compares.
-            return None;
-        }
-        assert!(!self.pcp.is_null(), "lockstep_check_load_store reached with no tracked PhysicalCodePage");
-        let page = unsafe { &*self.pcp };
-        let phys_base = page.pfn * crate::jitv2::PAGE_SIZE;
-        let entry_word = ((self.core.pc & 0xFFF) >> 2) as usize;
-        let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
-
-        let before = LockstepSnapshot::capture(&self.core);
-        let delay_slot_target_before = self.core.delay_slot_target;
-
-        // Interpreter runs first and for real — see this function's doc
-        // comment. Its read_data/write_data calls populate
-        // core.lockstep_mem_* as a side effect, which the JIT probe below
-        // reads back for comparison.
-        type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let interp_status = f(self, d);
-        let interp = LockstepSnapshot::capture(&self.core);
-        let delay_slot_target_after_interp = self.core.delay_slot_target;
-
-        // Skip the JIT comparison entirely whenever the interpreter's real
-        // dispatch didn't cleanly complete a real access:
-        //
-        // - EXEC_RETRY (bus busy) / EXEC_BREAKPOINT (memory breakpoint
-        //   mid-access) are pass-through statuses (see finish_status's doc
-        //   comment) — core.pc/gpr are unchanged, nothing was committed.
-        //
-        // - Any real exception (EXEC_IS_EXCEPTION set — observed live:
-        //   EXC_VCED, a Virtual Coherency Exception) means the fault
-        //   happened *inside the cache layer* (`mips_cache_v2.rs`'s pidx
-        //   check), which `lockstep_jit_read`/`lockstep_jit_write`
-        //   structurally cannot see: they deliberately never touch the real
-        //   cache at all (only `nanotlb_translate`, to avoid a second real
-        //   access — see their own doc comments), so a JIT probe can
-        //   "succeed" here not because it's wrong, but because it never ran
-        //   the check that would have caught what the interpreter did. This
-        //   isn't a JIT bug to fix — running the probe through the real
-        //   cache would defeat the entire point of not double-accessing
-        //   memory. (Production, non-lockstep JIT dispatch has none of this
-        //   gap: its `jit_read*`/`jit_write*` call the real `read_data`/
-        //   `write_data`, which do go through the cache and correctly
-        //   detect/propagate VCE via `jit_mem_exc`.)
-        //
-        // Both cases: core.lockstep_mem is `None` (see that field's own doc
-        // comment) — there's nothing for the JIT probe to meaningfully
-        // compare against. Restore `interp`'s state (unchanged from
-        // `before` in the retry/breakpoint case; the vectored-exception
-        // state in the fault case) and return immediately, same as the real
-        // production gate would for this status.
-        if interp_status != EXEC_COMPLETE {
-            interp.restore_into(self, delay_slot_target_after_interp);
-            return Some(interp_status);
-        }
-
-        // Restore real state so the JIT probe starts clean — but NOT
-        // core.lockstep_mem_*, which must survive the restore: it's the
-        // record of what the interpreter's real access just did, exactly
-        // what the JIT's lockstep_jit_read/lockstep_jit_write hooks need to
-        // compare against a moment from now.
-        //
-        // Every early-return below (codegen gap, analyzer exclusion) must
-        // restore `interp` — not leave `self.core` sitting in this
-        // pre-instruction `before` state — before returning
-        // `Some(interp_status)`: the caller (`exec_decoded`) trusts that
-        // status/state pair as final and never re-dispatches `d`, so
-        // returning `before`'s un-executed state here would silently undo
-        // the interpreter's real access while still reporting it as having
-        // completed (observed live: a CACHE instruction — no codegen
-        // emitter, always takes the earliest bail below — never advancing
-        // `core.pc`, hanging the CPU on the same instruction forever).
-        before.restore_into(self, delay_slot_target_before);
-
-        let key = (d.raw, 0u32, entry_word as u16, compiled_for_fr1);
-        let jit_fn: crate::jitv2::JitFn = match self.lockstep_cache.get(&key) {
-            Some(Some(f)) => *f,
-            Some(None) => { // codegen gap, already known — interpreter's real run above still stands
-                interp.restore_into(self, delay_slot_target_after_interp);
-                return Some(interp_status);
-            }
-            None => {
-                let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
-                words[entry_word] = d.raw;
-                let (walked, non_empty) = self.lockstep_analyzer.walk_bounded(&words, entry_word as u16, phys_base, 1);
-                if !non_empty {
-                    interp.restore_into(self, delay_slot_target_after_interp);
-                    return Some(interp_status);
-                }
-                let mut instrs_owned = *walked;
-                let compiled = self.lockstep_codegen.compile_region(&mut instrs_owned, entry_word as u16, compiled_for_fr1, true);
-                self.lockstep_cache.insert(key, compiled);
-                match compiled {
-                    Some(f) => f,
-                    None => { // codegen gap: nothing to compare against, interpreter's real run above still stands
-                        interp.restore_into(self, delay_slot_target_after_interp);
-                        return Some(interp_status);
-                    }
-                }
-            }
-        };
-
-        let jit_status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
-        let jit = LockstepSnapshot::capture(&self.core);
-
-        assert!(
-            !jit.mismatches(&interp, false, false),
-            "jitv2_lockstep load/store divergence at pc={:#x} raw={:#010x}\n\
-             jit:    status={:#x} pc={:#x} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}\n\
-             interp: status={:#x} pc={:#x} gpr={:x?} hi={:#x} lo={:#x} cause={:#x} epc={:#x}",
-            before.pc, d.raw,
-            jit_status, jit.pc, jit.gpr, jit.hi, jit.lo, jit.cause, jit.epc,
-            interp_status, interp.pc, interp.gpr, interp.hi, interp.lo, interp.cause, interp.epc,
-        );
-
-        // The interpreter's dispatch above is the one real, authoritative
-        // execution (its memory access already happened for real) — restore
-        // its state so the JIT probe's parallel run (same register/PC
-        // effects, verified equal above, but computed via a second,
-        // non-bus-touching pass) is left with no lasting trace.
-        interp.restore_into(self, delay_slot_target_after_interp);
-        Some(interp_status)
-    }
-
 }
 
-/// Everything a `jitv2_lockstep`-compared instruction (ALU op, or a
-/// branch/jump plus its ALU-only delay slot) can read or write, captured
-/// before/after each engine's run so `lockstep_check_alu`/
-/// `lockstep_check_branch` can restore real state between the JIT probe and
-/// the interpreter re-run, then compare. One shared shape for both: the ALU
-/// case never touches `fpr`/`in_delay_slot` (excluded from its own
-/// comparison via `mismatches`' `compare_delay_slot_and_fpr` flag) but
-/// capturing them anyway costs nothing and keeps this a single type instead
-/// of two near-identical ones.
+/// Everything an inline-lockstep-compared instruction can read or write,
+/// captured before the interpreter reference run (`lockstep_step`'s `before`,
+/// restored so the JIT runs from the same inputs), as the interpreter result
+/// (`ls_expected`), and after the JIT's own run (`lockstep_compare`'s `jit`).
+/// One shared shape covers every instruction class now that lockstep runs the
+/// real in-region instruction rather than a standalone recompile: every field
+/// is live and comparable (`mismatches(compare_fpr=true, compare_delay_slot=true)`).
 #[cfg(feature = "jitv2_lockstep")]
 #[derive(Clone, Copy)]
-struct LockstepSnapshot {
+pub(crate) struct LockstepSnapshot {
     gpr: [u64; 32],
     hi: u64,
     lo: u64,
@@ -7020,32 +6981,13 @@ impl LockstepSnapshot {
     }
 }
 
-/// Per-`LockstepClass` on/off switch — see `MipsExecutor::lockstep_enabled`'s
-/// doc comment for why this exists (running only FPU lockstep at close to
-/// full speed for an FPU-heavy workload, instead of paying the ALU/branch/
-/// load-store tax everywhere too). All `true` by default: the historical,
-/// still-default behavior is to verify everything `lockstep_check` knows how
-/// to.
-#[cfg(feature = "jitv2_lockstep")]
-#[derive(Clone, Copy)]
-pub(crate) struct LockstepEnabled {
-    pub alu: bool,
-    pub branch: bool,
-    pub load_store: bool,
-    pub fpu: bool,
-}
-
-#[cfg(feature = "jitv2_lockstep")]
-impl Default for LockstepEnabled {
-    fn default() -> Self {
-        Self { alu: true, branch: true, load_store: true, fpu: true }
-    }
-}
-
-/// Instruction category for `jitv2_lockstep`'s inline compile-and-compare
-/// (not `analyzer::Classify`, which is about reachability/control-flow, not
-/// semantics grouping). Each category's actual verification can be toggled
-/// independently at runtime — see `MipsExecutor::lockstep_enabled`.
+/// Instruction category for `jitv2_lockstep`'s inline self-check (not
+/// `analyzer::Classify`, which is about reachability/control-flow, not semantics
+/// grouping). Only used to decide *whether* a bracketed instruction can be
+/// meaningfully compared per-dispatch: Alu/LoadStore/Fpu yes; Branch (JIT
+/// inlines the delay slot into one unit — the two-dispatch reconciliation is
+/// deferred) and Other (opcodefusion producers) no. Lockstep itself is always
+/// on when built — there's no per-class runtime toggle anymore.
 #[cfg(feature = "jitv2_lockstep")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockstepClass {
@@ -7806,7 +7748,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                         let symbols = exec.symbols.lock();
                         let sym_str = format_pc_symbol(entry.pc, &symbols);
                         let dis = mips_dis::disassemble(entry.instr, entry.pc, Some(&symbols));
-                        let info = format!("{:016x}{}: {:08x} {}", entry.pc, sym_str, entry.instr, dis);
+                        let info = format!("{:#018x}{}: {:#010x} {}", entry.pc, sym_str, entry.instr, dis);
                         if insn_trace {
                             dlog_dev!(LogModule::Mips, "{}", info);
                             writeln!(writer, "{}", info).unwrap();
@@ -8449,7 +8391,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 lockstep [<alu|branch|loadstore|fpu> [on|off]] (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 flush | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -8738,16 +8680,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 
         // Helper to dump registers
         let dump_regs = |exec: &mut MipsExecutor<T, C>, out: &mut dyn Write| {
-            writeln!(out, "PC: {:016x}", exec.core.pc).unwrap();
-            writeln!(out, "HI: {:016x} LO: {:016x}", exec.core.hi, exec.core.lo).unwrap();
+            writeln!(out, "PC: {:#018x}", exec.core.pc).unwrap();
+            writeln!(out, "HI: {:#018x} LO: {:#018x}", exec.core.hi, exec.core.lo).unwrap();
             for i in 0..32 {
                 let val = exec.core.gpr[i];
-                write!(out, "{:4}(${:02}): {:016x}  ", mips_dis::reg_name(i as u32), i, val).unwrap();
+                write!(out, "{:4}(${:02}): {:#018x}  ", mips_dis::reg_name(i as u32), i, val).unwrap();
                 if (i + 1) % 4 == 0 { writeln!(out).unwrap(); }
             }
-            writeln!(out, "CP0 Status: {:08x} ({})", exec.core.cp0_status, decode_status(exec.core.cp0_status)).unwrap();
-            writeln!(out, "CP0 Cause:  {:08x} ({})", exec.core.cp0_cause, decode_cause(exec.core.cp0_cause)).unwrap();
-            writeln!(out, "CP0 EPC: {:016x} BadVAddr: {:016x}", exec.core.cp0_epc, exec.core.cp0_badvaddr).unwrap();
+            writeln!(out, "CP0 Status: {:#010x} ({})", exec.core.cp0_status, decode_status(exec.core.cp0_status)).unwrap();
+            writeln!(out, "CP0 Cause:  {:#010x} ({})", exec.core.cp0_cause, decode_cause(exec.core.cp0_cause)).unwrap();
+            writeln!(out, "CP0 EPC: {:#018x} BadVAddr: {:#018x}", exec.core.cp0_epc, exec.core.cp0_badvaddr).unwrap();
         };
 
         match actual_cmd {
@@ -8926,7 +8868,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     let val = exec.core.read_cp0(i);
                     let name = mips_dis::cp0_reg_name(i);
                     if name != "?" {
-                        write!(writer, "  {:2} {:8}: {:016x}", i, name, val).unwrap();
+                        write!(writer, "  {:2} {:8}: {:#018x}", i, name, val).unwrap();
                         if i == 12 { // Status
                             write!(writer, " {}", decode_status(val as u32)).unwrap();
                         } else if i == 13 { // Cause
@@ -8955,14 +8897,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     let val = exec.core.fpr[i];
                     let f32_val = f32::from_bits(val as u32);
                     let f64_val = f64::from_bits(val);
-                    writeln!(writer, "  f{:02}: {:016x}  (f32: {:e}, f64: {:e})", i, val, f32_val, f64_val).unwrap();
+                    writeln!(writer, "  f{:02}: {:#018x}  (f32: {:e}, f64: {:e})", i, val, f32_val, f64_val).unwrap();
                 }
                 writeln!(writer, "Control Registers:").unwrap();
-                writeln!(writer, "  FIR:  {:08x}", exec.core.fpu_fir).unwrap();
-                writeln!(writer, "  FCCR: {:08x}", exec.core.fpu_fccr).unwrap();
-                writeln!(writer, "  FEXR: {:08x}", exec.core.fpu_fexr).unwrap();
-                writeln!(writer, "  FENR: {:08x}", exec.core.fpu_fenr).unwrap();
-                writeln!(writer, "  FCSR: {:08x}", exec.core.fpu_fcsr).unwrap();
+                writeln!(writer, "  FIR:  {:#010x}", exec.core.fpu_fir).unwrap();
+                writeln!(writer, "  FCCR: {:#010x}", exec.core.fpu_fccr).unwrap();
+                writeln!(writer, "  FEXR: {:#010x}", exec.core.fpu_fexr).unwrap();
+                writeln!(writer, "  FENR: {:#010x}", exec.core.fpu_fenr).unwrap();
+                writeln!(writer, "  FCSR: {:#010x}", exec.core.fpu_fcsr).unwrap();
                 Ok(())
             }
             "mem" | "m" | "memory" => {
@@ -8976,8 +8918,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 for i in 0..count {
                     let curr_addr = addr.wrapping_add(i * 4);
                     match exec.debug_read(curr_addr, 4) {
-                        Ok(val) => writeln!(writer, "{:016x}: {:08x}", curr_addr, val).unwrap(),
-                        Err(e) => writeln!(writer, "{:016x}: Error {:?}", curr_addr, e).unwrap(),
+                        Ok(val) => writeln!(writer, "{:#018x}: {:#010x}", curr_addr, val).unwrap(),
+                        Err(e) => writeln!(writer, "{:#018x}: Error {:?}", curr_addr, e).unwrap(),
                     }
                 }
                 Ok(())
@@ -9087,9 +9029,9 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     match exec.debug_fetch_instr(curr_addr) {
                         Ok(instr) => {
                             let sym_str = format_pc_symbol(curr_addr, &symbols);
-                            writeln!(writer, "{:016x}{}: {:08x} {}", curr_addr, sym_str, instr, mips_dis::disassemble(instr, curr_addr, Some(&symbols))).unwrap()
+                            writeln!(writer, "{:#018x}{}: {:#010x} {}", curr_addr, sym_str, instr, mips_dis::disassemble(instr, curr_addr, Some(&symbols))).unwrap()
                         },
-                        Err(_) => writeln!(writer, "{:016x}: Could not fetch", curr_addr).unwrap(),
+                        Err(_) => writeln!(writer, "{:#018x}: Could not fetch", curr_addr).unwrap(),
                     }
                 }
                 Ok(())
@@ -9337,7 +9279,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <pcp|status|inline|dispatch|batch|opt|min-instrs|min-calls|lockstep|flush>".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|batch|opt|min-instrs|min-calls|lockstep|flush>".to_string()); }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -9384,8 +9326,21 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 // keeping a separate one).
                                 #[cfg(not(feature = "lightning"))]
                                 {
-                                    if let Some(codegen) = exec.jitv2.lock().compile_queue.stop() {
-                                        *exec.jitv2.lock().codegen.lock() = Some(codegen);
+                                    // Lock `jitv2` ONCE for both stop() and the
+                                    // codegen hand-back. The previous form
+                                    // `if let Some(cg) = exec.jitv2.lock().compile_queue.stop() { *exec.jitv2.lock()... }`
+                                    // deadlocked: the first `.lock()` temporary
+                                    // in the `if let` scrutinee lives until the
+                                    // whole `if let` completes, so the inner
+                                    // `exec.jitv2.lock()` re-locked the same
+                                    // (non-reentrant) mutex — hanging the
+                                    // console thread the instant `j2 inline on`
+                                    // ran, before the CPU even started.
+                                    {
+                                        let mut jit = exec.jitv2.lock();
+                                        if let Some(codegen) = jit.compile_queue.stop() {
+                                            *jit.codegen.lock() = Some(codegen);
+                                        }
                                     }
                                     exec.jitv2_inline_compile = true;
                                     writeln!(writer, "j2 inline compile: on").unwrap();
@@ -9431,6 +9386,28 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 }
                             }
                             Some(_) => return Err("Usage: j2 dispatch [on|off]".to_string()),
+                        }
+                    }
+                    "fallback" => {
+                        // Interpreter-fallback region admission (analyzer's
+                        // FALLBACK_ENABLED global): when on, an unsupported
+                        // (Excluded) instruction is kept in a compiled region
+                        // as a fallback head run through the interpreter,
+                        // instead of ending the region. A process-global read
+                        // by the analyzer at compile time — already-compiled
+                        // regions are unaffected until re-compiled, so a `j2
+                        // flush` (CPU stopped) is required for the change to
+                        // take effect. Defaults off while the path is being
+                        // validated against live boots.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 fallback: {}", if crate::jitv2::analyzer::fallback_enabled() { "on" } else { "off" }).unwrap();
+                            }
+                            Some(on @ ("on" | "off")) => {
+                                crate::jitv2::analyzer::set_fallback_enabled(on == "on");
+                                writeln!(writer, "j2 fallback: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
+                            }
+                            Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
                         }
                     }
                     "batch" => {
@@ -9520,48 +9497,122 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     }
                     #[cfg(feature = "jitv2_lockstep")]
                     "lockstep" => {
-                        let class = actual_args.get(1).copied();
-                        let flag = match class {
-                            Some("alu") => &mut exec.lockstep_enabled.alu,
-                            Some("branch") => &mut exec.lockstep_enabled.branch,
-                            Some("loadstore") => &mut exec.lockstep_enabled.load_store,
-                            Some("fpu") => &mut exec.lockstep_enabled.fpu,
-                            None => {
-                                let e = exec.lockstep_enabled;
-                                writeln!(writer, "j2 lockstep: alu={} branch={} loadstore={} fpu={}",
-                                    if e.alu { "on" } else { "off" },
-                                    if e.branch { "on" } else { "off" },
-                                    if e.load_store { "on" } else { "off" },
-                                    if e.fpu { "on" } else { "off" }).unwrap();
-                                return Ok(());
+                        // Lockstep is not a runtime toggle anymore: if the build
+                        // has the jitv2_lockstep feature, every verifiable
+                        // (straight-line ALU/load-store/CP1) JIT instruction
+                        // self-checks against the interpreter, always — it's
+                        // driven from the JIT block itself. Kept as an
+                        // informational command.
+                        #[cfg(feature = "jitv2_lockstep")]
+                        writeln!(writer, "j2 lockstep: always on (built with jitv2_lockstep). Straight-line ALU/load-store/CP1 instructions self-check every dispatch; branch/jump not yet verified.").unwrap();
+                        #[cfg(not(feature = "jitv2_lockstep"))]
+                        writeln!(writer, "j2 lockstep: not built (rebuild with the jitv2_lockstep feature to enable).").unwrap();
+                    }
+                    "analyze" => {
+                        // Runs the REAL analyzer walk (Analyzer::walk_bounded,
+                        // the same one handle_request uses to decide what a
+                        // region actually contains) against live memory, and
+                        // prints every visited word with its disassembly and
+                        // classification — the static-analysis counterpart to
+                        // `j2 pcp` (which only shows what's already been
+                        // compiled/published). Built for exactly the kind of
+                        // question this session kept needing answered ad hoc
+                        // via temporary eprintln instrumentation: "starting
+                        // from this exact word, what does the walk include,
+                        // and why does it stop where it does" — now a
+                        // permanent, no-rebuild-required tool.
+                        //
+                        // Takes a PHYSICAL address, not virtual: translation
+                        // isn't always available (CPU stopped mid-exception,
+                        // page not currently TLB-mapped, or the address came
+                        // from a log/j2 pcp dump that already gives phys) —
+                        // reading via `sysad.read32` directly (the same
+                        // primitive `handle_request` itself uses) sidesteps
+                        // needing a live translation at all.
+                        if actual_args.len() < 2 {
+                            return Err("Usage: j2 analyze <phys_addr>".to_string());
+                        }
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let phys_addr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))? as u32;
+                        let entry_word = ((phys_addr & 0xFFF) >> 2) as u16;
+                        let page_base_phys = phys_addr & !0xFFFu32;
+
+                        let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
+                        for (i, w) in words.iter_mut().enumerate() {
+                            let a = page_base_phys + (i as u32) * 4;
+                            let r = exec.sysad.read32(a);
+                            if !r.is_ok() {
+                                return Err(format!("failed to read word at phys {:#010x} (offset {:#x} into page)", a, i * 4));
                             }
-                            Some(_) => return Err("Usage: j2 lockstep [<alu|branch|loadstore|fpu> [on|off]]".to_string()),
-                        };
-                        match actual_args.get(2).copied() {
-                            None => writeln!(writer, "j2 lockstep {}: {}", class.unwrap(), if *flag { "on" } else { "off" }).unwrap(),
-                            Some("on") => { *flag = true; writeln!(writer, "j2 lockstep {}: on", class.unwrap()).unwrap(); }
-                            Some("off") => { *flag = false; writeln!(writer, "j2 lockstep {}: off", class.unwrap()).unwrap(); }
-                            Some(_) => return Err("Usage: j2 lockstep <alu|branch|loadstore|fpu> [on|off]".to_string()),
+                            *w = r.data;
+                        }
+
+                        let (walked, non_empty) = exec.jitv2_inline_analyzer.walk_bounded(&words, entry_word, page_base_phys, usize::MAX);
+                        writeln!(writer, "analyze phys={:#010x}: page_base_phys={:#010x} entry_page_off={:#05x}", phys_addr, page_base_phys, entry_word * 4).unwrap();
+                        if !non_empty {
+                            writeln!(writer, "  region is EMPTY — entry word itself is Excluded with no emitter and fallback is off, or otherwise undispatchable").unwrap();
+                        } else {
+                            let visited: Vec<_> = crate::jitv2::analyzer::instrs_linear(walked).collect();
+                            writeln!(writer, "  {} instructions visited:", visited.len()).unwrap();
+                            for instr in &visited {
+                                let paddr = page_base_phys + (instr.word as u32) * 4;
+                                let dis = mips_dis::disassemble(instr.raw, paddr as u64, Some(&symbols));
+                                let mut tags = Vec::new();
+                                if instr.word == entry_word { tags.push("ENTRY"); }
+                                if instr.is_fallback { tags.push("fallback"); }
+                                if instr.is_branch_fallback_successor { tags.push("branch-fallback-successor"); }
+                                if instr.is_slot_only { tags.push("slot-only"); }
+                                let tag_str = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(",")) };
+                                let exits = match (instr.fallthrough_exit, instr.taken_exit) {
+                                    (None, None) => String::new(),
+                                    (ft, tk) => format!(" (fallthrough_exit={:?} taken_exit={:?})", ft, tk),
+                                };
+                                writeln!(writer, "    page_off={:#05x} phys={:#010x}: {:08x} {}{}{}", instr.word * 4, paddr, instr.raw, dis, tag_str, exits).unwrap();
+                            }
                         }
                     }
                     "pcp" => {
+                        // Optional address argument: inspect an arbitrary
+                        // page's compile state (e.g. "why does this function
+                        // never show up as JIT-tagged in dt") instead of only
+                        // whatever page execution is currently stopped on —
+                        // previously silently ignored (this whole command
+                        // took no arguments at all), which made it impossible
+                        // to check a page other than the live one.
+                        // actual_args[0] is "pcp" itself here (this arm is
+                        // already inside `match actual_args[0]`) — the
+                        // address, if given, is actual_args[1]. Passing [0]
+                        // here fed the literal string "pcp" to parse_cpu_arg,
+                        // which tried (and failed) to resolve it as a symbol
+                        // name — "Symbol not found: pcp" — found live.
+                        let explicit_addr = if let Some(&addr_arg) = actual_args.get(1) {
+                            let symbols_arc = exec.symbols.clone();
+                            let symbols = symbols_arc.lock();
+                            Some(parse_cpu_arg(addr_arg, &exec.core, Some(&symbols))?)
+                        } else {
+                            None
+                        };
                         // `self.pcp` is null whenever the CPU is stopped
                         // (`MipsCpu::stop()`'s `nanotlb_invalidate()` — see
                         // its own doc comment for why that invariant exists)
                         // — which is exactly when a developer is most likely
                         // to run this command. Rather than just reporting
                         // "nothing tracked," re-derive the page the same way
-                        // a real fetch would: translate the current PC with
+                        // a real fetch would: translate the target PC with
                         // `debug_translate` (side-effect-free — no TLB/nanotlb
                         // state touched) and look it up via `page_for`, which
                         // finds the existing pool entry if this PFN was ever
                         // seen before (the overwhelmingly common case here —
                         // we're inspecting whatever page execution just
-                        // stopped on) without disturbing `self.pcp` itself.
-                        let page_ptr = if !exec.pcp.is_null() {
+                        // stopped on, or an explicitly requested one) without
+                        // disturbing `self.pcp` itself. An explicit address
+                        // always re-derives (never trusts self.pcp, which
+                        // tracks a different page whenever one was asked for).
+                        let page_ptr = if explicit_addr.is_none() && !exec.pcp.is_null() {
                             exec.pcp
                         } else {
-                            let pc = exec.core.pc;
+                            let pc = explicit_addr.unwrap_or(exec.core.pc);
                             let result = exec.debug_translate(pc);
                             if result.is_exception() {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} doesn't translate.", pc).unwrap();
@@ -9589,11 +9640,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         // same `Jitv2::pages` pool under the same lock
                         // discipline, so the same reasoning applies to it.
                         let page = unsafe { &*page_ptr };
-                        let pc = exec.core.pc;
+                        let pc = explicit_addr.unwrap_or(exec.core.pc);
                         let entry_offset = ((pc & 0xFFF) >> 2) as usize;
 
                         writeln!(writer, "pfn={:#010x}  gen={}", page.pfn, page.current_gen()).unwrap();
-                        writeln!(writer, "pc={:#018x}  entry_offset={:#05x}", pc, entry_offset).unwrap();
+                        writeln!(writer, "pc={:#018x}  page_off={:#05x}", pc, entry_offset * 4).unwrap();
                         writeln!(
                             writer,
                             "  entry_offset: published={} entry_valid={} denylisted={}",
@@ -9630,16 +9681,17 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 let gen = page.entries[off].gen.load(Ordering::Relaxed);
                                 let stale = gen != page.current_gen();
                                 #[cfg(feature = "developer")]
-                                let dev_cols = format!(" instrs={} code_size={} calls={}",
+                                let dev_cols = format!(" instrs={} code_size={} calls={} in_blocks={}",
                                     page.entries[off].instr_count,
                                     page.entries[off].code_size,
-                                    page.entries[off].call_count.load(Ordering::Relaxed));
+                                    page.entries[off].call_count.load(Ordering::Relaxed),
+                                    page.entries[off].block_include_count.load(Ordering::Relaxed));
                                 #[cfg(not(feature = "developer"))]
                                 let dev_cols = String::new();
                                 writeln!(
                                     writer,
-                                    "    word={:#05x} vaddr={:#018x} func={:#014x} gen={}{}{}",
-                                    off, vaddr, func as usize, gen,
+                                    "    page_off={:#05x} vaddr={:#018x} func={:#014x} gen={}{}{}",
+                                    off * 4, vaddr, func as usize, gen,
                                     dev_cols,
                                     if stale { " STALE" } else { "" },
                                 ).unwrap();
@@ -9654,10 +9706,32 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 .collect();
                             if !by_calls.is_empty() {
                                 by_calls.sort_by(|a, b| b.1.cmp(&a.1));
-                                writeln!(writer, "  hottest entries (word, calls, instrs):").unwrap();
+                                writeln!(writer, "  hottest entries (page_off, calls, instrs):").unwrap();
                                 for &(off, calls, instrs) in by_calls.iter().take(16) {
                                     let vaddr = vbase | ((off as u64) * 4);
-                                    writeln!(writer, "    word={:#05x} vaddr={:#018x} calls={} instrs={}", off, vaddr, calls, instrs).unwrap();
+                                    writeln!(writer, "    page_off={:#05x} vaddr={:#018x} calls={} instrs={}", off * 4, vaddr, calls, instrs).unwrap();
+                                }
+                            }
+
+                            // Block-overlap: words included in more than one
+                            // compiled region (block_include_count > 1),
+                            // regardless of whether the word is itself a
+                            // published entry — a word pulled into several
+                            // overlapping blocks from different entry points
+                            // shows the redundant-recompilation cost of the
+                            // same straight-line code directly. Saturates at
+                            // 255 ("255+").
+                            let mut overlaps: Vec<(usize, u8)> = (0..crate::jitv2::ENTRIES_PER_PAGE)
+                                .map(|off| (off, page.entries[off].block_include_count.load(Ordering::Relaxed)))
+                                .filter(|&(_, n)| n > 1)
+                                .collect();
+                            if !overlaps.is_empty() {
+                                overlaps.sort_by(|a, b| b.1.cmp(&a.1));
+                                writeln!(writer, "  block overlap (page_off, times included in a block):").unwrap();
+                                for &(off, n) in overlaps.iter().take(32) {
+                                    let vaddr = vbase | ((off as u64) * 4);
+                                    let pegged = if n == u8::MAX { "+" } else { "" };
+                                    writeln!(writer, "    page_off={:#05x} vaddr={:#018x} in_blocks={}{}", off * 4, vaddr, n, pegged).unwrap();
                                 }
                             }
                         }
@@ -9672,7 +9746,28 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     "stats" | "status" => {
                         let jit = exec.jitv2.lock();
                         writeln!(writer, "pages: {} / {} used", jit.pages_used(), jit.capacity()).unwrap();
+                        // Report the EFFECTIVE inline state: jitv2_lockstep forces
+                        // it on regardless of the runtime field (see exec_decoded's
+                        // `inline_compile`), so printing the raw field would
+                        // misleadingly say "off" on a lockstep build that's
+                        // actually inline-compiling every region.
+                        #[cfg(feature = "jitv2_lockstep")]
+                        {
+                            writeln!(writer, "inline compile: on (forced by jitv2_lockstep)").unwrap();
+                            // Positive proof lockstep is actually verifying: this
+                            // counts real JIT-vs-interpreter compares. Stuck at 0
+                            // means the JIT never ran (nothing compiled) and
+                            // verification is silently OFF.
+                            let verified = crate::mips_exec::LOCKSTEP_VERIFICATIONS.load(Ordering::Relaxed);
+                            writeln!(writer, "lockstep: {} instructions verified (0 => NOT verifying — JIT not running)", verified).unwrap();
+                        }
+                        #[cfg(not(feature = "jitv2_lockstep"))]
                         writeln!(writer, "inline compile: {}", if exec.jitv2_inline_compile { "on" } else { "off" }).unwrap();
+                        #[cfg(feature = "developer")]
+                        {
+                            let dt_calls = crate::mips_exec::DEV_TRACE_BP_CALLS.load(Ordering::Relaxed);
+                            writeln!(writer, "dev trace hook: {} calls (0 => emit_dev_trace_bp never reached from compiled code)", dt_calls).unwrap();
+                        }
                         // Functions compiled into the shared Codegen's
                         // Cranelift arena since the last mega_flush — a
                         // diagnostic count only now; the actual flush trigger
@@ -9689,12 +9784,20 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 jit.compile_queue.function_count()).unwrap(),
                         }
                         {
-                            let reserved = jit.codegen.lock().as_ref().map(|c| c.packing_stats().1);
-                            if let Some(reserved) = reserved {
-                                writeln!(writer, "arena reserved: {} / {} bytes ({:.1}%) — real flush trigger",
+                            let stats = jit.codegen.lock().as_ref().map(|c| c.packing_stats());
+                            if let Some((used, reserved)) = stats {
+                                writeln!(writer, "arena reserved: {} / {} bytes ({:.1}%), used {} bytes ({:.1}% packing) — real flush trigger",
                                     reserved, crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES,
-                                    reserved as f64 * 100.0 / crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64).unwrap();
+                                    reserved as f64 * 100.0 / crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64,
+                                    used, if reserved == 0 { 0.0 } else { used as f64 * 100.0 / reserved as f64 }).unwrap();
                             }
+                            // Mega-flush count: each flush wipes ALL published
+                            // entries, forcing everything to recompile. A count
+                            // that keeps climbing during steady-state execution
+                            // is the arena-fill/flush/recompile death spiral —
+                            // the working set exceeds the arena threshold.
+                            let flushes = crate::jit_feedback::JIT_FEEDBACK.flush_events.load(Ordering::Relaxed);
+                            writeln!(writer, "mega-flushes (arena/pool wipes, each recompiles everything): {}", flushes).unwrap();
                         }
                         #[cfg(feature = "developer")]
                         {
@@ -9706,6 +9809,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             let kills = jit.stats.kill_entry_calls.load(Ordering::Relaxed);
                             writeln!(writer, "compiles: {} ok, {} failed (codegen gap or analyzer-excluded), {} kill_entry_fn bailouts (FR-mismatch)",
                                 compiles, failed, kills).unwrap();
+                            let fb_words = jit.stats.fallback_words.load(Ordering::Relaxed);
+                            let fb_regions = jit.stats.fallback_regions.load(Ordering::Relaxed);
+                            writeln!(writer, "fallback: {} interp-fallback words compiled across {} regions ({})",
+                                fb_words, fb_regions,
+                                if crate::jitv2::analyzer::fallback_enabled() { "j2 fallback: on" } else { "j2 fallback: off" }).unwrap();
                             if failed > 0 {
                                 writeln!(writer, "  rejections by reason:").unwrap();
                                 for reason in [
@@ -9818,7 +9926,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             }
                         }
                     }
-                    _ => return Err("Usage: j2 <pcp|status|inline [on|off]|dispatch [on|off]|batch [on|off]|opt [none|speed]|min-instrs [N]|min-calls [N]|lockstep|hugepages>".to_string()),
+                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|batch [on|off]|opt [none|speed]|min-instrs [N]|min-calls [N]|lockstep|hugepages>".to_string()),
                 }
                 Ok(())
             }
@@ -9866,7 +9974,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     for entry in &entries {
                         let sym_str = format_pc_symbol(entry.pc, &symbols);
                         let dis = mips_dis::disassemble(entry.instr, entry.pc, Some(&symbols));
-                        writeln!(w, "{:016x}{}: {:08x} {}", entry.pc, sym_str, entry.instr, dis).unwrap();
+                        // Origin tag: plain interpreter entries are unmarked (the
+                        // common case), every other arrival class gets its own
+                        // distinct tag (see InstrOrigin::tag) so exactly how an
+                        // instruction was reached — plain JIT body, entry word via
+                        // back-edge, inlined delay slot, fallback, fallback
+                        // successor (with or without back-edge) — stands out in
+                        // the trace instead of a single collapsed [jit] bit.
+                        writeln!(w, "{:#018x}{}: {:#010x} {}{}", entry.pc, sym_str, entry.instr, dis, entry.origin.tag()).unwrap();
                     }
                 };
                 if let Some(ref path) = file_path {

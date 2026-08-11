@@ -804,7 +804,7 @@ impl<TAG: Default + Copy, const SIZE: usize, const LINE: usize, const WAYS: usiz
 
 // Debug configuration - set to Some(phys_addr) to enable cache line tracking
 #[cfg(feature = "debug_cache")]
-const DEBUG_TRACK_ADDR: Option<u64> = Some(0x17fa5ee0);
+const DEBUG_TRACK_ADDR: Option<u64> = Some(0x080165d4);
 #[cfg(not(feature = "debug_cache"))]
 const DEBUG_TRACK_ADDR: Option<u64> = None;
 
@@ -1147,7 +1147,7 @@ impl R4000Cache {
         if tag.is_valid() {
             let phys_addr = l1_tag_to_phys(tag, (idx << ICache::LINE_SHIFT) as u64);
             if self.is_tracking_l1d(phys_addr) {
-                println!("[CACHE DEBUG] invalidate_l1i_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}",
+                println!("[CACHE DEBUG] invalidate_l1i_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}",
                          self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr());
             }
         }
@@ -1170,10 +1170,10 @@ impl R4000Cache {
         if self.is_tracking_l1d_idx(idx) {
             if tag.cs != L1D_CS_INVALID as u8 {
                 let phys_addr = l1d_tag_to_phys(tag, (idx << DCache::LINE_SHIFT) as u64);
-                println!("[CACHE DEBUG] invalidate_l1d_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}, cs={}, coherent={}",
+                println!("[CACHE DEBUG] invalidate_l1d_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}, cs={}, coherent={}",
                          self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr(), tag.cs, coherent);
             } else {
-                println!("[CACHE DEBUG] invalidate_l1d_line: idx={} (already invalid)", idx);
+                println!("[CACHE DEBUG] invalidate_l1d_line: idx=0x{:x} (already invalid)", idx);
             }
         }
 
@@ -1201,10 +1201,10 @@ impl R4000Cache {
         if self.is_tracking_l2_idx(idx) {
             if l2_tag.cs() != L2_CS_INVALID {
                 let phys_base = l2_tag_to_phys(l2_tag, (idx << L2Cache::LINE_SHIFT) as u64);
-                println!("[CACHE DEBUG] invalidate_l2_line: {} idx={}, phys_base=0x{:08x}, ptag=0x{:05x}, cs={}",
+                println!("[CACHE DEBUG] invalidate_l2_line: {} idx=0x{:x}, phys_base=0x{:08x}, ptag=0x{:05x}, cs={}",
                          self.tracking_label_l2_idx(idx), idx, phys_base, l2_tag.ptag(), l2_tag.cs());
             } else {
-                println!("[CACHE DEBUG] invalidate_l2_line: {} idx={} (already invalid)",
+                println!("[CACHE DEBUG] invalidate_l2_line: {} idx=0x{:x} (already invalid)",
                          self.tracking_label_l2_idx(idx), idx);
             }
         }
@@ -1320,7 +1320,7 @@ impl R4000Cache {
         {
             let l2_idx_check = self.l2.get_index(phys_addr);
             if self.is_tracking_l1d(phys_addr) || self.is_tracking_l2_idx(l2_idx_check) {
-                println!("[CACHE DEBUG] writeback_l1d_line: {} l1_idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}, DIRTY → L2",
+                println!("[CACHE DEBUG] writeback_l1d_line: {} l1_idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}, DIRTY → L2",
                          self.tracking_label(phys_addr), l1_idx, phys_addr, tag.line_addr());
             }
         }
@@ -1369,7 +1369,7 @@ impl R4000Cache {
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_l1d(phys_addr) || self.is_tracking_l2_idx(l2_idx) {
-                println!("[CACHE DEBUG] writeback_l1d_line: wrote {} chunks to L2 idx={} offset={}",
+                println!("[CACHE DEBUG] writeback_l1d_line: wrote {} chunks to L2 idx=0x{:x} offset=0x{:x}",
                          DCache::CHUNKS_PER_LINE, l2_idx, offset_in_l2_line);
                 for i in 0..DCache::CHUNKS_PER_LINE {
                     println!("    [{}] addr=0x{:08x} val=0x{:016x}",
@@ -1489,7 +1489,7 @@ impl R4000Cache {
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l2_idx(idx) {
-            println!("[CACHE DEBUG] writeback_l2_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:05x}, cs={}, WRITING TO MEMORY",
+            println!("[CACHE DEBUG] writeback_l2_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:05x}, cs={}, WRITING TO MEMORY",
                      self.tracking_label_l2_idx(idx), idx, phys_addr, tag.ptag(), cs);
             // Dump the L2 line data being written
             let l2_data = self.l2.data();
@@ -1645,7 +1645,7 @@ impl R4000Cache {
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l2_idx(l2_idx) {
-            println!("[CACHE DEBUG] fill_l2_line: {} line 0x{:08x}, idx={}, phys_addr=0x{:08x}, ptag=0x{:05x}, pidx={}",
+            println!("[CACHE DEBUG] fill_l2_line: {} line 0x{:08x}, idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:05x}, pidx={}",
                      self.tracking_label_l2_idx(l2_idx), line_base, l2_idx, phys_addr, ptag, pidx);
             println!("  L2 line data (16 x u64):");
             for i in 0..L2Cache::CHUNKS_PER_LINE {
@@ -1979,19 +1979,23 @@ impl MipsCache for R4000Cache {
     #[cfg(not(feature = "r5k"))]
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         #[cfg(feature = "debug_cache")]
-        {
+        let tracked = {
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] fetch: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}",
                          self.tracking_label(phys_addr), virt_addr, phys_addr);
+                true
             } else {
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
                     let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
-                    println!("[CACHE DEBUG] fetch (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}",
+                    println!("[CACHE DEBUG] fetch (L2 alias): idx=0x{:x}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}",
                              l2_idx, line_base, virt_addr, phys_addr);
+                    true
+                } else {
+                    false
                 }
             }
-        }
+        };
 
         let ic_idx = self.ic.get_index(virt_addr);
         let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
@@ -2012,6 +2016,12 @@ impl MipsCache for R4000Cache {
             // here — see the comment there for why fetch() must not take get_mut().
             let l2_slot_idx = ((phys_addr as usize) & (L2_CACHE_SIZE - 1)) >> 2;
             let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
+            #[cfg(feature = "debug_cache")]
+            if tracked {
+                let raw = unsafe { (*slot).raw };
+                println!("[CACHE DEBUG] fetch: virt 0x{:016x}, phys 0x{:016x} -> raw=0x{:08x}",
+                         virt_addr, phys_addr, raw);
+            }
             FetchInstrResult::hit(slot)
         }
     }
@@ -2076,7 +2086,7 @@ impl MipsCache for R4000Cache {
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
                     let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
-                    println!("[CACHE DEBUG] read (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, size {}",
+                    println!("[CACHE DEBUG] read (L2 alias): idx=0x{:x}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, size {}",
                              l2_idx, line_base, virt_addr, phys_addr, SIZE);
                 }
             }
@@ -2527,9 +2537,22 @@ impl MipsCache for R4000Cache {
         match cache_name {
             "l1i" => {
                 let set = self.ic.get_index(virt_addr);
-                let mut s = format!("L1-I probe virt 0x{:016x} phys 0x{:016x} set=0x{:x}\n", virt_addr, phys_addr, set);
                 let num_ways = ICache::NUM_LINES / (IC_SIZE / IC_LINE / IC_WAYS).max(1);
                 let sets_per_way = IC_SIZE / IC_LINE / num_ways.max(1);
+                // Compute the overall verdict up front (any way hitting is a
+                // HIT) so the very first line states it plainly — a per-way
+                // "<-- HIT"/nothing marker buried after several unrelated
+                // Way0/Way1 lines reads as "this line's data is what's here"
+                // even on a clean MISS, which is exactly backwards (found
+                // live: a MISS on an unrelated line was mistaken for a
+                // stale/corrupt line belonging to the probed address — the
+                // display never said MISS anywhere, just omitted the arrow).
+                let any_hit = (0..num_ways).any(|way| {
+                    let eidx = set + way * sets_per_way;
+                    self.ic.get_tag(eidx).matches_phys(phys_addr)
+                });
+                let mut s = format!("L1-I probe virt 0x{:016x} phys 0x{:016x} set=0x{:x}: {}\n",
+                    virt_addr, phys_addr, set, if any_hit { "HIT" } else { "MISS" });
                 for way in 0..num_ways {
                     let eidx = set + way * sets_per_way;
                     let tag: L1ITag = self.ic.get_tag(eidx);
@@ -2543,9 +2566,16 @@ impl MipsCache for R4000Cache {
             }
             "l1d" => {
                 let set = self.dc.get_index(virt_addr);
-                let mut s = format!("L1-D probe virt 0x{:016x} phys 0x{:016x} set=0x{:x}\n", virt_addr, phys_addr, set);
                 let num_ways = DCache::NUM_LINES / (DC_SIZE / DC_LINE / DC_WAYS).max(1);
                 let sets_per_way = DC_SIZE / DC_LINE / num_ways.max(1);
+                // See l1i's own comment above — same "state the verdict up
+                // front" fix.
+                let any_hit = (0..num_ways).any(|way| {
+                    let eidx = set + way * sets_per_way;
+                    self.dc.get_tag(eidx).matches_phys(phys_addr)
+                });
+                let mut s = format!("L1-D probe virt 0x{:016x} phys 0x{:016x} set=0x{:x}: {}\n",
+                    virt_addr, phys_addr, set, if any_hit { "HIT" } else { "MISS" });
                 for way in 0..num_ways {
                     let eidx = set + way * sets_per_way;
                     let tag: L1DTag = self.dc.get_tag(eidx);

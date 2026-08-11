@@ -118,14 +118,9 @@ mod tests {
         // state entirely and must be disabled at the executor level.
         #[cfg(feature = "jitv2")]
         {
+            // Disables the whole JIT dispatch gate, which is what drives
+            // lockstep now — so this alone keeps jitv2/lockstep out.
             exec.jitv2_dispatch_enabled = false;
-            #[cfg(feature = "jitv2_lockstep")]
-            {
-                exec.lockstep_enabled.alu = false;
-                exec.lockstep_enabled.branch = false;
-                exec.lockstep_enabled.load_store = false;
-                exec.lockstep_enabled.fpu = false;
-            }
         }
         (exec, mem)
     }

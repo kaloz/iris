@@ -184,7 +184,23 @@ pub fn handle_request(
             let code_size = 0;
             page.publish(offset, jit_fn as *const (), gen_snap, instr_count, code_size);
             #[cfg(feature = "developer")]
-            stats.compiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                // Per-word block-overlap diagnostic (j2 pcp): every word this
+                // region visited gets its saturating include-count bumped, so
+                // a word covered by several overlapping regions reads high.
+                // Also count fallback words / regions (j2 status) — the direct
+                // confirmation that the fallback path actually ran.
+                let mut fb = 0u64;
+                for instr in crate::jitv2::analyzer::instrs_linear(&instrs_owned) {
+                    page.note_block_include(instr.word as usize);
+                    if instr.is_fallback { fb += 1; }
+                }
+                if fb > 0 {
+                    stats.fallback_words.fetch_add(fb, std::sync::atomic::Ordering::Relaxed);
+                    stats.fallback_regions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                stats.compiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         None if codegen.last_compile_ran_out_of_memory() => {
             // Not a real decline — the offset is perfectly compilable, the
@@ -311,6 +327,17 @@ pub fn handle_request_deferred(
             #[cfg(not(feature = "developer"))]
             let code_size = 0;
             pending.push(PendingPublish { page: req.page, offset, func_id, gen_snap, instr_count, code_size });
+            #[cfg(feature = "developer")]
+            {
+                // Per-word block-overlap diagnostic (j2 pcp) — counted at
+                // compile time, same as the immediate path, regardless of the
+                // deferred publish. Safe to touch `page` here: publish itself
+                // is deferred, but the include-count is an independent
+                // diagnostic field with no gen/validity contract.
+                for instr in crate::jitv2::analyzer::instrs_linear(&instrs_owned) {
+                    page.note_block_include(instr.word as usize);
+                }
+            }
         }
         None if codegen.last_compile_ran_out_of_memory() => {
             #[cfg(feature = "developer")]
@@ -429,16 +456,21 @@ mod tests {
         fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { std::ptr::null() }
     }
 
-    /// Every word decodes as `SYSCALL` (§4.4 excluded instruction) — used to
-    /// exercise `handle_request`'s denylist exit path deterministically.
-    struct SyscallDevice;
-    impl BusDevice for SyscallDevice {
+    /// Every word decodes as the JIT region-boundary sentinel — a genuine
+    /// zero-instruction region (analyzer `Classify::RegionBoundary`), used to
+    /// exercise `handle_request`'s denylist exit path deterministically. (An
+    /// excluded instruction like SYSCALL no longer works for this: with
+    /// interpreter-fallback it's kept in the region as a fallback head and
+    /// compiles/publishes successfully rather than denylisting — the sentinel is
+    /// now the only thing that reliably yields an empty region.)
+    struct BoundaryDevice;
+    impl BusDevice for BoundaryDevice {
         fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
         fn write8(&self, _addr: u32, _val: u8) -> u32 { BUS_ERR }
         fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
         fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
         fn read32(&self, _addr: u32) -> BusRead32 {
-            BusRead32::ok((OP_SPECIAL << 26) | crate::mips_isa::FUNCT_SYSCALL)
+            BusRead32::ok(crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
         }
         fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
         fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
@@ -533,10 +565,11 @@ mod tests {
             assert!(page.try_schedule(4), "scheduled bit must be cleared after a successful publish, so a future recompile request isn't blocked");
         }
 
-        // Outcome 2: sticky-denylisted (SYSCALL is an excluded instruction,
-        // §4.4 — entering directly on one yields a zero-instruction region).
+        // Outcome 2: sticky-denylisted (the region-boundary sentinel yields a
+        // zero-instruction region — the only reliable empty-region case now
+        // that excluded instructions compile as interpreter-fallback heads).
         {
-            let bus: Arc<dyn BusDevice> = Arc::new(SyscallDevice);
+            let bus: Arc<dyn BusDevice> = Arc::new(BoundaryDevice);
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             assert!(page.try_schedule(0));
             let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 0, compiled_for_fr1: true };
@@ -624,8 +657,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_deferred_denylists_excluded_entry_without_accumulating() {
-        let bus: Arc<dyn BusDevice> = Arc::new(SyscallDevice);
+    fn handle_request_deferred_denylists_empty_region_entry_without_accumulating() {
+        let bus: Arc<dyn BusDevice> = Arc::new(BoundaryDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 0, compiled_for_fr1: true };
@@ -635,7 +668,7 @@ mod tests {
         let mut pending = Vec::new();
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
-        assert!(pending.is_empty(), "an excluded entry produces no FuncId to defer");
+        assert!(pending.is_empty(), "an empty-region (boundary) entry produces no FuncId to defer");
         assert!(page.is_denylisted(0));
     }
 

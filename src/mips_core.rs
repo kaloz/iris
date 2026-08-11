@@ -377,9 +377,38 @@ pub struct MipsCore {
     /// not just this one dispatch — killing it means the next visit gets a
     /// genuine fresh compile against whatever FR mode is actually live then,
     /// instead of this exact same stale function being dispatched and
-    /// bailing again on every future visit.
+    /// bailing again on every future visit. `u32`, not `u16` (the real value
+    /// range) — a sub-32-bit `extern "C"` param isn't reliably zero-extended
+    /// by every caller/ABI; see `dev_trace_bp_fn`'s doc comment for the live
+    /// bug this class of mistake already caused once in this same file.
     #[cfg(feature = "jitv2")]
-    pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u16),
+    pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
+    /// Developer-only per-instruction hook, called by compiled code at the top
+    /// of every instruction's block (right where the interrupt preamble runs —
+    /// `codegen::emit_dev_trace_bp`), with the synthesized `pc`/`raw` and an
+    /// `origin` code (`mips_exec::InstrOrigin as u32`, a compile-time constant
+    /// each codegen call site passes for its own case — plain body, entry
+    /// word via back-edge, inlined delay slot, fallback successor, etc.).
+    /// Deliberately `u32`, not `u8`: a sub-32-bit `extern "C"` param isn't
+    /// guaranteed zero/sign-extended by the caller on every ABI, and this
+    /// codebase has already been bitten by that exact class of bug for
+    /// narrow write-values crossing this same kind of call — every hook
+    /// signature in this file uses `u32`+ for that reason, this one included
+    /// (was `u8`, silently read back wrong — the origin tag never showed up
+    /// in `dt` on a live boot despite the hook demonstrably firing millions
+    /// of times per `j2 stats`'s `dev trace hook` counter).
+    /// Records the traceback entry tagged with that origin and the trace-file
+    /// record, and checks PC breakpoints — restoring the per-instruction
+    /// `dt`/breakpoint visibility the interpreter's `step()` has but a
+    /// compiled region otherwise runs straight through. Returns
+    /// `EXEC_BREAKPOINT` if a breakpoint fired at `pc` (compiled code then
+    /// bails to the exit with that status, stopping *before* the instruction
+    /// executes, `core.pc` already at it so resume works), else
+    /// `EXEC_COMPLETE`. Only emitted/installed under `developer` (a plain
+    /// release/`lightning` build never pays for it); the not-installed sentinel
+    /// panics if ever reached without `install_jit_hooks`.
+    #[cfg(all(feature = "jitv2", feature = "developer"))]
+    pub dev_trace_bp_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32, u32) -> u32,
     /// Scratch: exception status from the most recent `read*_fn`/`write*_fn`
     /// call (`EXEC_COMPLETE` i.e. 0 = no fault). See the read-wrapper fields'
     /// doc comment above for the full contract.
@@ -444,6 +473,33 @@ pub struct MipsCore {
     /// behavior a direct JIT test expects today.
     #[cfg(feature = "jitv2_lockstep")]
     pub lockstep_mem: Option<LockstepMemCapture>,
+    /// Inline per-instruction lockstep: called by compiled code at the *start*
+    /// of every JIT instruction (`codegen::emit_lockstep_step`), with the
+    /// synthesized `pc`/`raw`/`bd` for that instruction. It sets `core.pc`/
+    /// `in_delay_slot` to those, snapshots the pre-instruction state, runs the
+    /// instruction once through the real interpreter handler (committing any
+    /// memory side effect and capturing it in `lockstep_mem`), stashes the
+    /// interpreter's resulting state for the later compare, then restores the
+    /// pre-instruction state so the JIT can run the same instruction for real
+    /// against identical inputs. See `MipsExecutor::jit_lockstep_step`. `bd`
+    /// is `u32`, not `u8`, despite only ever holding 0/1/`LOCKSTEP_BD_LIVE`
+    /// (0xFF) — a sub-32-bit `extern "C"` param isn't reliably zero-extended
+    /// by every caller/ABI (see `dev_trace_bp_fn`'s doc comment for the
+    /// exact live bug this class of mistake already caused once in this same
+    /// file).
+    #[cfg(feature = "jitv2_lockstep")]
+    pub lockstep_step_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32, u32),
+    /// Inline per-instruction lockstep: called by compiled code at the *end* of
+    /// every JIT instruction (`codegen::emit_lockstep_compare`), after the JIT
+    /// ran the instruction's own semantics. Compares the JIT's now-current
+    /// state against the interpreter result `lockstep_step_fn` stashed and
+    /// panics on any divergence. Because the lockstep build makes the JIT
+    /// materialize `core.pc` per instruction (start = pc, end = pc+4 or the
+    /// branch's own target write), the pc/delay-slot compare is direct — no
+    /// branch/slot-model reconciliation needed. See
+    /// `MipsExecutor::jit_lockstep_compare`.
+    #[cfg(feature = "jitv2_lockstep")]
+    pub lockstep_compare_fn: unsafe extern "C" fn(*mut core::ffi::c_void) -> u32,
     /// Set whenever PC is about to land on an offset that is a legitimate
     /// branch/jump target — the compile-worthiness signal `exec_decoded`'s
     /// JIT dispatch gate checks alongside the offset-4/valid-bit conditions
@@ -686,9 +742,28 @@ unsafe extern "C" fn jit_hooks_not_installed_interp_fallback(_ctx: *mut core::ff
     panic!("jitv2: interp_fallback hook called before MipsExecutor::install_jit_hooks");
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_hooks_not_installed_kill_entry(_ctx: *mut core::ffi::c_void, _offset: u16) {
+unsafe extern "C" fn jit_hooks_not_installed_kill_entry(_ctx: *mut core::ffi::c_void, _offset: u32) {
     panic!("jitv2: kill_entry hook called before MipsExecutor::install_jit_hooks");
 }
+/// Unlike the other not-installed sentinels (which panic — reaching them means
+/// a real correctness hook was skipped), the dev trace/breakpoint hook is pure
+/// diagnostics: a bare codegen unit test that compiles and runs a `jit_fn`
+/// without `install_jit_hooks` legitimately has no traceback/breakpoint state
+/// to touch, so the sentinel is a harmless no-op (return EXEC_COMPLETE = "no
+/// breakpoint") rather than an abort.
+#[cfg(all(feature = "jitv2", feature = "developer"))]
+unsafe extern "C" fn jit_hooks_not_installed_dev_trace_bp(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _origin: u32) -> u32 {
+    crate::mips_exec::EXEC_COMPLETE
+}
+/// No-op (not a panic) like the dev-hook sentinel: lockstep is pure
+/// verification, and a bare codegen unit test that runs a `jit_fn` without
+/// `install_jit_hooks` has no executor/interpreter to compare against — the
+/// compiled code just runs normally, unverified, exactly as a plain jitv2
+/// build would. (A real lockstep run always installs hooks.)
+#[cfg(feature = "jitv2_lockstep")]
+unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _bd: u32) {}
+#[cfg(feature = "jitv2_lockstep")]
+unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::mips_exec::EXEC_COMPLETE }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_get_status(_ctx: *mut core::ffi::c_void) -> u32 {
     panic!("jitv2: fpu_get_status hook called before MipsExecutor::install_jit_hooks");
@@ -767,6 +842,8 @@ impl MipsCore {
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
             #[cfg(feature = "jitv2")]
             kill_entry_fn: jit_hooks_not_installed_kill_entry,
+            #[cfg(all(feature = "jitv2", feature = "developer"))]
+            dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
             #[cfg(feature = "jitv2")]
             jit_mem_exc: 0,
             #[cfg(feature = "jitv2")]
@@ -775,6 +852,10 @@ impl MipsCore {
             fpu_clear_status_fn: jit_hooks_not_installed_fpu_clear_status,
             #[cfg(feature = "jitv2")]
             fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,
+            #[cfg(feature = "jitv2_lockstep")]
+            lockstep_step_fn: jit_hooks_not_installed_lockstep_step,
+            #[cfg(feature = "jitv2_lockstep")]
+            lockstep_compare_fn: jit_hooks_not_installed_lockstep_compare,
             #[cfg(feature = "jitv2_lockstep")]
             lockstep_mem: None,
             #[cfg(feature = "jitv2")]

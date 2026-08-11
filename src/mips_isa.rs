@@ -61,6 +61,20 @@ pub const OP_SDC1: u32 = 0x3D;
 pub const OP_SDC2: u32 = 0x3E;
 pub const OP_SD: u32 = 0x3F; // MIPS III
 
+/// JIT region-boundary sentinel — a reserved primary opcode (0x1E, unused by
+/// the R4000 and by this emulator's decoder) with a distinctive low pattern,
+/// recognized by the jitv2 analyzer (`classify` -> `Classify::RegionBoundary`)
+/// as a hard region end: never visited, never compiled, never run through the
+/// interpreter fallback. Exists so tests (and corpus tooling) that need a
+/// deterministic, zero-side-effect, no-delay-slot region terminator have one —
+/// now that ordinary unsupported/`Excluded` instructions are kept in the region
+/// as interpreter-fallback heads (`CompiledInstr::is_fallback`) instead of
+/// ending it. The interpreter would treat this word as a Reserved Instruction
+/// (exec_reserved) if it ever actually executed it, but a correct region never
+/// reaches it: the analyzer stops the walk at the predecessor's edge, exactly
+/// as it used to for `Excluded` words before fallback existed.
+pub const JIT_REGION_BOUNDARY_SENTINEL: u32 = 0x7800_0B0B;
+
 // SPECIAL Function Codes (FUNCT) - Bits 5..0
 pub const FUNCT_SLL: u32 = 0x00;
 pub const FUNCT_MOVCI: u32 = 0x01; // MIPS IV (MOVCI)
