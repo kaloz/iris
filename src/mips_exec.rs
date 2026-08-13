@@ -2235,6 +2235,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 let d = unsafe { &mut *slot };
                 if d.flags != 0 {
                     decode_into::<T, C>(d);
+                    #[cfg(feature = "instr_stats")]
+                    self.instr_stats.record_decode(d.op, d.rs, d.rt, d.funct);
                 } else {
                     #[cfg(feature = "developer")]
                     self.decoded_count.fetch_add(1, Ordering::Relaxed);
@@ -8144,7 +8146,28 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         #[cfg(feature = "tlbstats")]
         self.executor.lock().tlb.stats_print();
         #[cfg(feature = "instr_stats")]
-        self.executor.lock().instr_stats.print();
+        {
+            let exec = self.executor.lock();
+            exec.instr_stats.print();
+            // Diffable dumps: plain used-instruction list and mnemonic-sorted counts,
+            // written alongside the stderr report so two runs' coverage/frequency can be
+            // compared with a plain `diff` (write_report's stderr output is sorted by
+            // frequency, which reorders on every run and isn't diff-friendly).
+            match std::fs::File::create("instr_used.txt") {
+                Ok(f) => {
+                    let mut w = std::io::BufWriter::new(f);
+                    let _ = exec.instr_stats.write_used_list(&mut w);
+                }
+                Err(e) => eprintln!("instr_stats: cannot open instr_used.txt: {}", e),
+            }
+            match std::fs::File::create("instr_counts.txt") {
+                Ok(f) => {
+                    let mut w = std::io::BufWriter::new(f);
+                    let _ = exec.instr_stats.write_counts(&mut w);
+                }
+                Err(e) => eprintln!("instr_stats: cannot open instr_counts.txt: {}", e),
+            }
+        }
         #[cfg(feature = "jitv2")]
         {
             let mut exec = self.executor.lock();
@@ -8381,7 +8404,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
             ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
             #[cfg(feature = "instr_stats")]
-            ("instrstats".to_string(), "Per-instruction execution frequency counters: instrstats [report|clear] [DEV]".to_string()),
+            ("instrstats".to_string(), "Per-instruction decode/execution counters: instrstats [report|clear|dump] [DEV]".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
@@ -8391,7 +8414,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 flush | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -9279,7 +9302,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|batch|opt|min-instrs|min-calls|lockstep|flush>".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|alu|fpu|branch|loadstore|cop0|batch|opt|min-instrs|min-calls|lockstep|flush>".to_string()); }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -9409,6 +9432,53 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             }
                             Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
                         }
+                    }
+                    cat @ ("alu" | "fpu" | "branch" | "loadstore" | "cop0") => {
+                        // Category gate: bulk on/off over opcode_support's per-InstrKind
+                        // runtime enable table (ENABLED) — every InstrKind whose category()
+                        // intersects this one gets set together. Same underlying table a
+                        // future `j2 instr <name> [on|off]` will flip one bit of; disabling
+                        // a whole category and then re-enabling one instruction under test
+                        // composes naturally since there's only ever one table. Same
+                        // process-global-read-at-compile-time contract as `j2 fallback`:
+                        // already-compiled regions are unaffected until a `j2 flush`. Useful
+                        // for bisecting a live-boot divergence into one functional unit
+                        // before narrowing further.
+                        let bit = match cat {
+                            "alu" => crate::mips_instr_stats::InstrCategory::ALU,
+                            "fpu" => crate::mips_instr_stats::InstrCategory::FPU,
+                            "branch" => crate::mips_instr_stats::InstrCategory::BRANCH,
+                            "loadstore" => crate::mips_instr_stats::InstrCategory::LOADSTORE,
+                            "cop0" => crate::mips_instr_stats::InstrCategory::COP0,
+                            _ => unreachable!(),
+                        };
+                        match actual_args.get(1).copied() {
+                            None => {
+                                let on = crate::jitv2::opcode_support::category_enabled(bit);
+                                writeln!(writer, "j2 {}: {}", cat, if on { "on" } else { "off" }).unwrap();
+                            }
+                            Some(on @ ("on" | "off")) => {
+                                crate::jitv2::opcode_support::set_category_enabled(bit, on == "on");
+                                writeln!(writer, "j2 {}: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", cat, on).unwrap();
+                            }
+                            Some(_) => return Err(format!("Usage: j2 {} [on|off]", cat)),
+                        }
+                    }
+                    "instrs" => {
+                        // Inspection dump for the per-instruction toggle table above —
+                        // without this there's no way to see which instructions are
+                        // currently enabled/disabled short of reading the source, which
+                        // defeats the point of a runtime bisection tool.
+                        let filter = match actual_args.get(1).copied() {
+                            None => None,
+                            Some("alu") => Some(crate::mips_instr_stats::InstrCategory::ALU),
+                            Some("fpu") => Some(crate::mips_instr_stats::InstrCategory::FPU),
+                            Some("branch") => Some(crate::mips_instr_stats::InstrCategory::BRANCH),
+                            Some("loadstore") => Some(crate::mips_instr_stats::InstrCategory::LOADSTORE),
+                            Some("cop0") => Some(crate::mips_instr_stats::InstrCategory::COP0),
+                            Some(_) => return Err("Usage: j2 instrs [alu|fpu|branch|loadstore|cop0]".to_string()),
+                        };
+                        let _ = crate::jitv2::opcode_support::write_status(&mut writer, filter);
                     }
                     "batch" => {
                         // Only meaningful for the async compile-queue
@@ -10032,7 +10102,24 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         exec.instr_stats.clear();
                         writeln!(writer, "instrstats: counters cleared").unwrap();
                     }
-                    _ => return Err("Usage: instrstats [report | clear]".to_string()),
+                    "dump" => {
+                        match std::fs::File::create("instr_used.txt") {
+                            Ok(f) => {
+                                let mut w = std::io::BufWriter::new(f);
+                                let _ = exec.instr_stats.write_used_list(&mut w);
+                            }
+                            Err(e) => return Err(format!("Cannot open instr_used.txt: {}", e)),
+                        }
+                        match std::fs::File::create("instr_counts.txt") {
+                            Ok(f) => {
+                                let mut w = std::io::BufWriter::new(f);
+                                let _ = exec.instr_stats.write_counts(&mut w);
+                            }
+                            Err(e) => return Err(format!("Cannot open instr_counts.txt: {}", e)),
+                        }
+                        writeln!(writer, "instrstats: wrote instr_used.txt, instr_counts.txt").unwrap();
+                    }
+                    _ => return Err("Usage: instrstats [report | clear | dump]".to_string()),
                 }
                 Ok(())
             }

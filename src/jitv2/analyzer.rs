@@ -145,13 +145,13 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
 
     match op {
         OP_SPECIAL => match funct {
-            FUNCT_JR | FUNCT_JALR => Classify::RegJump,
+            FUNCT_JR | FUNCT_JALR => branch_category_gate(raw, Classify::RegJump),
             FUNCT_SYSCALL | FUNCT_BREAK => Classify::Excluded,
             _ => sequential_or_excluded(raw),
         },
         OP_REGIMM => match rt {
             RT_BLTZ | RT_BGEZ | RT_BLTZL | RT_BGEZL | RT_BLTZAL | RT_BGEZAL
-            | RT_BLTZALL | RT_BGEZALL => branch_target(raw, offset_word),
+            | RT_BLTZALL | RT_BGEZALL => branch_category_gate(raw, branch_target(raw, offset_word)),
             // Trap-immediate REGIMM variants (TGEI/TGEIU/TLTI/TLTIU/TEQI/TNEI):
             // no unresolved control flow either way (they either trap —
             // exception, out of scope for reachability — or fall through),
@@ -160,9 +160,9 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
             // through sequential_or_excluded.
             _ => sequential_or_excluded(raw),
         },
-        OP_J | OP_JAL => jump_target(),
+        OP_J | OP_JAL => branch_category_gate(raw, jump_target()),
         OP_BEQ | OP_BNE | OP_BLEZ | OP_BGTZ
-        | OP_BEQL | OP_BNEL | OP_BLEZL | OP_BGTZL => branch_target(raw, offset_word),
+        | OP_BEQL | OP_BNEL | OP_BLEZL | OP_BGTZL => branch_category_gate(raw, branch_target(raw, offset_word)),
         OP_COP0 => Classify::Excluded, // MFC0/MTC0/CFC0/CTC0/TLB*/ERET/WAIT all live under COP0
         // CP1 arithmetic/move/compare ops are plain data-flow (moves, add/sub/
         // mul/div/sqrt/convert/compare) — no unresolved control flow, so
@@ -231,6 +231,28 @@ pub fn is_fallback_branch(raw: u32) -> bool {
 fn sequential_or_excluded(raw: u32) -> Classify {
     if crate::jitv2::opcode_support::has_emitter(raw) {
         Classify::Sequential
+    } else {
+        Classify::Excluded
+    }
+}
+
+/// Runtime-toggle gate for the `Branch`/`Jump`/`RegJump` arms: these never
+/// call `has_emitter` (they're resolved by `classify`'s own construction,
+/// not an emitter-coverage lookup), so `j2 branch [on|off]` /
+/// `j2 <instr> [on|off]` would otherwise never apply to them.
+/// `already_classified` is whatever `classify` already computed
+/// (`Branch { target }`/`Jump { target }`/`RegJump`); this only downgrades
+/// it to `Excluded` when `raw`'s `InstrKind` is currently disabled in
+/// `opcode_support`'s per-instruction table — same "clean region boundary
+/// instead of poisoning the region" contract as `sequential_or_excluded`.
+fn branch_category_gate(raw: u32, already_classified: Classify) -> Classify {
+    let op = (raw >> 26) & 0x3F;
+    let rs = (raw >> 21) & 0x1F;
+    let rt = (raw >> 16) & 0x1F;
+    let funct = raw & 0x3F;
+    let kind = crate::mips_instr_stats::classify_instr(op as u8, rs as u8, rt as u8, funct as u8);
+    if crate::jitv2::opcode_support::instr_enabled(kind) {
+        already_classified
     } else {
         Classify::Excluded
     }

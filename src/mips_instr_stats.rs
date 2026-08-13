@@ -1,10 +1,15 @@
-// Per-instruction execution frequency counters (feature = "instr_stats").
+// Per-instruction identity map: classifies every decoded MIPS instruction
+// into a flat `InstrKind` enum. `InstrKind`/`classify_instr`/`IsaClass`
+// compile unconditionally — jitv2's `opcode_support.rs` depends on them to
+// answer "does codegen have an emitter for this instruction's category"
+// without needing the `instr_stats` feature.
 //
-// Purely diagnostic: classifies each decoded instruction into an `InstrKind`
-// and bumps a `u64` counter. Used to investigate MIPS IV instruction usage in
-// Nekoware MIPS4-ISA builds (Firefox/SeaMonkey) that run correctly in MAME but
-// misbehave here — the working assumption is that our MIPS III emulation is
-// solid and the bug is in a MIPS IV instruction (COP1X, MOVCI/MOVZ/MOVN,
+// `InstrStats` (the actual counters + exit-time report) stays behind
+// `#[cfg(feature = "instr_stats")]`: purely diagnostic, intrusive on the hot
+// path. Originally built to investigate MIPS IV instruction usage in
+// Nekoware MIPS4-ISA builds (Firefox/SeaMonkey) that ran correctly in MAME
+// but misbehaved here — the working assumption was that MIPS III emulation
+// was solid and the bug was in a MIPS IV instruction (COP1X, MOVCI/MOVZ/MOVN,
 // FMOVZ/FMOVN/FMOVCF, PREFX, paired-single, etc).
 //
 // Classification mirrors `decode_into` in mips_exec.rs field-for-field, but
@@ -112,6 +117,50 @@ impl IsaClass {
     }
 }
 
+/// Coarse functional-unit bitmask (ALU/FPU/branch/load-store/COP0), orthogonal to
+/// [`IsaClass`]'s "which MIPS generation" axis. A plain `u32` bitmask (not the `bitflags`
+/// crate — not a dependency here) so a caller can OR bits together or test membership in
+/// several categories with one comparison, e.g. jitv2 gating logic reasoning about "is this
+/// whole category supported" independent of the fine-grained per-instruction
+/// [`InstrKind::has_jitv2_emitter`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrCategory(u32);
+
+impl InstrCategory {
+    pub const NONE: InstrCategory = InstrCategory(0);
+    pub const ALU: InstrCategory = InstrCategory(1 << 0);
+    pub const FPU: InstrCategory = InstrCategory(1 << 1);
+    pub const BRANCH: InstrCategory = InstrCategory(1 << 2);
+    pub const LOADSTORE: InstrCategory = InstrCategory(1 << 3);
+    pub const COP0: InstrCategory = InstrCategory(1 << 4);
+    pub const ALL: InstrCategory = InstrCategory(
+        Self::ALU.0 | Self::FPU.0 | Self::BRANCH.0 | Self::LOADSTORE.0 | Self::COP0.0
+    );
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn from_bits_truncate(bits: u32) -> InstrCategory {
+        InstrCategory(bits & (Self::ALU.0 | Self::FPU.0 | Self::BRANCH.0 | Self::LOADSTORE.0 | Self::COP0.0))
+    }
+
+    pub const fn contains(self, other: InstrCategory) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn intersects(self, other: InstrCategory) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+impl std::ops::BitOr for InstrCategory {
+    type Output = InstrCategory;
+    fn bitor(self, rhs: InstrCategory) -> InstrCategory {
+        InstrCategory(self.0 | rhs.0)
+    }
+}
+
 impl InstrKind {
     /// Classify into the ISA/functional bucket used for the frequency report.
     pub fn isa_class(self) -> IsaClass {
@@ -145,6 +194,122 @@ impl InstrKind {
             // Everything else: MIPS I/II baseline (integer, branch, load/store, basic FPU)
             _ => IsaClass::Mips12,
         }
+    }
+
+    /// Coarse functional-unit bucket (ALU/FPU/branch/load-store/COP0/other), as a bitmask
+    /// so a caller can test membership in several buckets at once (e.g. jitv2 gating logic
+    /// that wants "ALU or load-store" as one check). This is a coarser, orthogonal axis to
+    /// [`InstrKind::isa_class`] (which buckets by MIPS ISA generation, not functional unit) —
+    /// e.g. `Dadd` is `IsaClass::Mips3` and `InstrCategory::ALU` at the same time.
+    pub fn category(self) -> InstrCategory {
+        use InstrKind::*;
+        match self {
+            Reserved => InstrCategory::NONE,
+
+            Nop | Syscall | Break | Sync => InstrCategory::ALU,
+
+            Jr | Jalr => InstrCategory::BRANCH,
+            Bltz | Bgez | Bltzl | Bgezl | Bltzal | Bgezal | Bltzall | Bgezall
+            | J | Jal | Beq | Bne | Blez | Bgtz | Beql | Bnel | Blezl | Bgtzl => InstrCategory::BRANCH,
+
+            Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Tlbr | Tlbwi | Tlbwr | Tlbp | Eret => InstrCategory::COP0,
+
+            Mfc1 | Dmfc1 | Cfc1 | Mtc1 | Dmtc1 | Ctc1 | Bc1
+            | Fadd_s | Fsub_s | Fmul_s | Fdiv_s | Fsqrt_s | Fabs_s | Fmov_s | Fneg_s
+            | Fround_l_s | Ftrunc_l_s | Fceil_l_s | Ffloor_l_s
+            | Fround_w_s | Ftrunc_w_s | Fceil_w_s | Ffloor_w_s
+            | Fmovcf_s | Fmovz_s | Fmovn_s | Frecip_s | Frsqrt_s
+            | Fcvt_d_s | Fcvt_w_s | Fcvt_l_s | Fcc_s
+            | Fadd_d | Fsub_d | Fmul_d | Fdiv_d | Fsqrt_d | Fabs_d | Fmov_d | Fneg_d
+            | Fround_l_d | Ftrunc_l_d | Fceil_l_d | Ffloor_l_d
+            | Fround_w_d | Ftrunc_w_d | Fceil_w_d | Ffloor_w_d
+            | Fmovcf_d | Fmovz_d | Fmovn_d | Frecip_d | Frsqrt_d
+            | Fcvt_s_d | Fcvt_w_d | Fcvt_l_d | Fcc_d
+            | Fcvt_s_w | Fcvt_d_w | Fcvt_s_l | Fcvt_d_l
+            | Madd_s | Madd_d | Msub_s | Msub_d | Nmadd_s | Nmadd_d | Nmsub_s | Nmsub_d
+                => InstrCategory::FPU,
+
+            Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu
+            | Sb | Sh | Swl | Sw | Sdl | Sdr | Swr | Cache
+            | Ll | Ldl | Ldr | Ld | Sc | Sd | Pref | Lld | Scd
+                => InstrCategory::LOADSTORE,
+            // FPU loads/stores: both a memory op and CP1-adjacent (they're routed through
+            // codegen's CP1 lookup table — see opcode_support.rs's has_cp1_emitter doc
+            // comment) — tag with both bits.
+            Lwxc1 | Ldxc1 | Swxc1 | Sdxc1 | Prefx
+                => InstrCategory::from_bits_truncate(InstrCategory::LOADSTORE.bits() | InstrCategory::FPU.bits()),
+            Lwc1 | Ldc1 | Swc1 | Sdc1
+                => InstrCategory::from_bits_truncate(InstrCategory::LOADSTORE.bits() | InstrCategory::FPU.bits()),
+
+            // Everything else: plain integer ALU (SPECIAL funct arithmetic/logic/shift/trap,
+            // REGIMM trap-immediate, and the immediate-form ALU opcodes).
+            _ => InstrCategory::ALU,
+        }
+    }
+
+    /// True if `jitv2::codegen` has a real emitter for this instruction — the single source
+    /// of truth backing `jitv2::opcode_support::has_emitter`. Every arm here must mirror
+    /// `codegen.rs`'s `lookup_semantics`/`lookup_cp1_semantics` coverage exactly; this is
+    /// intentionally a *coverage* question only ("is there an emitter"), not the emitter
+    /// itself. Branches/jumps/register-indirect-jumps are handled by `analyzer::classify`'s
+    /// own dispatch before this would ever be consulted for them (same caveat as the old
+    /// `has_emitter`'s doc comment) — this only answers the Sequential-vs-Excluded question
+    /// for everything else.
+    pub fn has_jitv2_emitter(self) -> bool {
+        use InstrKind::*;
+        matches!(self,
+            // Integer ALU (mirrors has_integer_emitter's OP_SPECIAL/OP_REGIMM/immediate list)
+            Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu
+            | Sll | Srl | Sra | Sllv | Srlv | Srav
+            | Mfhi | Mthi | Mflo | Mtlo
+            | Mult | Multu | Div | Divu | Dmult | Dmultu | Ddiv | Ddivu
+            | Dadd | Daddu | Dsub | Dsubu
+            | Dsll | Dsrl | Dsra | Dsll32 | Dsrl32 | Dsra32
+            | Dsllv | Dsrlv | Dsrav
+            | Movz | Movn | Movci
+            | Tge | Tgeu | Tlt | Tltu | Teq | Tne | Sync
+            | Tgei | Tgeiu | Tlti | Tltiu | Teqi | Tnei
+            | Addi | Addiu | Daddi | Slti | Sltiu | Andi | Ori | Xori | Lui
+            | Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld
+            | Lwl | Lwr | Ldl | Ldr
+            | Sb | Sh | Sw | Sd
+            | Swl | Swr | Sdl | Sdr
+            | Pref
+            // CP1 (mirrors has_cp1_emitter's OP_LWC1/LDC1/SWC1/SDC1 + OP_COP1 coverage)
+            | Lwc1 | Ldc1 | Swc1 | Sdc1
+            | Fadd_s | Fsub_s | Fmul_s | Fdiv_s | Fsqrt_s
+            | Fabs_s | Fneg_s | Fmov_s | Fmovcf_s
+            | Fcvt_d_s | Fcvt_w_s | Fcvt_l_s
+            | Fround_w_s | Ftrunc_w_s | Fceil_w_s | Ffloor_w_s
+            | Fround_l_s | Ftrunc_l_s | Fceil_l_s | Ffloor_l_s
+            | Fcc_s
+            | Fadd_d | Fsub_d | Fmul_d | Fdiv_d | Fsqrt_d
+            | Fabs_d | Fneg_d | Fmov_d | Fmovcf_d
+            | Fcvt_s_d | Fcvt_w_d | Fcvt_l_d
+            | Fround_w_d | Ftrunc_w_d | Fceil_w_d | Ffloor_w_d
+            | Fround_l_d | Ftrunc_l_d | Fceil_l_d | Ffloor_l_d
+            | Fcc_d
+            | Fcvt_s_w | Fcvt_d_w | Fcvt_s_l | Fcvt_d_l
+            | Mfc1 | Dmfc1 | Cfc1 | Mtc1 | Dmtc1 | Ctc1
+        )
+    }
+
+    /// True if jitv2 can compile this instruction at all — `has_jitv2_emitter()`
+    /// (the `lookup_semantics`/`lookup_cp1_semantics`-backed table) plus the
+    /// branch/jump/register-indirect-jump kinds, which have their own emitters
+    /// (`codegen::lookup_branch_or_jump`/`lookup_regjump`) but are deliberately
+    /// excluded from `has_jitv2_emitter` since `analyzer::classify` resolves them
+    /// by construction rather than an emitter-coverage lookup (see that method's
+    /// doc comment). This is the set `opcode_support`'s per-instruction runtime
+    /// toggle table (`ENABLED`) initializes to "on" — i.e. "supported today,
+    /// absent any `j2 <instr>`/`j2 <category>` override."
+    pub fn has_jitv2_support(self) -> bool {
+        use InstrKind::*;
+        matches!(self,
+            Jr | Jalr
+            | Bltz | Bgez | Bltzl | Bgezl | Bltzal | Bgezal | Bltzall | Bgezall
+            | J | Jal | Beq | Bne | Blez | Bgtz | Beql | Bnel | Blezl | Bgtzl
+        ) || self.has_jitv2_emitter()
     }
 
     pub fn name(self) -> &'static str {
@@ -322,42 +487,73 @@ pub fn classify_instr(op: u8, rs: u8, rt: u8, funct: u8) -> InstrKind {
     }
 }
 
-/// Execution frequency counters, one slot per `InstrKind`.
+/// Execution frequency counters, one slot per `InstrKind`. Also tracks
+/// decode-time counts separately from execution-time counts: `decode_into`
+/// (mips_exec.rs) only runs once per L1I/L2 cache fill, while `exec_decoded`
+/// runs once per dispatch, so "how many times was this decoded" and "how
+/// many times was this executed" are genuinely different numbers for any
+/// instruction inside a loop.
+///
+/// Note on scope: `exec_counts` only sees interpreter-path dispatches. Once
+/// jitv2 has compiled a region, `exec_decoded`'s JIT-hit path calls the
+/// native function pointer directly and returns without recording anything
+/// here (mips_exec.rs's `exec_decoded`), and the `lightning`-build fast path
+/// skips decode/exec entirely on a hit. So under `jitv2`, `exec_counts`
+/// undercounts actual guest execution once compilation kicks in — expected,
+/// not a bug. `decode_counts` is unaffected (decoding still happens the
+/// first time a JIT-compiled region's underlying words are read into the
+/// cache, before compilation).
+#[cfg(feature = "instr_stats")]
 #[derive(Clone)]
 pub struct InstrStats {
-    pub counts: Box<[u64; NUM_INSTR_KINDS]>,
-    /// Raw 32-bit instruction word -> hit count, populated only for `InstrKind::Reserved`.
-    /// `InstrKind::Reserved` lumps every illegal encoding into one counter slot; this map
-    /// recovers which distinct encodings were actually hit for the aggregate report.
+    pub exec_counts: Box<[u64; NUM_INSTR_KINDS]>,
+    pub decode_counts: Box<[u64; NUM_INSTR_KINDS]>,
+    /// Raw 32-bit instruction word -> hit count, populated only for `InstrKind::Reserved`
+    /// (executed path only). `InstrKind::Reserved` lumps every illegal encoding into one
+    /// counter slot; this map recovers which distinct encodings were actually hit for the
+    /// aggregate report.
     pub reserved_words: std::collections::HashMap<u32, u64>,
 }
 
+#[cfg(feature = "instr_stats")]
 impl Default for InstrStats {
     fn default() -> Self {
         Self {
-            counts: Box::new([0u64; NUM_INSTR_KINDS]),
+            exec_counts: Box::new([0u64; NUM_INSTR_KINDS]),
+            decode_counts: Box::new([0u64; NUM_INSTR_KINDS]),
             reserved_words: std::collections::HashMap::new(),
         }
     }
 }
 
+#[cfg(feature = "instr_stats")]
 impl InstrStats {
     #[inline(always)]
     pub fn record(&mut self, op: u8, rs: u8, rt: u8, funct: u8, raw: u32) {
         let kind = classify_instr(op, rs, rt, funct);
-        self.counts[kind as usize] += 1;
+        self.exec_counts[kind as usize] += 1;
         if kind == InstrKind::Reserved {
             *self.reserved_words.entry(raw).or_insert(0) += 1;
         }
     }
 
+    /// Record a decode (cache fill), separate from `record`'s execution count — see the
+    /// struct doc comment. Called from the `decode_into::<T, C>(d)` call site (mips_exec.rs),
+    /// not from inside `decode_into` itself, so `decode_into`'s signature stays unchanged.
+    #[inline(always)]
+    pub fn record_decode(&mut self, op: u8, rs: u8, rt: u8, funct: u8) {
+        let kind = classify_instr(op, rs, rt, funct);
+        self.decode_counts[kind as usize] += 1;
+    }
+
     pub fn total(&self) -> u64 {
-        self.counts.iter().sum()
+        self.exec_counts.iter().sum()
     }
 
     /// Reset all counters to zero (monitor `cpu instrstats clear`).
     pub fn clear(&mut self) {
-        self.counts.fill(0);
+        self.exec_counts.fill(0);
+        self.decode_counts.fill(0);
         self.reserved_words.clear();
     }
 
@@ -369,6 +565,8 @@ impl InstrStats {
     }
 
     /// Write the same report to an arbitrary sink (used by the monitor `cpu instrstats` command).
+    /// Reports `exec_counts` (interpreter-path executions — see the struct doc comment for the
+    /// jitv2-bypass caveat).
     pub fn write_report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         let total = self.total();
         if total == 0 {
@@ -378,7 +576,7 @@ impl InstrStats {
 
         let rows: Vec<(InstrKind, u64)> = (0..NUM_INSTR_KINDS)
             .filter_map(|k| {
-                let count = self.counts[k];
+                let count = self.exec_counts[k];
                 if count == 0 { return None; }
                 // SAFETY: k is in range 0..NUM_INSTR_KINDS, which matches the enum's contiguous discriminants.
                 let kind: InstrKind = unsafe { std::mem::transmute(k as u16) };
@@ -387,7 +585,7 @@ impl InstrStats {
             .collect();
 
         writeln!(w, "\n=== MIPS Instruction Frequency Statistics ===")?;
-        writeln!(w, "  Total instructions executed: {}", total)?;
+        writeln!(w, "  Total instructions executed (interpreter path only — see jitv2 caveat in InstrStats doc comment): {}", total)?;
 
         const CLASSES: &[IsaClass] = &[
             IsaClass::Mips12, IsaClass::Mips3, IsaClass::Mips3Fpu,
@@ -434,8 +632,147 @@ impl InstrStats {
         }
         Ok(())
     }
+
+    /// Diffable dump: mnemonics with a nonzero decode OR exec count, one per line,
+    /// alphabetically sorted so the file diffs cleanly across runs regardless of
+    /// execution-order/timing noise. Written at CPU stop as `instr_used.txt`.
+    pub fn write_used_list(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let mut names: Vec<&'static str> = (0..NUM_INSTR_KINDS)
+            .filter(|&k| self.exec_counts[k] != 0 || self.decode_counts[k] != 0)
+            .map(|k| {
+                // SAFETY: k is in range 0..NUM_INSTR_KINDS, matching the enum's contiguous discriminants.
+                let kind: InstrKind = unsafe { std::mem::transmute(k as u16) };
+                kind.name()
+            })
+            .collect();
+        names.sort_unstable();
+        for name in names {
+            writeln!(w, "{}", name)?;
+        }
+        Ok(())
+    }
+
+    /// Diffable dump: mnemonic, decode count, exec count — one per line, alphabetically
+    /// sorted by mnemonic (not by frequency, unlike `write_report`) so line-for-line diffs
+    /// against a previous run's dump are meaningful. Written at CPU stop as `instr_counts.txt`.
+    pub fn write_counts(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let mut rows: Vec<(&'static str, u64, u64)> = (0..NUM_INSTR_KINDS)
+            .filter(|&k| self.exec_counts[k] != 0 || self.decode_counts[k] != 0)
+            .map(|k| {
+                // SAFETY: k is in range 0..NUM_INSTR_KINDS, matching the enum's contiguous discriminants.
+                let kind: InstrKind = unsafe { std::mem::transmute(k as u16) };
+                (kind.name(), self.decode_counts[k], self.exec_counts[k])
+            })
+            .collect();
+        rows.sort_unstable_by_key(|&(name, _, _)| name);
+        writeln!(w, "# mnemonic decoded executed")?;
+        for (name, decoded, executed) in rows {
+            writeln!(w, "{:<14} {:>14} {:>14}", name, decoded, executed)?;
+        }
+        Ok(())
+    }
 }
 
 fn pct(num: u64, den: u64) -> f64 {
     if den == 0 { 0.0 } else { num as f64 / den as f64 * 100.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
+        (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+    fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+        (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+    }
+    fn fields(raw: u32) -> (u8, u8, u8, u8) {
+        (
+            ((raw >> 26) & 0x3F) as u8,
+            ((raw >> 21) & 0x1F) as u8,
+            ((raw >> 16) & 0x1F) as u8,
+            (raw & 0x3F) as u8,
+        )
+    }
+
+    /// Differential regression guard: for a representative sample of encodings covering
+    /// every top-level opcode/funct group `decode_into` (mips_exec.rs) dispatches through,
+    /// `classify_instr` must never fall back to `Reserved` for an encoding that has a real
+    /// handler. This doesn't replace keeping the two match trees in sync by hand (the user
+    /// explicitly chose to keep them as two trees, not merge them), but it catches the
+    /// common failure mode: a new opcode added to `decode_into` and forgotten here.
+    #[test]
+    fn classify_instr_never_reserved_for_known_encodings() {
+        let samples: &[u32] = &[
+            r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU),
+            r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ),
+            r_type(OP_SPECIAL, 1, 2, 0, 0, FUNCT_JR),
+            r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_SYSCALL),
+            r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_DSRA32),
+            i_type(OP_REGIMM, 1, RT_BLTZ, 0),
+            i_type(OP_REGIMM, 1, RT_TGEI, 5),
+            i_type(OP_J, 0, 0, 0) | 1, // J with a nonzero target field
+            i_type(OP_BEQ, 1, 2, 0),
+            i_type(OP_ADDIU, 1, 2, 5),
+            i_type(OP_DADDIU, 1, 2, 5),
+            i_type(OP_LW, 1, 2, 0),
+            i_type(OP_SD, 1, 2, 0),
+            r_type(OP_COP0, RS_MFC0, 2, 3, 0, 0),
+            r_type(OP_COP0, RS_TLB, 0, 0, 0, FUNCT_TLBWI),
+            r_type(OP_COP0, RS_TLB, 0, 0, 0, FUNCT_ERET),
+            r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0),
+            r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FADD),
+            r_type(OP_COP1, RS_D, 2, 3, 0, FUNCT_FMOVZ),
+            r_type(OP_COP1, RS_W, 2, 3, 0, FUNCT_FCVT_S),
+            r_type(OP_COP1, RS_BC1, 0, 0, 0, 0),
+            r_type(OP_COP1X, 1, 2, 3, 0, FUNCT_LWXC1),
+            r_type(OP_COP1X, 1, 2, 3, 0, FUNCT_MADD_S),
+        ];
+        for &raw in samples {
+            let (op, rs, rt, funct) = fields(raw);
+            let kind = classify_instr(op, rs, rt, funct);
+            assert_ne!(kind, InstrKind::Reserved, "raw={:08x} op={:#04x} rs={:#04x} rt={:#04x} funct={:#04x} classified as Reserved", raw, op, rs, rt, funct);
+        }
+    }
+
+    #[test]
+    fn category_loadstore_fpu_overlap_for_indexed_fp_mem_ops() {
+        assert!(InstrKind::Lwxc1.category().contains(InstrCategory::LOADSTORE));
+        assert!(InstrKind::Lwxc1.category().contains(InstrCategory::FPU));
+        assert!(InstrKind::Lwc1.category().contains(InstrCategory::LOADSTORE));
+        assert!(InstrKind::Lwc1.category().contains(InstrCategory::FPU));
+    }
+
+    #[test]
+    fn category_plain_alu_and_branch() {
+        assert_eq!(InstrKind::Addu.category(), InstrCategory::ALU);
+        assert_eq!(InstrKind::Beq.category(), InstrCategory::BRANCH);
+        assert_eq!(InstrKind::Jr.category(), InstrCategory::BRANCH);
+        assert_eq!(InstrKind::Mfc0.category(), InstrCategory::COP0);
+        assert_eq!(InstrKind::Reserved.category(), InstrCategory::NONE);
+    }
+
+    #[cfg(feature = "instr_stats")]
+    #[test]
+    fn instr_stats_record_and_dump_roundtrip() {
+        let mut stats = InstrStats::default();
+        let (op, rs, rt, funct) = fields(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU));
+        stats.record(op, rs, rt, funct, r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU));
+        stats.record_decode(op, rs, rt, funct);
+        stats.record_decode(op, rs, rt, funct);
+
+        assert_eq!(stats.exec_counts[InstrKind::Addu as usize], 1);
+        assert_eq!(stats.decode_counts[InstrKind::Addu as usize], 2);
+
+        let mut used = Vec::new();
+        stats.write_used_list(&mut used).unwrap();
+        assert_eq!(String::from_utf8(used).unwrap(), "addu\n");
+
+        let mut counts = Vec::new();
+        stats.write_counts(&mut counts).unwrap();
+        let text = String::from_utf8(counts).unwrap();
+        assert!(text.contains("addu"));
+        assert!(text.lines().next().unwrap().starts_with('#'));
+    }
 }

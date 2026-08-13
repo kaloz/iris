@@ -37,11 +37,17 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
-# Per-instruction execution frequency counters (all ~205 MIPS III/IV opcodes),
-# printed at emulator exit with a MIPS III/IV usage rollup. Diagnostic only —
-# classifies every executed instruction via a match mirroring decode_into, so
-# it is intrusive on the hot path. Kept out of default builds. See
-# mips_instr_stats.rs.
+# Per-instruction decode and execution frequency counters (all ~205 MIPS
+# III/IV opcodes), printed at emulator exit with a MIPS III/IV usage rollup,
+# plus diffable instr_used.txt/instr_counts.txt dumps. Diagnostic only —
+# classifies every decoded/executed instruction via a match mirroring
+# decode_into, so it is intrusive on the hot path. Kept out of default
+# builds. Note: execution counts are interpreter-path only — instructions
+# running as compiled jitv2 code bypass this counter entirely (see
+# InstrStats's doc comment in mips_instr_stats.rs). The classifier itself
+# (InstrKind/classify_instr) always compiles, independent of this flag —
+# jitv2::opcode_support depends on it unconditionally for its own
+# emitter-coverage gating. See mips_instr_stats.rs.
 instr_stats = []
 # R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
 # Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
