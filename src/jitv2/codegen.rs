@@ -4340,6 +4340,79 @@ fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_fmov_s(ctx, fr_mode);
 }
 
+/// MOVCF.fmt fd, fs, cc, tf: fd = fs if FPU condition code `cc` == `tf`
+/// (no-op otherwise). Mirrors `MipsExecutor::exec_fmovcf_s`/`_d` exactly —
+/// same FCSR cc-bit extraction as `emit_movci` (cc0 at bit 23, cc1..cc7 at
+/// bits 24..30, both compile-time constants from the fixed encoding), just
+/// gating an FPR-to-FPR copy instead of a GPR write. Like `emit_fmov_s`,
+/// format (S vs D) doesn't matter for a raw copy, so both functs share this
+/// body via the same full-64-bit-slot `emit_read_fpr_l`/`emit_write_fpr_l`
+/// pair `emit_fmov_d` already relies on.
+/// Emits the FCSR load + cc-bit compare shared by MOVCF.s/MOVCF.d, and
+/// returns the `taken` boolean `Value`. Mirrors `emit_movci`'s identical
+/// FCSR bit extraction (cc0 at bit 23, cc1..cc7 at bits 24..30).
+fn emit_fmovcf_taken(ctx: &mut EmitCtx) -> Value {
+    let cc = (ctx.raw >> 18) & 0x7;
+    let tf = ((ctx.raw >> 16) & 0x1) != 0;
+    let bit = if cc == 0 { 23 } else { 24 + cc };
+
+    let mem = MemFlagsData::trusted();
+    let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+    let cc_bit = ctx.builder.ins().ushr_imm_s(fcsr, bit as i64);
+    let cc_value = ctx.builder.ins().band_imm_s(cc_bit, 1);
+    let want = if tf { 1 } else { 0 };
+    ctx.builder.ins().icmp_imm_s(ir::condcodes::IntCC::Equal, cc_value, want)
+}
+
+/// MOVCF.S fd, fs, cc, tf: fd = fs if FPU condition code `cc` == `tf`
+/// (no-op otherwise). Mirrors `MipsExecutor::exec_fmovcf_s` exactly,
+/// including its use of `fpr_read_w`/`fpr_write_w` (32-bit word, not the
+/// full 64-bit slot) — unlike `emit_fmov_s`/`_d` (which alias to the same
+/// full-slot copy because `exec_fmov_s` itself uses `fpr_read_l`/`_write_l`
+/// even for the `.s` funct), `exec_fmovcf_s` and `exec_fmovcf_d` use
+/// genuinely different-width accessors, so `.s` and `.d` need separate
+/// bodies here.
+fn emit_fmovcf_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let taken = emit_fmovcf_taken(ctx);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_w(ctx, fs, fr_mode);
+    emit_write_fpr_w(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+/// MOVCF.D fd, fs, cc, tf — see `emit_fmovcf_s`'s doc comment for why this
+/// isn't just a delegate to it: `exec_fmovcf_d` uses `fpr_read_d`/
+/// `fpr_write_d` (full 64-bit slot, same shape as `emit_read_fpr_l`/
+/// `emit_write_fpr_l`), not the 32-bit word accessors `.s` uses.
+fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let taken = emit_fmovcf_taken(ctx);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_write_fpr_l(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
 // ---- CP1 conversions ------
 //
 // Two families, both funneled through emit_fpu_clear_status/emit_fpu_update_fcsr
@@ -4835,6 +4908,7 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FABS => Some(emit_fabs_s),
             FUNCT_FNEG => Some(emit_fneg_s),
             FUNCT_FMOV => Some(emit_fmov_s),
+            FUNCT_FMOVCF => Some(emit_fmovcf_s),
             FUNCT_FCVT_D => Some(emit_fcvt_d_s),
             FUNCT_FCVT_W => Some(emit_fcvt_w_s),
             FUNCT_FCVT_L => Some(emit_fcvt_l_s),
@@ -4858,6 +4932,7 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FABS => Some(emit_fabs_d),
             FUNCT_FNEG => Some(emit_fneg_d),
             FUNCT_FMOV => Some(emit_fmov_d),
+            FUNCT_FMOVCF => Some(emit_fmovcf_d),
             FUNCT_FCVT_S => Some(emit_fcvt_s_d),
             FUNCT_FCVT_W => Some(emit_fcvt_w_d),
             FUNCT_FCVT_L => Some(emit_fcvt_l_d),

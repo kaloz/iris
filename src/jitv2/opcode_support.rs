@@ -96,7 +96,7 @@ fn has_cp1_emitter(raw: u32) -> bool {
     match rs {
         RS_S | RS_D => matches!(funct,
             FUNCT_FADD | FUNCT_FSUB | FUNCT_FMUL | FUNCT_FDIV | FUNCT_FSQRT
-            | FUNCT_FABS | FUNCT_FNEG | FUNCT_FMOV
+            | FUNCT_FABS | FUNCT_FNEG | FUNCT_FMOV | FUNCT_FMOVCF
             | FUNCT_FCVT_D | FUNCT_FCVT_S | FUNCT_FCVT_W | FUNCT_FCVT_L
             | FUNCT_FROUND_W | FUNCT_FTRUNC_W | FUNCT_FCEIL_W | FUNCT_FFLOOR_W
             | FUNCT_FROUND_L | FUNCT_FTRUNC_L | FUNCT_FCEIL_L | FUNCT_FFLOOR_L

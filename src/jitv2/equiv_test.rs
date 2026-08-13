@@ -3682,6 +3682,71 @@ mod tests {
         }
     }
 
+    /// MOVCF.fmt (FMOVCF.s/FMOVCF.d): same cc/tf/cc_actual sweep as
+    /// `movci_matches_interpreter_across_all_cc_and_tf_combinations`, but
+    /// gating an FPR-to-FPR copy (`fs`=rd-position, `fd`=sa-position) instead
+    /// of a GPR write, and exercised across both FR modes since fs/fd
+    /// register addressing differs between them (see `emit_read_fpr_l`/
+    /// `emit_write_fpr_l`'s FrMode handling).
+    fn fmovcf_case(fmt: u32, fr1: bool) {
+        for cc in 0u32..8 {
+            for tf in [false, true] {
+                for cc_actual_value in [false, true] {
+                    let mut fpr = [0u64; 32];
+                    fpr[1] = 0xCAFE_BABE_1234_5678; // fs
+                    fpr[3] = 0x2222_2222_2222_2222; // pre-existing fd, must survive when not taken
+                    // fs=rd-position(1), fd=sa-position(3); cc/tf packed into
+                    // the rt-position field: bits[20:18]=cc, bit16=tf.
+                    let cc_tf = (cc << 2) | (tf as u32);
+                    let instr = make_r(crate::mips_isa::OP_COP1, fmt, cc_tf, 1, 3, crate::mips_isa::FUNCT_FMOVCF);
+
+                    let pc = 0xFFFF_FFFF_8000_1000u64;
+                    let word_offset = (pc as u16 / 4) & 0x3FF;
+
+                    let (mut interp_exec, _) = fpu_seeded_executor([0u64; 32], fpr, pc, fr1);
+                    interp_exec.core.fpu_fcsr = 0;
+                    interp_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    interp_exec.exec(instr);
+                    let interp_snapshot = CoreSnapshot::capture(&interp_exec.core);
+
+                    let mut page = [0u32; ENTRIES_PER_PAGE];
+                    page[word_offset as usize] = instr;
+                    let mut analyzer = Analyzer::new();
+                    let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 1);
+                    assert!(non_empty);
+                    let mut instrs_owned = *walked;
+                    let mut codegen = Codegen::new();
+                    let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, fr1, false)
+                        .expect("FMOVCF must be compilable for this test to be meaningful");
+
+                    let (jit_exec, _) = fpu_seeded_executor([0u64; 32], fpr, pc, fr1);
+                    let mut jit_exec = Box::new(jit_exec);
+                    jit_exec.core.fpu_fcsr = 0;
+                    jit_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    jit_exec.install_jit_hooks();
+                    unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
+                    std::mem::forget(codegen);
+                    let jit_snapshot = CoreSnapshot::capture(&jit_exec.core);
+
+                    assert_eq!(jit_snapshot, interp_snapshot,
+                        "FMOVCF diverged for fmt={} fr1={} cc={} tf={} cc_actual={}", fmt, fr1, cc, tf, cc_actual_value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fmovcf_s_matches_interpreter_across_all_cc_and_tf_combinations() {
+        fmovcf_case(crate::mips_isa::RS_S, false);
+        fmovcf_case(crate::mips_isa::RS_S, true);
+    }
+
+    #[test]
+    fn fmovcf_d_matches_interpreter_across_all_cc_and_tf_combinations() {
+        fmovcf_case(crate::mips_isa::RS_D, false);
+        fmovcf_case(crate::mips_isa::RS_D, true);
+    }
+
     fn trap_case_rr(funct: u32, rs_val: u64, rt_val: u64) {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;

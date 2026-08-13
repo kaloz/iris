@@ -42,9 +42,26 @@ coverage in `opcode_support.rs`, equivalence test(s) in `equiv_test.rs`):
 `MOVCI`/`MOVZ`/`MOVN`, `SYNC`/`PREF`, `DMULT`/`DMULTU`/`DDIV`/`DDIVU`,
 `TGE`/`TGEU`/`TLT`/`TLTU`/`TEQ`/`TNE` (+ the six `OP_REGIMM` trap-immediate
 variants), the unaligned load/store family (`LWL`/`LWR`/`SWL`/`SWR`/`LDL`/
-`LDR`/`SDL`/`SDR`), `DADDI`, and the FPU load/store family (`LWC1`/`LDC1`/
+`LDR`/`SDL`/`SDR`), `DADDI`, the FPU load/store family (`LWC1`/`LDC1`/
 `SWC1`/`SDC1`, routed through `lookup_cp1_semantics` specifically so the
-region-wide CU1/FR guard's trigger check still catches them).
+region-wide CU1/FR guard's trigger check still catches them), and
+`MOVCF.fmt` (funct 0x11 under `RS_S`/`RS_D`).
+
+`MOVCF.S`/`MOVCF.D` needed separate emitter bodies despite looking like a
+conditional version of the already-implemented `FMOV` — unlike `emit_fmov_s`/
+`_d` (which both alias to the same full-64-bit-slot copy because
+`exec_fmov_s` itself uses `fpr_read_l`/`fpr_write_l` even for the `.s`
+funct), `exec_fmovcf_s` uses the 32-bit `fpr_read_w`/`fpr_write_w` accessors
+while `exec_fmovcf_d` uses the full-slot `fpr_read_d`/`fpr_write_d` ones —
+genuinely different widths, not a S/D formatting difference that collapses
+to the same bit pattern. An initial implementation copied `emit_fmov_s`'s
+full-slot-copy shape for both functs and passed compilation, but the
+`fmovcf_s_matches_interpreter_across_all_cc_and_tf_combinations` equivalence
+test caught the divergence immediately (JIT clobbered fd's upper 32 bits
+under FR=1; the interpreter's 32-bit write preserves them) — a reminder that
+"looks like an existing pattern" isn't the same as "is architecturally the
+same op," and equivalence tests earn their keep even on seemingly-trivial
+conditional-move instructions.
 
 Trap instructions raise `EXC_TR` through the same `emit_exception_exit`
 shared-infrastructure path `DADDI`'s overflow trap already used — this was
@@ -95,7 +112,6 @@ scope for an R4400 target regardless — but the scalar S/D forms
 
 | Instruction | funct | Notes |
 |---|---|---|
-| `MOVCF.fmt` | 0x11 | FP conditional move on FP condition code |
 | `MOVZ.fmt` | 0x12 | MIPS IV, FP conditional move on GPR == 0 |
 | `MOVN.fmt` | 0x13 | MIPS IV, FP conditional move on GPR != 0 |
 | `RECIP.fmt` | 0x15 | MIPS IV reciprocal approximation |
