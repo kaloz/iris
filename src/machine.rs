@@ -180,6 +180,8 @@ impl Machine {
         // is shadowed later in this function.
         let ci_enabled = cfg.ci;
         let perf = cfg.perf.clone();
+        #[cfg(feature = "jitv2")]
+        let jitv2_threads = cfg.jitv2.threads;
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
 
@@ -665,6 +667,10 @@ impl Machine {
         #[cfg(feature = "jitv2")]
         {
             let jit = cpu.jitv2();
+            // Fixed at startup, before the queue ever starts — see
+            // CompileQueue::set_thread_count's own doc comment for why this
+            // can't change at runtime.
+            jit.lock().compile_queue.set_thread_count(jitv2_threads.max(1));
             jit.lock().compile_queue.set_cpu(Arc::downgrade(&cpu_device));
             jit.lock().compile_queue.set_owner(Arc::downgrade(&jit));
             // Threaded compile is the default (`MipsExecutor::jitv2_inline_compile`
@@ -687,11 +693,14 @@ impl Machine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let mut guard = jit.lock();
-                let codegen = guard.codegen.get_mut().take()
-                    .expect("Machine::new: Jitv2::codegen must be Some before the compile queue has ever started");
+                // start() now builds its own Codegen internally (no more
+                // shared-arena-across-modes handoff — see CompileQueue::start's
+                // own doc comment) — the idle Jitv2::codegen slot built by
+                // Jitv2::new() stays untouched here, reserved for inline
+                // mode if `j2 inline on` ever switches to it.
                 let stats = guard.stats.clone();
                 let bus: Arc<dyn BusDevice> = phys.clone();
-                guard.compile_queue.start(bus, codegen, stats);
+                guard.compile_queue.start(bus, stats);
             }
         }
 

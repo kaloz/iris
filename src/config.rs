@@ -576,6 +576,26 @@ fn set_or_remove_env(key: &str, val: &str) {
     }
 }
 
+/// jitv2 compile-pool tuning (`[jitv2]` section) — unrelated to the legacy
+/// `[jit]`/`JitConfig` above (that's the older MIPS/REX3 JIT engine); this
+/// is the new jitv2 engine's one tunable today, its compile-pool thread
+/// count. Fixed at process startup, never changed at runtime — see
+/// `CompileQueue::set_thread_count`'s own doc comment for why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Jitv2Config {
+    #[serde(default = "default_jitv2_threads")]
+    pub threads: usize,
+}
+
+fn default_jitv2_threads() -> usize { 1 }
+
+impl Default for Jitv2Config {
+    fn default() -> Self {
+        Self { threads: default_jitv2_threads() }
+    }
+}
+
 /// Host-side performance tuning (`[perf]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -800,6 +820,11 @@ pub struct MachineConfig {
     #[serde(default)]
     pub jit: JitConfig,
 
+    /// jitv2 compile-pool tuning (`[jitv2]` section) — distinct from the
+    /// legacy `jit` section above, see `Jitv2Config`'s own doc comment.
+    #[serde(default)]
+    pub jitv2: Jitv2Config,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -903,6 +928,7 @@ impl Default for MachineConfig {
             graphics: GraphicsSection::default(),
             impact: ImpactSection::default(),
             jit: JitConfig::default(),
+            jitv2: Jitv2Config::default(),
             perf: PerfConfig::default(),
             #[cfg(feature = "ultra64")]
             ultra64: Ultra64Config::default(),
@@ -1032,6 +1058,11 @@ impl MachineConfig {
                 }
             }
         }
+        if self.jitv2.threads == 0 {
+            return Err(
+                "jitv2.threads must be at least 1 — 0 would silently degrade to no compile threads, everything sticky-fails to compile forever".into(),
+            );
+        }
         Ok(())
     }
 
@@ -1098,6 +1129,10 @@ pub struct Cli {
     /// RAM bank 3 size in MB (0/8/16/32/64/128)
     #[arg(long)]
     pub bank3: Option<u32>,
+
+    /// jitv2 compile-pool thread count (fixed at startup, see jitv2.threads)
+    #[arg(long = "jitv2-threads", value_name = "N")]
+    pub jitv2_threads: Option<usize>,
 
     /// SCSI ID 1 image path (HDD)
     #[arg(long)]
@@ -1213,6 +1248,7 @@ impl Cli {
         if let Some(v) = self.bank1    { cfg.banks[1] = v; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; }
         if let Some(v) = self.bank3    { cfg.banks[3] = v; }
+        if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; }
 
         // Helper: insert or update a SCSI device entry.
         let apply_scsi = |map: &mut std::collections::HashMap<u8, ScsiDeviceConfig>,

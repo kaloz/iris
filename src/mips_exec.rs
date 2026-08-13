@@ -8414,7 +8414,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -9340,13 +9340,17 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             Some("on") => {
                                 #[cfg(feature = "lightning")]
                                 return Err("j2 inline on: unavailable under `lightning` — compiles always go to the async queue, never inline".to_string());
-                                // Switching TO inline: the async compile
-                                // queue, if running, must give its Codegen
-                                // back — inline dispatch takes it from
-                                // Jitv2::codegen on every compile (see that
-                                // field's doc comment for why the two modes
-                                // share one Cranelift arena instead of each
-                                // keeping a separate one).
+                                // Switching TO inline: stop the async
+                                // compile queue (if running) and build a
+                                // fresh Codegen for Jitv2::codegen's idle
+                                // slot, reusing the queue's own still-live
+                                // shared arena rather than reserving a new
+                                // one — no leaked reservation, and inline
+                                // dispatch picks up right where the queue
+                                // left off, address-space-wise. The queue's
+                                // own (now-discarded) Codegen wrapper is
+                                // simply dropped; its arena lives on via the
+                                // new Codegen built on top of it below.
                                 #[cfg(not(feature = "lightning"))]
                                 {
                                     // Lock `jitv2` ONCE for both stop() and the
@@ -9361,8 +9365,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                     // ran, before the CPU even started.
                                     {
                                         let mut jit = exec.jitv2.lock();
-                                        if let Some(codegen) = jit.compile_queue.stop() {
-                                            *jit.codegen.lock() = Some(codegen);
+                                        let stopped = jit.compile_queue.stop();
+                                        if let Some(old) = stopped.into_iter().next() {
+                                            let (shared, state) = old.shared_arena();
+                                            drop(old);
+                                            *jit.codegen.lock() = Some(crate::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
                                         }
                                     }
                                     exec.jitv2_inline_compile = true;
@@ -9370,16 +9377,24 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                 }
                             }
                             Some("off") => {
-                                // Switching TO threaded: hand the shared
-                                // Codegen to the compile queue's worker.
+                                // Switching TO threaded: reuse the inline
+                                // slot's own still-live shared arena for the
+                                // queue's new worker Codegen (built inside
+                                // start() — see that method's own doc
+                                // comment) rather than reserving a fresh
+                                // one. The old Jitv2::codegen wrapper is
+                                // simply dropped once its arena handle is
+                                // extracted; the arena itself lives on.
                                 exec.jitv2_inline_compile = false;
                                 let bus = exec.sysad.clone();
-                                let codegen = exec.jitv2.lock().codegen.lock().take();
-                                match codegen {
-                                    Some(codegen) => {
+                                let old = exec.jitv2.lock().codegen.lock().take();
+                                match old {
+                                    Some(old) => {
+                                        let (shared, state) = old.shared_arena();
+                                        drop(old);
                                         let mut jit = exec.jitv2.lock();
                                         let stats = jit.stats.clone();
-                                        jit.compile_queue.start(bus, codegen, stats);
+                                        jit.compile_queue.start_with_shared_arena(bus, stats, shared, state);
                                     }
                                     None => {
                                         return Err("j2 inline off: no Codegen available (already owned by a running compile queue?)".to_string());
@@ -9480,29 +9495,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         };
                         let _ = crate::jitv2::opcode_support::write_status(&mut writer, filter);
                     }
-                    "batch" => {
-                        // Only meaningful for the async compile-queue
-                        // worker (`worker_loop`'s deferred-finalize path,
-                        // paged_memory.rs) — jitv2_inline_compile's own
-                        // "run it immediately" contract can never defer a
-                        // finalize, so this toggle has no effect while
-                        // inline compile is on (not an error, just a no-op
-                        // until `j2 inline off`).
-                        let jit = exec.jitv2.lock();
-                        match actual_args.get(1).copied() {
-                            None => {
-                                writeln!(writer, "j2 batch: {}", if jit.compile_queue.batch_enabled() { "on" } else { "off" }).unwrap();
-                            }
-                            Some("on") => {
-                                jit.compile_queue.set_batch_enabled(true);
-                                writeln!(writer, "j2 batch: on").unwrap();
-                            }
-                            Some("off") => {
-                                jit.compile_queue.set_batch_enabled(false);
-                                writeln!(writer, "j2 batch: off").unwrap();
-                            }
-                            Some(_) => return Err("Usage: j2 batch [on|off]".to_string()),
+                    "threads" => {
+                        // Read-only: thread_count is fixed at process
+                        // startup (iris.toml's jitv2.threads or
+                        // --jitv2-threads), never mutable at runtime — see
+                        // CompileQueue::set_thread_count's own doc comment.
+                        if actual_args.len() > 1 {
+                            return Err("j2 threads is read-only — set via iris.toml [jitv2] threads or --jitv2-threads at startup".to_string());
                         }
+                        let jit = exec.jitv2.lock();
+                        writeln!(writer, "j2 threads: {}", jit.compile_queue.thread_count()).unwrap();
                     }
                     "opt" => {
                         // Process-wide, not per-Codegen (opt_level is baked
@@ -9838,28 +9840,41 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             let dt_calls = crate::mips_exec::DEV_TRACE_BP_CALLS.load(Ordering::Relaxed);
                             writeln!(writer, "dev trace hook: {} calls (0 => emit_dev_trace_bp never reached from compiled code)", dt_calls).unwrap();
                         }
-                        // Functions compiled into the shared Codegen's
+                        // Functions compiled into the active Codegen's
                         // Cranelift arena since the last mega_flush — a
                         // diagnostic count only now; the actual flush trigger
                         // is CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES (real bytes
-                        // reserved), printed separately below.
-                        let functions = jit.codegen.lock().as_ref().map(|c| c.function_count());
-                        match functions {
-                            Some(n) => writeln!(writer, "codegen: {} functions compiled", n).unwrap(),
-                            // codegen is None: the async compile thread owns it right
-                            // now (`j2 inline off`) — CompileQueue::function_count is
-                            // a shared mirror updated after every compile specifically
-                            // so this case isn't a dead end (see its own doc comment).
-                            None => writeln!(writer, "codegen: {} functions compiled (owned by async compile thread)",
-                                jit.compile_queue.function_count()).unwrap(),
+                        // reserved), printed separately below. Branch on
+                        // whether the pool is actually spawned, not on
+                        // `jit.codegen`'s Option — that slot stays `Some`
+                        // the entire time the pool runs (reserved for
+                        // `j2 inline on` to take later, see `Machine::new`'s
+                        // own comment), so it's never a reliable "who owns
+                        // compilation right now" signal on its own.
+                        if jit.compile_queue.is_running() {
+                            writeln!(writer, "codegen: {} functions compiled (owned by async compile thread pool, {} threads)",
+                                jit.compile_queue.function_count(), jit.compile_queue.thread_count()).unwrap();
+                        } else if let Some(n) = jit.codegen.lock().as_ref().map(|c| c.function_count()) {
+                            writeln!(writer, "codegen: {} functions compiled", n).unwrap();
                         }
                         {
-                            let stats = jit.codegen.lock().as_ref().map(|c| c.packing_stats());
+                            // Real per-worker arena byte counts have no
+                            // cross-thread mirror today (only function_count
+                            // does — see CompileQueue::function_count's own
+                            // doc comment) — only readable here while the
+                            // pool isn't running (the idle inline slot).
+                            let stats = if jit.compile_queue.is_running() {
+                                None
+                            } else {
+                                jit.codegen.lock().as_ref().map(|c| c.packing_stats())
+                            };
                             if let Some((used, reserved)) = stats {
                                 writeln!(writer, "arena reserved: {} / {} bytes ({:.1}%), used {} bytes ({:.1}% packing) — real flush trigger",
                                     reserved, crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES,
                                     reserved as f64 * 100.0 / crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64,
                                     used, if reserved == 0 { 0.0 } else { used as f64 * 100.0 / reserved as f64 }).unwrap();
+                            } else if jit.compile_queue.is_running() {
+                                writeln!(writer, "arena reserved: n/a while pooled (no cross-thread byte mirror yet — see function_count for a live signal instead)").unwrap();
                             }
                             // Mega-flush count: each flush wipes ALL published
                             // entries, forcing everything to recompile. A count
@@ -9909,13 +9924,12 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                     dispatches, full, full_pct, avg_depth).unwrap();
                             }
 
-                            writeln!(writer, "batch: {}", if jit.compile_queue.batch_enabled() { "on" } else { "off" }).unwrap();
-                            let page_cross = jit.stats.batch_flushes_page_cross.load(Ordering::Relaxed);
+                            let pending_threshold = jit.stats.batch_flushes_pending_threshold.load(Ordering::Relaxed);
                             let queue_drain = jit.stats.batch_flushes_queue_drain.load(Ordering::Relaxed);
-                            if page_cross > 0 || queue_drain > 0 {
+                            if pending_threshold > 0 || queue_drain > 0 {
                                 let max_pending = jit.stats.batch_max_pending.load(Ordering::Relaxed);
-                                writeln!(writer, "  batch flushes: {} page-cross, {} queue-drain, largest batch {} pending entries",
-                                    page_cross, queue_drain, max_pending).unwrap();
+                                writeln!(writer, "force-seal sweeps: {} pending-threshold, {} queue-drain, largest backlog {} entries",
+                                    pending_threshold, queue_drain, max_pending).unwrap();
                             }
                             // Packing quality (bytes actually used by compiled
                             // code vs. bytes reserved for it, per the arena's

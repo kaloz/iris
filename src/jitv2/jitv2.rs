@@ -347,23 +347,23 @@ pub struct JitStats {
     /// keeping up) or usually near-full (compile thread falling behind)."
     #[cfg(feature = "developer")]
     pub compile_queue_depth_sum: AtomicU64,
-    /// `flush_pending_batch` calls triggered by `Codegen::provider_crossed_page`
-    /// (a batch that filled its host-page segment) — `j2 stats`'s batching
-    /// section, split from `batch_flushes_queue_drain` so it's possible to
-    /// tell whether batches are actually reaching page-fill in practice or
-    /// are mostly getting cut short by the queue draining first (a sign
-    /// `MAX_INSTRS_PER_COMPILE`-sized regions or a slow request rate are
-    /// preventing batches from ever growing large).
+    /// `try_force_seal` calls triggered by `pending` crossing
+    /// `PENDING_FORCE_SEAL_THRESHOLD` on a continuously busy worker — `j2
+    /// stats`'s batching section, split from `batch_flushes_queue_drain` so
+    /// it's possible to tell whether a worker is getting throttled by
+    /// sustained load (this counter) or is mostly idling between bursts
+    /// (that one).
     #[cfg(feature = "developer")]
-    pub batch_flushes_page_cross: AtomicU64,
-    /// `flush_pending_batch` calls triggered by the compile queue draining
-    /// empty (`worker_loop`'s `Err(_)` arm) — see `batch_flushes_page_cross`.
+    pub batch_flushes_pending_threshold: AtomicU64,
+    /// `try_force_seal` calls triggered by the compile queue draining empty
+    /// (`worker_loop`'s `None` arm's idle-timeout sweep) — see
+    /// `batch_flushes_pending_threshold`.
     #[cfg(feature = "developer")]
     pub batch_flushes_queue_drain: AtomicU64,
-    /// High-water mark of `pending.len()` just before any `flush_pending_batch`
-    /// call actually finalized something (i.e. sampled right before the
-    /// batch drains, not after) — `j2 stats`'s "biggest batch we ever
-    /// packed" figure. A `Relaxed` compare-and-swap loop, not a simple
+    /// High-water mark of `pending` just before any force-seal sweep
+    /// actually published something (i.e. sampled right before the sweep
+    /// runs, not after) — `j2 stats`'s "biggest backlog we ever let build
+    /// up" figure. A `Relaxed` compare-and-swap loop, not a simple
     /// `fetch_max` (stabilized in std but this codebase's MSRV predates it
     /// for `AtomicU64` — matches the CAS-loop pattern already used elsewhere
     /// in this codebase for high-water-mark tracking).
@@ -383,12 +383,12 @@ pub struct JitStats {
     pub fallback_regions: AtomicU64,
 }
 
-/// Why `flush_pending_batch` was called — see `JitStats::batch_flushes_page_cross`/
+/// Why a force-seal sweep ran — see `JitStats::batch_flushes_pending_threshold`/
 /// `batch_flushes_queue_drain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(feature = "developer")]
 pub enum BatchFlushReason {
-    PageCross,
+    PendingThreshold,
     QueueDrain,
 }
 
@@ -404,12 +404,12 @@ impl JitStats {
         self.reject_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one `flush_pending_batch` call: bump the trigger-specific
-    /// counter and update the high-water mark from `pending_len` (the batch
-    /// size just before this flush drained it).
+    /// Record one force-seal sweep: bump the trigger-specific counter and
+    /// update the high-water mark from `pending_len` (the backlog size just
+    /// before this sweep drained it).
     pub fn record_batch_flush(&self, pending_len: usize, reason: BatchFlushReason) {
         match reason {
-            BatchFlushReason::PageCross => self.batch_flushes_page_cross.fetch_add(1, Ordering::Relaxed),
+            BatchFlushReason::PendingThreshold => self.batch_flushes_pending_threshold.fetch_add(1, Ordering::Relaxed),
             BatchFlushReason::QueueDrain => self.batch_flushes_queue_drain.fetch_add(1, Ordering::Relaxed),
         };
         let pending_len = pending_len as u64;
@@ -457,6 +457,17 @@ pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
 /// that error path (`comp::handle_request`'s exhaustion match arm) stays as
 /// a belt-and-suspenders backstop, not the primary trigger.
 pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Force-seal trigger for a continuously busy batching worker — see
+/// `worker_loop`'s own comment at its call site. `handle_request_deferred`
+/// finalizes every compile immediately, but a non-forced finalize only
+/// seals a page the bump cursor has already moved past, so `pending` can
+/// otherwise grow without bound while the queue never goes empty long
+/// enough to reach the idle-timeout sweep. Small and arbitrary — this only
+/// needs to be "small enough that pending never grows unbounded," not tuned
+/// to any particular page size (unlike the old page-cross trigger it
+/// replaces, this one has no reason to line up with `ENTRIES_PER_PAGE`).
+const PENDING_FORCE_SEAL_THRESHOLD: usize = 64;
 
 /// A compile request pushed from the mips exec thread to the compile thread
 /// over the SPSC fifo (§6.4). Carries the page pointer rather than a snapshotted
@@ -1224,62 +1235,81 @@ impl Jitv2 {
     /// function is cleared by `mega_flush` in the same operation, and the
     /// compile queue is fully stopped (joined) before that clear runs.
     pub unsafe fn flush_from_cpu_thread(&mut self, bus: Arc<dyn BusDevice>) {
-        // `compile_queue.stop()` returns `Some` only if the async worker was
-        // actually running (i.e. threaded/`j2 inline off` mode) — that's
-        // also the only case this should restart it afterward. When it
-        // returns `None`, the codegen was already idle in `self.codegen`
-        // (inline/`j2 inline on` mode, the default), and it must go back
-        // there, NOT to the compile queue — unconditionally restarting the
-        // queue here regardless of which mode was actually active used to
-        // silently steal the codegen out from under inline dispatch: every
-        // inline compile after the first pool-exhaustion flush would find
-        // `self.codegen` empty and silently no-op (mips_exec.rs's `if let
-        // Some(codegen) = codegen.as_mut()` guard swallows it with no
-        // error), while `j2 inline` still reported "on" the whole time.
-        let (was_threaded, mut codegen) = match self.compile_queue.stop() {
-            Some(codegen) => (true, codegen),
-            None => (false, self.codegen.get_mut().take().expect(
-                "flush_from_cpu_thread: no Codegen available from either the stopped compile queue or the idle slot"
-            )),
-        };
-        // `stop()` joins the worker (provably not popping anymore) and hands
-        // back its Consumer as-is — anything still queued in it points into
-        // the pool `mega_flush` is about to clear. Drain before clearing, not
-        // after, same reasoning (and the same live-confirmed crash) as
-        // `CompileQueue::worker_loop`'s own pre-flush drain.
+        // `compile_queue.stop()` returns non-empty only if the async worker
+        // was actually running (i.e. threaded/`j2 inline off` mode) —
+        // that's also the only case this should restart it afterward. When
+        // it returns empty, the codegen was already idle in `self.codegen`
+        // (inline/`j2 inline on` mode, the default), and it must be reset
+        // and stay there, NOT go to the compile queue — unconditionally
+        // restarting the queue here regardless of which mode was actually
+        // active used to silently steal the codegen out from under inline
+        // dispatch: every inline compile after the first pool-exhaustion
+        // flush would find `self.codegen` empty and silently no-op
+        // (mips_exec.rs's `if let Some(codegen) = codegen.as_mut()` guard
+        // swallows it with no error), while `j2 inline` still reported "on"
+        // the whole time.
+        let stopped = self.compile_queue.stop();
+        let was_threaded = !stopped.is_empty();
+        let mut function_count = 0;
+        // `stop()` already drains the ring itself (see its own doc comment)
+        // — this second call is a harmless no-op belt-and-suspenders: every
+        // request still queued at stop-time points into the pool
+        // `mega_flush` is about to clear, and this must happen before that
+        // clear runs, not after (see `drain_pending`'s own doc comment for
+        // the live-confirmed crash that reasoning guards against).
         self.compile_queue.drain_pending_queue();
+        if was_threaded {
+            // The threaded queue's own Codegen(s) are discarded (dropped,
+            // not reset — `start()` will build fresh ones internally on
+            // restart below, same as it always does on a first start).
+            // `Codegen`'s `mem::forget`-on-drop semantics (see `reset`'s own
+            // doc comment) mean this leaks the old arena, same as any other
+            // orphaned Codegen — acceptable here since mega_flush below is
+            // about to invalidate every PhysicalCodePage entry that could
+            // have pointed into it anyway.
+            function_count = stopped.iter().map(|c| c.function_count()).sum();
+        } else if let Some(codegen) = self.codegen.get_mut().as_mut() {
+            function_count = codegen.function_count();
+            unsafe { codegen.reset(); }
+        }
         eprintln!(
             "jitv2: mega_flush (from cpu thread) — {} / {} pages used, {} functions compiled",
-            self.pages_used(), self.capacity(), codegen.function_count(),
+            self.pages_used(), self.capacity(), function_count,
         );
         self.mega_flush();
-        unsafe { codegen.reset(); }
         if was_threaded {
             let stats = self.stats.clone();
-            self.compile_queue.start(bus, codegen, stats);
-        } else {
-            *self.codegen.get_mut() = Some(codegen);
+            self.compile_queue.start(bus, stats);
         }
     }
 
     /// Mirror image of [`Self::flush_from_cpu_thread`], called FROM the
-    /// compile thread (`CompileQueue::worker_loop`, when its own `Codegen`
-    /// growth crosses `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`). The compile thread
-    /// can't pause itself (`CompileQueue::stop()` joins the very thread
-    /// that would be calling it — a self-join deadlock), so this pauses the
+    /// compile thread (`CompileQueue::worker_loop`'s `run_leader_flush`,
+    /// when the shared arena's growth crosses
+    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`). The compile thread can't
+    /// pause itself (`CompileQueue::stop()` joins the very thread that
+    /// would be calling it — a self-join deadlock), so this pauses the
     /// *CPU* instead: `cpu.stop()` fully joins the CPU's OS thread and
     /// establishes `pcp == null` as a stop-time invariant (`MipsCpu::stop`'s
     /// own doc comment) before returning, which is what makes it safe for
     /// this to clear the page pool directly despite §6.1.3's usual
     /// CPU-thread-only contract — the CPU is provably not running for the
-    /// whole operation. `codegen` is the caller's own instance (already
-    /// owned by the worker, never taken from `self.codegen` — unlike
-    /// `flush_from_cpu_thread`, there's no ambiguity about which `Codegen`
-    /// is "the" one here).
+    /// whole operation.
+    ///
+    /// Page-pool clear only — no longer resets any `Codegen`/arena itself
+    /// (unlike before the compile-pool redesign): `run_leader_flush` is the
+    /// one that builds the fresh shared arena and rebuilds every worker's
+    /// `Codegen` on top of it, since that needs direct access to
+    /// `SharedArena`/`BarrierState` types that have no reason to leak into
+    /// `Jitv2` itself. `function_count` is just for the log line (the
+    /// caller's own `codegen.function_count()` at the moment of the flush —
+    /// `Jitv2` has no `Codegen` of its own to read this from anymore).
     ///
     /// # Safety
-    /// Same contract as `Codegen::reset`. Guaranteed here by `cpu.stop()`
-    /// having fully joined before `mega_flush` runs.
+    /// No `JitFn` any worker's `Codegen` ever produced may still be
+    /// reachable/callable anywhere after this returns — guaranteed by the
+    /// caller having fully stopped the CPU (and, once a real pool exists,
+    /// having every other worker parked) before this runs.
     ///
     /// Must be called with `self` NOT already locked by the caller:
     /// `cpu.stop()` locks the executor and, through it, this same
@@ -1287,16 +1317,15 @@ impl Jitv2 {
     /// `MipsCpu::stop`'s doc comment) — calling this while already holding
     /// `Jitv2`'s lock (e.g. via `jit.lock().flush_from_jit_thread(...)`)
     /// self-deadlocks the compile thread on its own non-reentrant lock.
-    /// Callers must take the lock only for the `mega_flush`/`reset` portion,
-    /// not across `cpu.stop()`/`cpu.start()` — see `CompileQueue::worker_loop`
-    /// for the correct call shape.
-    pub unsafe fn flush_from_jit_thread(&mut self, cpu: &dyn Device, codegen: &mut crate::jitv2::codegen::Codegen) {
+    /// Callers must take the lock only for the `mega_flush` portion, not
+    /// across `cpu.stop()`/`cpu.start()` — see `CompileQueue::worker_loop`'s
+    /// `run_leader_flush` for the correct call shape.
+    pub unsafe fn flush_from_jit_thread(&mut self, function_count: u32) {
         eprintln!(
             "jitv2: mega_flush (from jit thread) — {} / {} pages used, {} functions compiled",
-            self.pages_used(), self.capacity(), codegen.function_count(),
+            self.pages_used(), self.capacity(), function_count,
         );
         self.mega_flush();
-        unsafe { codegen.reset(); }
     }
 }
 
@@ -1309,26 +1338,94 @@ impl Jitv2 {
 /// mostly sitting near-empty.
 pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 
-/// The compile thread and its inbound SPSC fifo (§6.4/§9 Phase 1: "mips exec
-/// thread pushes work via spsc fifo, jit thread compiles").
+/// Shared state behind the compile-pool's flush barrier — see
+/// `CompileQueue::park_at_barrier`/`run_leader_flush` for the protocol this
+/// drives. Wrapped as `Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>`,
+/// cloned into every worker thread. At today's fixed `thread_count == 1`
+/// this is exercised only through its degenerate no-wait path (see
+/// `run_leader_flush`'s own doc comment) — the park/wake logic itself is
+/// unit-tested directly against real spawned test threads
+/// (`tests::barrier_parks_followers_until_leader_resumes_them`), independent
+/// of the single-worker `worker_loop` integration, since N=1 alone can never
+/// exercise a real park.
+/// Shared state behind the compile-pool's single quiesce-everyone barrier —
+/// covers both kinds of pool-wide pause a worker can trigger: a full arena
+/// flush (rebuild every `Codegen` on a fresh arena) and a forced-seal sweep
+/// (mprotect whatever's queued, no arena replacement). These used to be two
+/// entirely separate barriers (`BarrierState`/`SealBarrierState`, each with
+/// its own leader-election `AtomicBool`) — confirmed live as a genuine
+/// deadlock: worker A wins the seal-leader election and waits for worker B
+/// to park at the seal barrier, while worker B simultaneously wins the
+/// flush-leader election and waits for worker A to park at the flush
+/// barrier; neither ever parks for the other since each is itself busy
+/// leading its own barrier wait. One barrier with one leader-election gate
+/// closes that off structurally: only one kind of pool-wide pause can ever
+/// be "in flight" at a time, and every follower always parks at the same
+/// single point regardless of which kind the leader is running.
+struct BarrierState {
+    /// How many non-leader workers are currently parked, waiting for this
+    /// generation to end. Reset to 0 by the leader once it resumes everyone.
+    parked_count: usize,
+    /// Bumped by the leader exactly once, right before `notify_all()` —
+    /// after finishing a flush and publishing a fresh arena into
+    /// `current_arena`/`current_state` below, or after finishing a
+    /// forced-seal sweep (which touches neither field). A parked worker
+    /// compares this against the value it observed when it started waiting
+    /// — guards against lost/spurious wakeups (a `Condvar::wait` can return
+    /// without a matching `notify`, and without this check a worker could
+    /// misread that as "the cycle is done" before it actually is).
+    generation: u64,
+    /// Whether the cycle that just ended (as of the most recent `generation`
+    /// bump) was a full flush — if so, every follower must rebuild its own
+    /// `Codegen` on `current_arena`/`current_state` before resuming (the old
+    /// arena is gone); if not (a seal-only cycle), followers resume in
+    /// place with no rebuild at all, since nothing about the arena's
+    /// identity changed, only its sealed watermark.
+    was_flush: bool,
+    /// The fresh shared arena the leader just built — `None` until the
+    /// first flush ever completes (never read before then, since nothing
+    /// can be parked before any worker has ever detected a flush trigger),
+    /// and never touched by a seal-only cycle (see `was_flush`).
+    current_arena: Option<Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>>,
+    current_state: Option<Arc<crate::jitv2::paged_memory::PagedArenaState>>,
+}
+
+impl BarrierState {
+    fn new() -> Self {
+        Self { parked_count: 0, generation: 0, was_flush: false, current_arena: None, current_state: None }
+    }
+}
+
+/// The compile thread pool and its inbound MPMC queue (§6.4/§9 Phase 1:
+/// "mips exec thread pushes work via fifo, jit thread(s) compile").
 ///
-/// Owns the `rtrb::Producer` end; the worker thread owns the `Consumer` end
-/// for its lifetime. Restartable: `stop()` gets the consumer back from the
-/// exiting worker so a later `start()` can resume with the same queue — this
-/// is what lets `mega_flush` stop-drain-restart the thread around a page-pool
-/// reset instead of the queue being single-use (see `mega_flush`'s call site
-/// in `mips_exec.rs`, `jitv2_track_pcp`, for why that's required: every
+/// One shared `crossbeam_queue::ArrayQueue` (`queue`) — the CPU thread
+/// pushes, every worker thread pops from the same instance, no
+/// producer/consumer split needed. Restartable: `stop()` joins every worker
+/// thread and collects their `Codegen`s, but the queue itself (an `Arc`) is
+/// never taken apart — it just sits idle (still holding whatever's left
+/// un-popped) between a `stop()` and the next `start()`. This is what lets
+/// `mega_flush` stop-drain-restart the pool around a page-pool reset instead
+/// of the queue being single-use (see `mega_flush`'s call site in
+/// `mips_exec.rs`, `jitv2_track_pcp`, for why that's required: every
 /// `CompileRequest::page` in flight or still queued points into the `Vec`
-/// `mega_flush` is about to clear, so the worker must be fully joined, and
-/// its queue drained, before that clear happens).
+/// `mega_flush` is about to clear, so every worker must be fully joined,
+/// and the queue drained, before that clear happens).
 pub struct CompileQueue {
-    producer: rtrb::Producer<CompileRequest>,
-    /// Consumer end, held here whenever the worker isn't running (between
-    /// `new()`/`stop()` and the next `start()`). `start()` takes it to move
-    /// into the worker thread; `None` while the thread is running.
-    consumer: Option<rtrb::Consumer<CompileRequest>>,
+    /// The one shared bounded MPMC ring: the CPU thread pushes
+    /// (`CompileQueue::send`), every worker thread pops from the same
+    /// `Arc` — no producer/consumer handoff needed (unlike the old
+    /// `rtrb`-based SPSC design, `ArrayQueue::push`/`pop` both take `&self`,
+    /// so this can just be cloned into each worker thread and left there
+    /// permanently, alive across `stop()`/`start()` cycles). Bounded, with
+    /// `push` returning `Err` on full rather than blocking — preserves
+    /// §6.4's "drop on full, hot pages re-trigger" semantics exactly.
+    queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
     running: Arc<AtomicBool>,
-    thread: Option<JoinHandle<(rtrb::Consumer<CompileRequest>, crate::jitv2::codegen::Codegen)>>,
+    /// One `JoinHandle` per worker thread — empty when not running. Each
+    /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
+    /// return type); `stop()` collects all of them.
+    threads: Vec<JoinHandle<crate::jitv2::codegen::Codegen>>,
     /// Weak handle to the CPU device, so the worker can stop/start it itself
     /// when a memory-growth flush is needed (`Codegen::function_count()`
     /// crossing `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES` — see `worker_loop`). Set
@@ -1349,80 +1446,116 @@ pub struct CompileQueue {
     /// is provably stopped for the whole operation). Set via `set_owner`,
     /// same injection-after-construction reasoning as `cpu`.
     jitv2: Mutex<Option<Weak<Mutex<Jitv2>>>>,
-    /// Mirror of the worker's own `codegen.function_count()`, updated after
-    /// every compile — exists purely so `j2 stats` can read a function count
-    /// while the worker owns the real `Codegen` by value (not behind any
-    /// lock a status command could take without contending the hot compile
-    /// path). Shared (`Arc`, like `running`) because `worker_loop` runs on
-    /// its own thread and needs to write it without a `&CompileQueue`. Reset
-    /// to 0 alongside every real flush (`worker_loop`'s own
-    /// `flush_from_jit_thread` call) so it never drifts from what
-    /// `function_count()` would report if you could ask the real `Codegen`
-    /// directly.
-    function_count: Arc<AtomicU32>,
-    /// Toggle for `worker_loop`'s deferred-finalize batching (`j2 batch
-    /// on|off`) — `Arc<AtomicBool>` for the same reason `running` is: the
-    /// worker thread needs to read it every loop iteration without a lock,
-    /// and the CPU/console thread needs to flip it from outside — see
-    /// `worker_loop`'s own doc comment for what flips on when this is `true`.
-    /// Defaults to `false` under `developer` (diagnostics builds want the
-    /// simpler per-compile-immediate-finalize behavior, not batched
-    /// publishes complicating a step-by-step investigation) and to `true`
-    /// otherwise (production runs want the tighter arena packing batching
-    /// gives).
-    batch_enabled: Arc<AtomicBool>,
+    /// Per-worker mirror of each worker's own `codegen.function_count()`,
+    /// one slot per pool thread, updated after every compile that worker
+    /// performs — exists purely so `j2 stats` can read a total function
+    /// count while each worker owns its own real `Codegen` by value (not
+    /// behind any lock a status command could take without contending the
+    /// hot compile path). `function_count()` sums across all slots. Built
+    /// fresh (length `thread_count`) by `start_inner` on every start, since
+    /// the slot count itself can only change between runs, never while a
+    /// pool is live. Each worker's own slot is reset to 0 alongside every
+    /// real flush its `Codegen` goes through (`run_leader_flush`/
+    /// `park_at_barrier`'s resume path) so it never drifts from what
+    /// `Codegen::function_count()` would report if you could ask that
+    /// worker's real `Codegen` directly.
+    function_counts: Vec<Arc<AtomicU32>>,
+    /// Fixed pool size — read once by `start()`, never changed at runtime
+    /// (no "j2 threads N" mutation; see `set_thread_count`'s own doc
+    /// comment). Defaults to 1 so every existing caller (tests,
+    /// `equiv_test.rs`, any non-`Machine::new` construction path) keeps
+    /// today's single-worker behavior without having to know this field
+    /// exists at all.
+    thread_count: usize,
+    /// The compile-pool flush barrier — see `BarrierState`'s own doc
+    /// comment. Shared (`Arc`) so it can be cloned into the worker thread
+    /// (and, once a real pool exists, every worker thread) alongside
+    /// `running`.
+    barrier: Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
+    /// Leader-election gate for a quiesce cycle (either kind — full flush or
+    /// forced-seal-only, see `BarrierState`'s own doc comment for why
+    /// there's only one gate covering both): the first worker to detect
+    /// either trigger (`compare_exchange(false, true)`) becomes leader and
+    /// runs the corresponding sequence; every other worker that also
+    /// detects a trigger (or polls this flag at its own next loop-top
+    /// check) falls straight to `park_at_barrier` instead of racing to also
+    /// lead. Cleared by the leader after publishing the result and
+    /// releasing the barrier. At today's `thread_count == 1` this is still
+    /// real — exactly one worker exists, so it always "wins" trivially —
+    /// but the mechanism is exercised for real once a genuine pool shares
+    /// it.
+    quiesce_in_progress: Arc<AtomicBool>,
 }
 
 impl CompileQueue {
-    /// Construct the queue without starting the worker thread. Call
-    /// [`Self::start`] to spawn it.
+    /// Construct the queue without starting any worker threads. Call
+    /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
-        let (producer, consumer) = rtrb::RingBuffer::new(COMPILE_QUEUE_CAPACITY);
         Self {
-            producer,
-            consumer: Some(consumer),
+            queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            threads: Vec::new(),
             cpu: Mutex::new(None),
             jitv2: Mutex::new(None),
-            function_count: Arc::new(AtomicU32::new(0)),
-            batch_enabled: Arc::new(AtomicBool::new(!cfg!(feature = "developer"))),
+            function_counts: Vec::new(),
+            thread_count: 1,
+            barrier: Arc::new((parking_lot::Mutex::new(BarrierState::new()), parking_lot::Condvar::new())),
+            quiesce_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Enable or disable deferred-finalize batching on the worker thread —
-    /// see `worker_loop`'s doc comment. Safe to call at any time; takes
-    /// effect on the worker's next loop iteration (or immediately for a
-    /// not-yet-started queue). Returns the previous value.
-    pub fn set_batch_enabled(&self, enabled: bool) -> bool {
-        self.batch_enabled.swap(enabled, Ordering::Relaxed)
+    /// Set the pool's fixed worker-thread count — must be called before the
+    /// queue is ever `start()`-ed (later calls are a no-op, guarded by
+    /// `debug_assert!`, since the whole point is "fixed at startup, no
+    /// runtime mutation"). `Machine::new` is the only real caller today
+    /// (reading `[jitv2].threads`/`--jitv2-threads` from config — not yet
+    /// wired; still hardcoded to the default of 1 everywhere until that
+    /// config plumbing lands). `n.max(1)`: a misconfigured 0 would
+    /// otherwise silently degrade to "no compile threads at all."
+    pub fn set_thread_count(&mut self, n: usize) {
+        debug_assert!(self.threads.is_empty(), "set_thread_count must be called before the pool ever starts");
+        self.thread_count = n.max(1);
     }
 
+    /// Configured pool size — `j2 threads`'s read-only report.
     #[inline]
-    pub fn batch_enabled(&self) -> bool {
-        self.batch_enabled.load(Ordering::Relaxed)
+    pub fn thread_count(&self) -> usize {
+        self.thread_count
     }
 
-    /// Mirror of the worker's own `Codegen::function_count()` — see
-    /// `function_count`'s field doc comment for why this exists instead of
-    /// reading the real `Codegen` directly. Meaningful only while the
-    /// worker is actually running (`j2 stats`/`j2 status` callers should
-    /// prefer `Jitv2::codegen.lock()` when it's `Some`, and fall back to
-    /// this only when it's `None`, i.e. the worker currently owns it).
+    /// Whether the worker pool is currently spawned — the real signal for
+    /// "does the async compile thread own compilation right now," since
+    /// `Jitv2::codegen` being `Some`/`None` no longer tracks that (the pool
+    /// leaves `Jitv2::codegen`'s idle slot alone the whole time it runs,
+    /// reserved for `j2 inline on` to take later — see `Machine::new`'s own
+    /// comment on `compile_queue.start()`). `j2 status`/`j2 stats` should
+    /// check this, not `jit.codegen.lock().is_some()`, to decide whether to
+    /// report from the idle slot or from `function_count()`/pool-wide state.
+    #[inline]
+    pub fn is_running(&self) -> bool {
+        !self.threads.is_empty()
+    }
+
+
+    /// Sum, across every worker's own slot, of `Codegen::function_count()`
+    /// — see `function_counts`' field doc comment for why this is per-worker
+    /// rather than one shared mirror. Meaningful only while the pool is
+    /// actually running (`j2 stats`/`j2 status` callers should prefer
+    /// `Jitv2::codegen.lock()` when it's `Some`, and fall back to this only
+    /// when it's `None`, i.e. the pool currently owns every `Codegen`).
     #[inline]
     pub fn function_count(&self) -> u32 {
-        self.function_count.load(Ordering::Relaxed)
+        self.function_counts.iter().map(|c| c.load(Ordering::Relaxed)).sum()
     }
 
-    /// Current occupancy of the compile-request ring buffer — `producer`
-    /// stays on `CompileQueue` at all times (only `consumer` moves into the
-    /// worker thread on `start()`), so this is readable regardless of
-    /// whether the worker is running. `j2 status`'s live "how full is it
+    /// Current occupancy of the compile-request queue — readable regardless
+    /// of whether any worker is running (the queue is a plain shared `Arc`,
+    /// not handed off to a consumer). `j2 status`'s live "how full is it
     /// right now" reading, distinct from `JitStats::compile_queue_depth_sum`'s
     /// historical average.
     #[inline]
     pub fn queue_occupancy(&self) -> usize {
-        COMPILE_QUEUE_CAPACITY - self.producer.slots()
+        self.queue.len()
     }
 
     /// Inject the CPU device handle — see the `cpu` field's doc comment for
@@ -1457,14 +1590,14 @@ impl CompileQueue {
     pub fn send(&mut self, req: CompileRequest, #[allow(unused_variables)] stats: &JitStats) -> bool {
         #[cfg(feature = "developer")]
         {
-            // slots() before push(): occupancy right now, not after this
-            // one lands — matches "depth the compile thread is running at"
-            // rather than counting this dispatch's own contribution to it.
-            let occupancy = COMPILE_QUEUE_CAPACITY - self.producer.slots();
+            // len() before push(): occupancy right now, not after this one
+            // lands — matches "depth the compile pool is running at" rather
+            // than counting this dispatch's own contribution to it.
+            let occupancy = self.queue.len();
             stats.compile_queue_dispatches.fetch_add(1, Ordering::Relaxed);
             stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
         }
-        let accepted = self.producer.push(req).is_ok();
+        let accepted = self.queue.push(req).is_ok();
         #[cfg(feature = "developer")]
         if !accepted {
             stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
@@ -1472,91 +1605,169 @@ impl CompileQueue {
         accepted
     }
 
-    /// Discard every `CompileRequest` currently sitting in `consumer`
+    /// Discard every `CompileRequest` currently sitting in the shared queue
     /// without processing it. Every `CompileRequest::page` is a raw pointer
     /// into `Jitv2::pages` (`Vec<PhysicalCodePage>`) — a request enqueued
     /// before a `mega_flush` still holds a pointer into the just-cleared
     /// `Vec` after it, and `comp::handle_request` dereferencing it is a real
     /// use-after-free (confirmed live: `PhysicalCodePage::publish` segfault,
     /// `jitv2-compile` thread, immediately after a `flush_from_jit_thread`
-    /// that never drained the queue first). Must run with nothing else
-    /// popping `consumer` concurrently — true both when called from the
-    /// worker thread itself right after `cpu.stop()` (nothing else touches
-    /// this `Consumer` while the CPU can't enqueue new requests and this
-    /// thread isn't popping anything else), and when called by
-    /// `flush_from_cpu_thread`'s caller right after `stop()` hands the
-    /// `Consumer` back (the worker thread is joined, provably not popping).
-    fn drain_pending(consumer: &mut rtrb::Consumer<CompileRequest>) {
-        while consumer.pop().is_ok() {}
+    /// that never drained the queue first). Must run with no worker thread
+    /// concurrently popping — true both when called from the flush leader
+    /// itself right after `cpu.stop()` has fully joined the CPU and every
+    /// other worker has parked (nothing pops anymore), and when called by
+    /// `flush_from_cpu_thread`'s caller right after `stop()` has joined
+    /// every worker thread (provably not popping).
+    fn drain_pending(queue: &crossbeam_queue::ArrayQueue<CompileRequest>) {
+        while queue.pop().is_some() {}
     }
 
     /// Public entry point for [`Self::drain_pending`] when the caller only
-    /// has `&mut CompileQueue`, not the raw `Consumer` (i.e. after `stop()`
-    /// has stashed it back into `self.consumer`) — see `drain_pending`'s own
-    /// doc comment for why this must run. No-op if the worker is currently
-    /// running (`self.consumer` is `None` while it owns the `Consumer`) —
-    /// callers in that state should be draining via the worker thread's own
-    /// call to `drain_pending` instead (`worker_loop`'s pre-flush drain).
+    /// has `&CompileQueue`, not direct access to the shared queue — see
+    /// `drain_pending`'s own doc comment for why this must run and when
+    /// it's safe to call (no worker concurrently popping).
     pub fn drain_pending_queue(&mut self) {
-        if let Some(consumer) = self.consumer.as_mut() {
-            Self::drain_pending(consumer);
-        }
+        Self::drain_pending(&self.queue);
     }
 
-    /// Spawn the compile-thread worker. No-op if already running (`codegen`
-    /// is dropped in that case — same "start is idempotent" contract as
-    /// before). `bus` is the executor's `sysad` — the worker reads the page
-    /// snapshot off it at compile time (§6.5 step 2). `codegen` is the
-    /// shared `Codegen` this queue and `jitv2_inline_compile` take turns
-    /// owning (`Jitv2::codegen` — see that field's doc comment); the worker
-    /// owns it for its entire run and hands it back via `stop()`. `stats` is
-    /// `Jitv2::stats`, cloned in by the caller (mirrors `cpu`/`jitv2` below —
-    /// see `JitStats`'s own doc comment for why this is an `Arc` handed in
-    /// rather than reached via a lock on every `handle_request` call).
-    /// Threaded through unconditionally (cheap: one more `Arc` clone) rather
-    /// than duplicating this whole function behind `#[cfg(feature =
-    /// "developer")]` — the actual counter increments are what's gated, in
-    /// `comp::handle_request`.
-    pub fn start(&mut self, bus: Arc<dyn BusDevice>, codegen: crate::jitv2::codegen::Codegen, stats: Arc<JitStats>) {
-        if self.thread.is_some() {
+    /// Spawn the compile-thread pool with one freshly-reserved shared arena
+    /// — today's normal entry point (`Machine::new`'s startup path). See
+    /// `start_inner`'s own doc comment for the full contract.
+    pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
+        let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
+            crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, state.clone(),
+        ).expect("CompileQueue::start: failed to reserve a fresh jitv2 arena");
+        self.start_inner(bus, stats, shared, state);
+    }
+
+    /// Spawn the compile-thread pool with every worker's `Codegen` built on
+    /// top of an *already-reserved* shared arena instead of a fresh one —
+    /// the `j2 inline off` mode-switch path (reusing whatever arena inline
+    /// mode's own `Codegen` was already using, rather than abandoning it —
+    /// see that handler's own comment).
+    pub fn start_with_shared_arena(
+        &mut self,
+        bus: Arc<dyn BusDevice>,
+        stats: Arc<JitStats>,
+        shared: Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
+        state: Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    ) {
+        self.start_inner(bus, stats, shared, state);
+    }
+
+    /// No-op if already running. `bus` is the executor's `sysad` — every
+    /// worker reads the page snapshot off it at compile time (§6.5 step 2).
+    /// `stats` is `Jitv2::stats`, cloned in by the caller (mirrors
+    /// `cpu`/`jitv2` below — see `JitStats`'s own doc comment for why this
+    /// is an `Arc` handed in rather than reached via a lock on every
+    /// `handle_request` call). Threaded through unconditionally (cheap: one
+    /// more `Arc` clone per worker) rather than duplicating this whole
+    /// function behind `#[cfg(feature = "developer")]` — the actual counter
+    /// increments are what's gated, in `comp::handle_request`.
+    ///
+    /// Spawns exactly `self.thread_count` `jitv2-compile-N` OS threads, each
+    /// with its own `Codegen` built via `Codegen::new_with_shared_arena` on
+    /// top of the ONE `shared`/`state` pair passed in — one arena
+    /// reservation for the whole pool, N independent `JITModule`s sharing
+    /// it (see `paged_memory`'s module doc comment for why that's safe:
+    /// `allocate()` is mutex-serialized inside `SharedArena`, and sealing is
+    /// worker-agnostic by construction). Every worker pops from the same
+    /// `self.queue` (`crossbeam_queue::ArrayQueue`) — no per-worker ring, no
+    /// dispatch routing needed on the send side.
+    fn start_inner(
+        &mut self,
+        bus: Arc<dyn BusDevice>,
+        stats: Arc<JitStats>,
+        shared: Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
+        state: Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    ) {
+        if !self.threads.is_empty() {
             return;
         }
-        let consumer = match self.consumer.take() {
-            Some(c) => c,
-            None => return, // start() called concurrently or before the prior stop() finished
-        };
         self.running.store(true, Ordering::SeqCst);
-        self.function_count.store(codegen.function_count(), Ordering::Relaxed);
-        let running = self.running.clone();
-        let cpu = self.cpu.lock().clone();
-        let jitv2 = self.jitv2.lock().clone();
-        let function_count = self.function_count.clone();
-        let batch_enabled = self.batch_enabled.clone();
-        self.thread = Some(
-            std::thread::Builder::new()
-                .name("jitv2-compile".to_string())
-                .spawn(move || Self::worker_loop(consumer, running, bus, codegen, cpu, jitv2, function_count, stats, batch_enabled))
-                .expect("jitv2-compile spawn"),
-        );
+        self.function_counts = (0..self.thread_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
+        for i in 0..self.thread_count {
+            let codegen = crate::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
+            let queue = self.queue.clone();
+            let running = self.running.clone();
+            let bus = bus.clone();
+            let cpu = self.cpu.lock().clone();
+            let jitv2 = self.jitv2.lock().clone();
+            let function_count = self.function_counts[i].clone();
+            let stats = stats.clone();
+            let barrier = self.barrier.clone();
+            let quiesce_in_progress = self.quiesce_in_progress.clone();
+            let thread_count = self.thread_count;
+            self.threads.push(
+                std::thread::Builder::new()
+                    .name(format!("jitv2-compile-{i}"))
+                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count))
+                    .expect("jitv2-compile spawn"),
+            );
+        }
     }
 
-    /// Stop the worker thread and join it, reclaiming the consumer and the
-    /// shared `Codegen` so a later `start()` can resume with both. No-op (and
-    /// returns `None`) if not running. The `Codegen` returned here is
-    /// whatever the worker was using at the moment it exited — untouched by
-    /// `stop()` itself, so the caller (`j2 inline off`→`on`, or
-    /// `MipsExecutor` reclaiming it for inline dispatch) must put it back
-    /// into `Jitv2::codegen` before anything tries to compile through the
-    /// inline path.
-    pub fn stop(&mut self) -> Option<crate::jitv2::codegen::Codegen> {
+    /// Stop the worker thread(s) and join them, reclaiming the consumer(s)
+    /// and every worker's own `Codegen` so a later `start()` can resume
+    /// (with fresh `Codegen`s of its own — see `start()`'s own doc comment
+    /// on why these returned ones are no longer handed back in). Empty
+    /// `Vec` if not running; otherwise one `Codegen` per worker thread, in
+    /// no particular order — every caller (`flush_from_cpu_thread`, the `j2
+    /// inline` handler) already treats this as "however many were running,"
+    /// not "exactly one."
+    ///
+    /// Drains every request still sitting in the shared queue (the CPU
+    /// thread can keep enqueueing right up until the moment `running` flips
+    /// false, so this is never guaranteed empty just because every worker
+    /// joined) and zeroes the status-bar queue-fill gauge — without this, a
+    /// request dropped here silently vanishes (harmless on its own, same as
+    /// any other §6.4 drop-on-full/drop-on-flush case; the offset just
+    /// re-triggers on its next arrival) but the status bar's occupancy
+    /// reading was confirmed live to otherwise stay stuck at whatever it
+    /// last was before the stop, forever, since nothing calls
+    /// `set_queue_fill` again once no worker is running.
+    pub fn stop(&mut self) -> Vec<crate::jitv2::codegen::Codegen> {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.thread.take() {
-            if let Ok((consumer, codegen)) = handle.join() {
-                self.consumer = Some(consumer);
-                return Some(codegen);
-            }
+        let result: Vec<_> = self.threads.drain(..).enumerate().filter_map(|(i, h)| {
+            let r = h.join();
+            r.ok()
+        }).collect();
+        self.drain_pending_queue();
+        crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
+        result
+    }
+
+    /// Block this (non-leader) worker until the current quiesce cycle's
+    /// leader finishes and releases the barrier. Registers itself as parked
+    /// (bumping `parked_count`, which is what the leader's own wait
+    /// condition — `parked_count == thread_count - 1` — counts against),
+    /// then waits on `generation` advancing past whatever value was current
+    /// at entry (guards spurious/lost wakeups — see `BarrierState::generation`'s
+    /// own doc comment). Returns `Some((arena, state))` if the cycle that
+    /// just ended was a full flush (`BarrierState::was_flush`) — the caller
+    /// must rebuild its own `Codegen` from it
+    /// (`Codegen::new_with_shared_arena`) before resuming its loop — or
+    /// `None` if it was a seal-only cycle, where the caller resumes in
+    /// place with nothing to rebuild.
+    fn park_at_barrier(
+        barrier: &Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
+    ) -> Option<(Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>, Arc<crate::jitv2::paged_memory::PagedArenaState>)> {
+        let (mutex, cv) = &**barrier;
+        let mut state = mutex.lock();
+        let my_generation = state.generation;
+        state.parked_count += 1;
+        cv.notify_all(); // wake the leader, which is waiting for parked_count to reach thread_count - 1
+        while state.generation == my_generation {
+            cv.wait(&mut state);
         }
-        None
+        if !state.was_flush {
+            return None;
+        }
+        Some((
+            state.current_arena.clone().expect("park_at_barrier: a flush leader must publish an arena before bumping generation"),
+            state.current_state.clone().expect("park_at_barrier: a flush leader must publish a state before bumping generation"),
+        ))
     }
 
     /// Worker body: pop requests until stopped and hand each to
@@ -1569,36 +1780,76 @@ impl CompileQueue {
     /// rather than busy-spinning — compile requests are bursty (arrival
     /// threshold crossings), not latency-critical.
     ///
-    /// When `batch_enabled` is set (`j2 batch on`), compiles route through
-    /// `comp::handle_request_deferred` instead of the immediate
-    /// `comp::handle_request`: each successful compile accumulates a
-    /// `PendingPublish` rather than finalizing+publishing on the spot, and
-    /// the whole pending batch is finalized together
-    /// (`comp::flush_pending_batch`) whenever `codegen.provider_crossed_page()`
-    /// reports the *next* allocation would spill onto a new host-page
-    /// segment, or the queue drains empty (whichever comes first) — see
-    /// `paged_memory`'s module doc comment for why batching the
-    /// `finalize_definitions()` call is what actually lets functions pack
-    /// tightly instead of each getting its own page. `pending` is discarded
-    /// (never flushed) immediately before `do_flush` runs: `do_flush` resets
-    /// `codegen` (freeing the whole arena — every not-yet-finalized `FuncId`
-    /// in `pending` would dangle) and clears the page pool (every
-    /// `PendingPublish::page` would dangle too), so there's nothing safe left
-    /// to publish by that point — same reasoning as `drain_pending` already
-    /// applies to in-flight `CompileRequest`s for the identical reset.
+    /// Every compile routes through `comp::handle_request_deferred`, never
+    /// `comp::handle_request` — `handle_request`'s forced-seal contract
+    /// (mprotect a whole host page to RX immediately, unconditionally) is
+    /// only safe with a single caller, since it assumes nothing else could
+    /// possibly still be bump-allocating or `copy_nonoverlapping`-ing into
+    /// that same page; under a real N>1 pool, another worker routinely can
+    /// be — confirmed live as a SIGSEGV inside `CompiledBlob::new`'s own
+    /// write the first time this pool ran with `thread_count > 1` outside
+    /// tests. `handle_request` stays in use elsewhere (inline compile,
+    /// `mips_exec.rs`'s `jitv2_inline_compile` — single-threaded on the CPU
+    /// thread, where the forced-seal assumption still holds), just never
+    /// here. `handle_request_deferred` still finalizes every successful
+    /// compile immediately (`Codegen::finalize_batch_nonforced`,
+    /// called with just that one `FuncId` — cheap, and this is what patches
+    /// relocations; see that function's own doc comment for why deferring
+    /// the finalize call itself, not just the seal, used to be a real bug
+    /// under multi-worker concurrency). What's deferred is only the *seal*
+    /// (mprotect) step: `finalize_batch_nonforced` pushes the just-finalized
+    /// range onto the shared arena's seal queue and opportunistically seals
+    /// whatever's now a contiguous prefix from the watermark — the common
+    /// case publishes right away, same call. If this range is gap-blocked
+    /// behind an earlier, not-yet-finalized range from another worker, it
+    /// comes back unsealed and `handle_request_deferred` pushes exactly one
+    /// `PendingPublish` onto `pending` for a later retry — see
+    /// `paged_memory`'s module doc comment for why sealing (not finalizing)
+    /// is what actually lets functions pack tightly instead of each getting
+    /// its own page. `pending` is drained two ways: (1) on every queue-empty
+    /// poll (the `None` arm), a *non-forced* `comp::publish_ready_nonforced`
+    /// attempt runs first (safe/cheap — publishes anything already sealable
+    /// without forcing a page closed early), and only once the queue has
+    /// been continuously empty for a real ~100ms idle threshold does
+    /// `comp::force_publish_pending` force-seal whatever's still stuck — so
+    /// a lone straggler that never grows into a full page still gets
+    /// published eventually, at the cost of at most one prematurely-closed
+    /// partial page per idle burst (see `Codegen::force_seal_pending`'s own
+    /// doc comment). `pending` is normally at most one or two entries per
+    /// worker (genuinely gap-blocked ranges), not an accumulated batch.
+    /// `pending` is discarded (never flushed) immediately before `do_flush` runs:
+    /// `do_flush` resets `codegen` (freeing the whole arena — every
+    /// not-yet-finalized `FuncId` in `pending` would dangle) and clears the
+    /// page pool (every `PendingPublish::page` would dangle too), so there's
+    /// nothing safe left to publish by that point — same reasoning as
+    /// `drain_pending` already applies to in-flight `CompileRequest`s for
+    /// the identical reset.
     ///
     /// After every successful compile, checks `codegen.function_count()`
     /// against the flush threshold (`Codegen::function_count`'s doc comment)
-    /// — if crossed, stops the CPU (via `cpu`, upgraded from `Weak`; skipped
-    /// entirely if unset or already gone — nothing to flush for if the
-    /// machine has no CPU to pause), flushes in place (page pool +
-    /// `codegen.reset()` — NOT `Jitv2::flush`, which would try to stop this
-    /// same compile queue from within itself; this worker just does the
-    /// pool clear + reset directly, since it's already the thing that would
-    /// need pausing), and restarts the CPU. Returns `(consumer, codegen)` on
-    /// exit so `stop()` can hand both back to a later `start()`.
+    /// — if crossed, the first worker to detect it becomes leader
+    /// (`quiesce_in_progress.compare_exchange`) and runs `run_leader_flush`:
+    /// stops the CPU (via `cpu`, upgraded from `Weak`; skipped entirely if
+    /// unset or already gone — nothing to flush for if the machine has no
+    /// CPU to pause), waits for every other worker to park
+    /// (`park_at_barrier`, called by any worker whose own loop-top check —
+    /// or its own trigger detection — sees `quiesce_in_progress` already
+    /// set), flushes the page pool (`Jitv2::flush_from_jit_thread` — NOT
+    /// `Jitv2::flush`, which would try to stop this same compile queue from
+    /// within itself), builds one fresh shared arena, rebuilds every
+    /// worker's own `Codegen` on top of it
+    /// (`Codegen::new_with_shared_arena`/`reset_with_shared_arena`),
+    /// publishes it into the barrier, and restarts the CPU. At today's
+    /// `thread_count == 1` there are never any followers to wait for — the
+    /// leader's own barrier wait is immediately satisfied — so this is
+    /// observably identical to the pre-pool `do_flush` sequence; the
+    /// election/park machinery itself is proven separately, with real
+    /// concurrent threads, in `tests::barrier_parks_followers_until_leader_resumes_them`.
+    /// Returns `codegen` on exit so `stop()` can collect it — the shared
+    /// `queue` itself is never handed back (it's an `Arc`, cloned into every
+    /// worker up front and simply left running/idle after they all exit).
     fn worker_loop(
-        mut consumer: rtrb::Consumer<CompileRequest>,
+        queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
         running: Arc<AtomicBool>,
         bus: Arc<dyn BusDevice>,
         mut codegen: crate::jitv2::codegen::Codegen,
@@ -1606,66 +1857,269 @@ impl CompileQueue {
         jitv2: Option<Weak<Mutex<Jitv2>>>,
         function_count: Arc<AtomicU32>,
         stats: Arc<JitStats>,
-        batch_enabled: Arc<AtomicBool>,
-    ) -> (rtrb::Consumer<CompileRequest>, crate::jitv2::codegen::Codegen) {
+        barrier: Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
+        quiesce_in_progress: Arc<AtomicBool>,
+        thread_count: usize,
+    ) -> crate::jitv2::codegen::Codegen {
         let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
-        let mut pending: Vec<crate::jitv2::comp::PendingPublish> = Vec::new();
-        // Pauses the CPU and flushes in place — shared by both flush
-        // triggers below (function-count threshold, and an out-of-memory
-        // compile failure). See the two call sites for why each one needs
-        // this; the sequencing itself (cpu.stop() outside the Jitv2 lock,
-        // drain the queue before mega_flush clears the pool, cpu.start()
-        // after releasing the lock) is identical either way.
-        let do_flush = |consumer: &mut rtrb::Consumer<CompileRequest>,
-                         codegen: &mut crate::jitv2::codegen::Codegen,
-                         function_count: &Arc<AtomicU32>,
-                         pending: &mut Vec<crate::jitv2::comp::PendingPublish>| {
-            if let (Some(cpu), Some(jit)) = (
-                cpu.as_ref().and_then(Weak::upgrade),
-                jitv2.as_ref().and_then(Weak::upgrade),
-            ) {
+        let mut pending: crate::jitv2::comp::PendingCount = 0;
+        // Wall-clock start of the current unbroken stretch of "queue empty
+        // AND pending still non-empty after a non-forced publish attempt" —
+        // see the `Err(_)` arm below (queue-drain fallback) for the
+        // idle-timeout scheme this drives. `None` whenever there's nothing
+        // idle to time (queue non-empty, or pending fully drained).
+        let mut idle_since: Option<std::time::Instant> = None;
+        // Wait for every other worker to park, same as a plain `cv.wait`
+        // loop on `parked_count`, but periodically re-checks `running` so a
+        // `CompileQueue::stop()` racing against an in-flight leader
+        // sequence can never wedge forever: `stop()` sets `running = false`
+        // then joins every thread in turn; a *follower* thread's own
+        // top-of-loop check can see `running == false` and exit
+        // `worker_loop` entirely (not park) before the leader's wait
+        // condition is ever satisfied — confirmed live as a genuine hang
+        // (leader stuck waiting for parked_count to reach a follower that
+        // had already exited, `stop()`'s `.join()` on the leader thread
+        // never returning). Returns `true` once every other worker has
+        // actually parked (safe to proceed with the real flush/seal work),
+        // or `false` if `running` went false first (the caller must abandon
+        // the quiesce cleanly and return, not touch shared state further).
+        let wait_for_followers_or_abandon = |barrier: &Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>| -> bool {
+            let (mutex, cv) = &**barrier;
+            let mut state = mutex.lock();
+            while state.parked_count < thread_count.saturating_sub(1) {
+                if !running.load(Ordering::Relaxed) {
+                    return false;
+                }
+                // Bounded wait, not an unbounded `cv.wait` — this is what
+                // lets the `running` re-check above actually happen instead
+                // of blocking indefinitely on a notify that a stopping pool
+                // will never send (the follower that's supposed to park has
+                // already exited instead). The timeout only needs to be
+                // short enough that `stop()` doesn't feel hung — it is not
+                // on any latency-sensitive path otherwise.
+                cv.wait_for(&mut state, std::time::Duration::from_millis(20));
+            }
+            true
+        };
+        // Release the barrier without publishing anything (no arena, no
+        // seal result) — the shared cleanup for every way a leader sequence
+        // can end without actually doing the flush/seal work: `cpu`/`jitv2`
+        // failed to upgrade, or `running` went false while waiting for
+        // followers (`wait_for_followers_or_abandon` returned `false`).
+        // Bumping `generation` here still matters even with nothing to
+        // publish — any follower already parked (or about to park) must
+        // still wake up and see `was_flush: false`, not hang forever behind
+        // a leader that's giving up.
+        let abandon_quiesce = |pending: &mut crate::jitv2::comp::PendingCount| {
+            *pending = 0;
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            state.parked_count = 0;
+            state.was_flush = false;
+            state.generation += 1;
+            cv.notify_all();
+            drop(state);
+            quiesce_in_progress.store(false, Ordering::Release);
+        };
+        // Runs the full leader sequence for an arena flush — see
+        // worker_loop's own doc comment for the step-by-step. Called only
+        // after this thread has already won leadership via
+        // `quiesce_in_progress.compare_exchange`.
+        let run_leader_flush = |codegen: &mut crate::jitv2::codegen::Codegen,
+                                 function_count: &Arc<AtomicU32>,
+                                 pending: &mut crate::jitv2::comp::PendingCount| {
+            let Some((cpu, jit)) = cpu.as_ref().and_then(Weak::upgrade).zip(jitv2.as_ref().and_then(Weak::upgrade)) else {
+                // `set_cpu`/`set_owner` were never called, or their target
+                // has since been dropped — this thread already won
+                // leadership (quiesce_in_progress is true) and every other
+                // worker will either park here too or block waiting for
+                // this generation to end, so failing to release the barrier
+                // would deadlock the whole pool forever, not just skip one
+                // flush. A running pool with no cpu/jitv2 wired is a real
+                // bug (Machine::new always wires both before load can ever
+                // reach a flush threshold) — assert in debug/test builds so
+                // it's caught immediately, but still recover in release so
+                // production never wedges silently.
+                debug_assert!(false, "jitv2 compile pool flush triggered with no cpu/jitv2 wired (set_cpu/set_owner never called, or their target was dropped)");
+                abandon_quiesce(pending);
+                return;
+            };
+            {
+                // Wait for every OTHER worker to park before touching
+                // anything shared — at thread_count == 1 there are none, so
+                // this is immediately satisfied (parked_count < 0 never
+                // holds for the unsigned saturating_sub(1) below). Bails
+                // out cleanly (no flush performed) if `running` goes false
+                // first — see `wait_for_followers_or_abandon`'s own doc
+                // comment for the `CompileQueue::stop()` race this guards.
+                if !wait_for_followers_or_abandon(&barrier) {
+                    abandon_quiesce(pending);
+                    return;
+                }
                 // Discard, not flush: every PendingPublish::page and every
                 // not-yet-finalized FuncId this batch is holding is about to
-                // dangle (flush_from_jit_thread clears the page pool and
-                // resets codegen's whole arena) — see worker_loop's own doc
-                // comment for the full reasoning, same as drain_pending's
-                // existing treatment of in-flight CompileRequests below.
-                pending.clear();
+                // dangle (the page-pool clear below, plus every worker's
+                // Codegen getting rebuilt on a fresh arena) — see
+                // worker_loop's own doc comment for the full reasoning,
+                // same as drain_pending's existing treatment of in-flight
+                // CompileRequests below.
+                *pending = 0;
                 // cpu.stop() must run with Jitv2's lock NOT held — it locks
                 // the executor and, through it, this same Mutex<Jitv2>
                 // again (own page-pool stats print), which would
                 // self-deadlock this thread on its own non-reentrant lock
-                // if taken here first. Lock only for the actual flush/reset
-                // (flush_from_jit_thread's own doc comment), release
-                // before cpu.start().
+                // if taken here first. Lock only for the actual flush
+                // (flush_from_jit_thread's own doc comment), release before
+                // cpu.start().
                 cpu.stop();
-                // Every request still sitting in `consumer` right now
-                // points into the pool `flush_from_jit_thread` is about to
+                // Every request still sitting in the shared queue right now
+                // points into the pool flush_from_jit_thread is about to
                 // clear — drain them before the flush, not after, or the
                 // next pop() dereferences a dangling PhysicalCodePage
                 // pointer (see drain_pending's own doc comment for the
-                // crash this was confirmed to cause).
-                Self::drain_pending(consumer);
-                unsafe { jit.lock().flush_from_jit_thread(cpu.as_ref(), codegen); }
+                // crash this was confirmed to cause). Safe to drain once
+                // here even though the queue is shared with every other
+                // (already-parked, not popping) worker.
+                Self::drain_pending(&queue);
+                unsafe { jit.lock().flush_from_jit_thread(codegen.function_count()); }
+                // Build ONE fresh shared arena and rebuild this (leader's
+                // own) Codegen on top of it — every other, parked worker
+                // rebuilds its own once it wakes (park_at_barrier's return
+                // value), from the same arena published below.
+                let fresh_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+                let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
+                    crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, fresh_state.clone(),
+                ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
+                unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
+                {
+                    let (mutex, cv) = &*barrier;
+                    let mut state = mutex.lock();
+                    state.current_arena = Some(fresh_arena);
+                    state.current_state = Some(fresh_state);
+                    state.parked_count = 0;
+                    state.was_flush = true;
+                    state.generation += 1;
+                    cv.notify_all();
+                }
+                quiesce_in_progress.store(false, Ordering::Release);
                 cpu.start();
                 // flush_from_jit_thread reset codegen back to 0.
                 function_count.store(0, Ordering::Relaxed);
             }
         };
+        // Runs the full leader sequence for a forced-seal-only quiesce — no
+        // arena replacement, no CPU stop, just "wait for everyone else to
+        // park (guaranteeing none of them is mid-compile — no lower-`start`
+        // range can still arrive), force-seal whatever's queued under that
+        // guarantee, then resume everyone in place." Called only after this
+        // thread has already won leadership via the SAME
+        // `quiesce_in_progress.compare_exchange` a flush leader would use —
+        // see `BarrierState`'s own doc comment for why this and
+        // `run_leader_flush` share one gate/barrier instead of two.
+        let run_leader_seal = |codegen: &mut crate::jitv2::codegen::Codegen,
+                                pending: &mut crate::jitv2::comp::PendingCount| {
+            // Bails out cleanly (no seal performed) if `running` goes false
+            // first — see `wait_for_followers_or_abandon`'s own doc comment
+            // for the `CompileQueue::stop()` race this guards.
+            if !wait_for_followers_or_abandon(&barrier) {
+                abandon_quiesce(pending);
+                return;
+            }
+            crate::jitv2::comp::force_publish_pending(codegen, pending);
+            {
+                let (mutex, cv) = &*barrier;
+                let mut state = mutex.lock();
+                state.parked_count = 0;
+                state.was_flush = false;
+                state.generation += 1;
+                cv.notify_all();
+            }
+            quiesce_in_progress.store(false, Ordering::Release);
+        };
+        // Leader election: the first worker whose own compile triggers
+        // EITHER a flush condition or a forced-seal condition wins this one
+        // shared compare_exchange and runs the corresponding sequence;
+        // every other worker that also observes a trigger (its own, or via
+        // this same check at the top of its next loop iteration) instead
+        // drains/discards its own state and parks at the one shared
+        // barrier, regardless of which kind of leader it's waiting on — see
+        // `BarrierState`'s own doc comment for why one gate covers both. At
+        // thread_count == 1 there is only ever one worker, so this always
+        // wins trivially — real contention is exercised separately
+        // (`tests::barrier_parks_followers_until_leader_resumes_them`).
+        let try_flush = |codegen: &mut crate::jitv2::codegen::Codegen,
+                          function_count: &Arc<AtomicU32>,
+                          pending: &mut crate::jitv2::comp::PendingCount| {
+            if quiesce_in_progress.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                run_leader_flush(codegen, function_count, pending);
+            } else {
+                *pending = 0;
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                    unsafe { codegen.reset_with_shared_arena(arena, state); }
+                } else {
+                }
+                function_count.store(codegen.function_count(), Ordering::Relaxed);
+            }
+        };
+        let try_force_seal = |codegen: &mut crate::jitv2::codegen::Codegen,
+                               pending: &mut crate::jitv2::comp::PendingCount| {
+            if quiesce_in_progress.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                run_leader_seal(codegen, pending);
+            } else {
+                *pending = 0;
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                    unsafe { codegen.reset_with_shared_arena(arena, state); }
+                    function_count.store(codegen.function_count(), Ordering::Relaxed);
+                } else {
+                }
+            }
+        };
         while running.load(Ordering::Relaxed) {
-            match consumer.pop() {
-                Ok(req) => {
-                    let batching = batch_enabled.load(Ordering::Relaxed);
-                    let ran_out_of_memory = if batching {
+            // A worker idling between compiles (about to pop its next
+            // request) that sees another worker already leading a quiesce
+            // cycle (flush OR seal-only — one shared gate, see
+            // `BarrierState`'s own doc comment) must park immediately
+            // rather than pop/compile anything new — its own next compile
+            // would target a page pool/arena that's about to be cleared out
+            // from under it, or would race the leader's forced seal. At
+            // thread_count == 1 this can only ever be this same thread
+            // mid-leader-sequence, which never reaches back here until it's
+            // done (the flag is cleared before the leader function
+            // returns), so it's a no-op today; real contention is exercised
+            // separately.
+            if quiesce_in_progress.load(Ordering::Acquire) {
+                pending = 0;
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                    unsafe { codegen.reset_with_shared_arena(arena, state); }
+                    function_count.store(codegen.function_count(), Ordering::Relaxed);
+                } else {
+                }
+                continue;
+            }
+            match queue.pop() {
+                Some(req) => {
+                    // Always the deferred/non-forced path — never
+                    // handle_request's forced-seal one. Forced sealing
+                    // mprotects a WHOLE host page to RX immediately,
+                    // unconditionally safe only when nothing else can be
+                    // mid-allocate/mid-copy on that same page — true for
+                    // inline compile (single-threaded, its only other
+                    // caller) but not here: a second worker can easily
+                    // still be bump-allocating into (or, worse,
+                    // mid-`copy_nonoverlapping` writing compiled bytes
+                    // into) the very page this worker's own forced seal
+                    // would just mprotect out from under it. Confirmed
+                    // live as a real SIGSEGV (copy_nonoverlapping crashing
+                    // inside CompiledBlob::new) the first time this pool
+                    // actually ran with thread_count > 1 outside tests —
+                    // `j2 batch off` (the `developer`-build default) used
+                    // to route here into handle_request instead, which is
+                    // what triggered it.
+                    let ran_out_of_memory = {
                         #[cfg(feature = "developer")]
                         { crate::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending, &stats) }
                         #[cfg(not(feature = "developer"))]
                         { crate::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending) }
-                    } else {
-                        #[cfg(feature = "developer")]
-                        { crate::jitv2::comp::handle_request(&req, &bus, &mut analyzer, &mut codegen, &stats) }
-                        #[cfg(not(feature = "developer"))]
-                        { crate::jitv2::comp::handle_request(&req, &bus, &mut analyzer, &mut codegen) }
                     };
                     // Keep CompileQueue::function_count's mirror in sync —
                     // see that field's doc comment for why it exists
@@ -1685,10 +2139,7 @@ impl CompileQueue {
                     // check below.
                     let reserved_bytes = codegen.packing_stats().1;
                     crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
-                    // Consumer::slots() is occupancy directly (unlike
-                    // Producer::slots(), which is free space) — see rtrb's
-                    // own doc comment on that method.
-                    crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(consumer.slots(), COMPILE_QUEUE_CAPACITY);
+                    crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(queue.len(), COMPILE_QUEUE_CAPACITY);
                     if ran_out_of_memory {
                         // The compile that just ran couldn't get memory —
                         // flush immediately, regardless of the byte
@@ -1698,7 +2149,7 @@ impl CompileQueue {
                         // (handle_request already returned), so it'll only
                         // be retried on this offset's next real arrival —
                         // same as any other "retry later" outcome.
-                        do_flush(&mut consumer, &mut codegen, &function_count, &mut pending);
+                        try_flush(&mut codegen, &function_count, &mut pending);
                     } else if reserved_bytes > CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES {
                         // Real bytes reserved in the arena (not a
                         // function-count proxy — see
@@ -1708,40 +2159,88 @@ impl CompileQueue {
                         // unboundedly (nothing else ever frees it — see
                         // Codegen::reset's doc comment) and needs flushing
                         // pre-emptively, before it actually runs out.
-                        do_flush(&mut consumer, &mut codegen, &function_count, &mut pending);
-                    } else if batching && codegen.provider_crossed_page() {
-                        // The compile that just ran started a fresh
-                        // host-page segment — everything accumulated in
-                        // `pending` before it packed into the previous
-                        // segment as tightly as it's going to; finalize and
-                        // publish that batch now rather than let it keep
-                        // growing indefinitely (an unbounded `pending` would
-                        // mean an unbounded window of "compiled but not yet
-                        // dispatchable").
+                        try_flush(&mut codegen, &function_count, &mut pending);
+                    } else if pending >= PENDING_FORCE_SEAL_THRESHOLD {
+                        // A continuously busy worker (queue never goes
+                        // empty for it) never reaches the `None` arm's
+                        // idle-timeout sweep below — every compile finalizes
+                        // immediately (see handle_request_deferred's own doc
+                        // comment) but a non-forced finalize only seals a
+                        // page the bump cursor has already moved past, so a
+                        // steady stream of small compiles can accumulate in
+                        // `pending` indefinitely with nothing to force a
+                        // seal. Once `pending` grows past a small bound,
+                        // force-seal it now rather than wait for a queue-
+                        // empty tick that may never come — bounds `pending`
+                        // under sustained load at the cost of at most one
+                        // prematurely-closed partial page per threshold
+                        // crossing, same trade-off as the idle-timeout sweep.
+                        // Goes through try_force_seal (the shared quiesce
+                        // barrier), not a direct force_publish_pending call
+                        // — see BarrierState's own doc comment for why a
+                        // forced seal is only safe once every other worker
+                        // is provably parked (not mid-compile).
                         #[cfg(feature = "developer")]
-                        stats.record_batch_flush(pending.len(), crate::jitv2::BatchFlushReason::PageCross);
-                        crate::jitv2::comp::flush_pending_batch(&mut codegen, &mut pending);
+                        stats.record_batch_flush(pending, crate::jitv2::BatchFlushReason::PendingThreshold);
+                        try_force_seal(&mut codegen, &mut pending);
+                        function_count.store(codegen.function_count(), Ordering::Relaxed);
                     }
                 }
-                Err(_) => {
+                None => {
                     // Queue-drain fallback: even under batching, a lone
                     // compile followed by a quiet period must not sit
-                    // unpublished indefinitely waiting for a page to fill —
-                    // flush whatever's pending before backing off. A no-op
-                    // (via flush_pending_batch's own empty check) on every
-                    // iteration where nothing is pending, which is the
-                    // common case when batching is off.
-                    if !pending.is_empty() {
-                        #[cfg(feature = "developer")]
-                        stats.record_batch_flush(pending.len(), crate::jitv2::BatchFlushReason::QueueDrain);
-                        crate::jitv2::comp::flush_pending_batch(&mut codegen, &mut pending);
+                    // unpublished indefinitely waiting for a page to fill.
+                    //
+                    // Two-phase, matching the non-forced sealing design
+                    // (`paged_memory`'s module doc comment,
+                    // `Codegen::finalize_batch_nonforced`/`force_seal_pending`):
+                    // on every empty poll, try a non-forced publish attempt
+                    // first (`publish_ready_nonforced` — cheap, harmless,
+                    // and at today's N=1 worker count it's what actually
+                    // does the real work here, converging with the page-cross
+                    // trigger above). Only once the queue has been
+                    // continuously empty for the real idle threshold
+                    // (~100ms, tracked in wall-clock time across repeated
+                    // empty polls, not "first empty poll") does this
+                    // force-seal whatever's left — so a lone straggler that
+                    // never grows into a full page still gets published
+                    // eventually, but a genuinely busy queue that's just
+                    // between two back-to-back bursts doesn't pay for a
+                    // premature forced seal on every 200µs backoff tick.
+                    // At N=1 this is behaviorally a no-op relative to
+                    // today (nothing here can ever actually be blocked on
+                    // another worker), but it's real, reachable machinery —
+                    // this is where the same idle-sweep this worker will
+                    // need once a real multi-worker pool shares one arena
+                    // gets exercised and proven first.
+                    const IDLE_FORCE_SEAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+                    if pending > 0 {
+                        crate::jitv2::comp::publish_ready_nonforced(&mut codegen, &mut pending);
+                        if pending > 0 {
+                            if idle_since.is_none() {
+                                idle_since = Some(std::time::Instant::now());
+                            }
+                            if idle_since.is_some_and(|t| t.elapsed() >= IDLE_FORCE_SEAL_THRESHOLD) {
+                                #[cfg(feature = "developer")]
+                                stats.record_batch_flush(pending, crate::jitv2::BatchFlushReason::QueueDrain);
+                                // Same shared quiesce barrier as the pending-
+                                // threshold trigger above — see
+                                // BarrierState's own doc comment.
+                                try_force_seal(&mut codegen, &mut pending);
+                                idle_since = None;
+                            }
+                        } else {
+                            idle_since = None;
+                        }
                         function_count.store(codegen.function_count(), Ordering::Relaxed);
+                    } else {
+                        idle_since = None;
                     }
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             }
         }
-        (consumer, codegen)
+        codegen
     }
 }
 
@@ -1749,6 +2248,96 @@ impl CompileQueue {
 mod tests {
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
+
+    /// Proves `park_at_barrier`'s park/wake protocol directly, with real
+    /// spawned threads simulating N=3 workers — independent of `worker_loop`,
+    /// since a real single-worker (`thread_count == 1`) integration can
+    /// never actually exercise a park (see `BarrierState`'s own doc
+    /// comment). Two "followers" call `park_at_barrier`; the main thread
+    /// plays "leader": waits for both to register as parked, publishes a
+    /// fresh arena/state, bumps `generation`, and releases them — then
+    /// asserts both followers woke with exactly that published arena/state,
+    /// not a stale or missing one.
+    #[test]
+    fn barrier_parks_followers_until_leader_resumes_them() {
+        let barrier = Arc::new((parking_lot::Mutex::new(BarrierState::new()), parking_lot::Condvar::new()));
+
+        let followers: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || CompileQueue::park_at_barrier(&barrier))
+            })
+            .collect();
+
+        // Wait for both followers to register as parked (mirrors what a
+        // real leader's own wait loop does — see run_leader_flush, landed
+        // in a later step).
+        {
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            while state.parked_count < 2 {
+                cv.wait(&mut state);
+            }
+        }
+
+        let fresh_state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, fresh_state.clone()).unwrap();
+        {
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            state.current_arena = Some(fresh_arena.clone());
+            state.current_state = Some(fresh_state.clone());
+            state.parked_count = 0;
+            state.was_flush = true;
+            state.generation += 1;
+            cv.notify_all();
+        }
+
+        for handle in followers {
+            let (arena, state) = handle.join().unwrap()
+                .expect("was_flush was set — a parked worker must wake with Some((arena, state))");
+            assert!(Arc::ptr_eq(&arena, &fresh_arena), "a parked worker must wake with the exact arena the leader published");
+            assert!(Arc::ptr_eq(&state, &fresh_state), "a parked worker must wake with the exact state the leader published");
+        }
+    }
+
+    #[test]
+    fn barrier_parks_followers_and_resumes_them_in_place_for_a_seal_only_cycle() {
+        // Companion to the flush test above: a seal-only cycle
+        // (`was_flush: false`, no arena/state published) must wake a parked
+        // worker with `None` — nothing to rebuild — not panic on the
+        // `.expect()` an arena would otherwise require.
+        let barrier = Arc::new((parking_lot::Mutex::new(BarrierState::new()), parking_lot::Condvar::new()));
+
+        let followers: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || CompileQueue::park_at_barrier(&barrier))
+            })
+            .collect();
+
+        {
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            while state.parked_count < 2 {
+                cv.wait(&mut state);
+            }
+        }
+
+        {
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            state.parked_count = 0;
+            state.was_flush = false;
+            state.generation += 1;
+            cv.notify_all();
+        }
+
+        for handle in followers {
+            let result = handle.join().unwrap();
+            assert!(result.is_none(), "a seal-only cycle must resume a parked worker with None (nothing to rebuild)");
+        }
+    }
 
     #[test]
     fn null_gen_ptr_reads_the_never_compilable_fallback_without_panicking() {
@@ -2051,7 +2640,7 @@ mod tests {
         // any filesystem I/O — no cwd/tempdir isolation needed here.
         let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
-        q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();
         for i in 0..8u16 {
@@ -2061,19 +2650,58 @@ mod tests {
         q.stop();
     }
 
+    /// Minimal `Device` (not `BusDevice`) stand-in for `CompileQueue::set_cpu` —
+    /// tests that need `run_leader_flush`'s real flush path (not its
+    /// no-cpu-wired recovery path) to actually run just need something a
+    /// `Weak<dyn Device>` can upgrade to and call `stop()`/`start()` on; no
+    /// test here cares whether cycles are actually stepped.
+    struct NoopDevice;
+    impl Device for NoopDevice {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { true }
+        fn get_clock(&self) -> u64 { 0 }
+    }
+
     /// Every word decodes as `ADDIU r1, r0, 1` — a real, compilable
     /// instruction, unlike `FakeDevice` (which always errors so
     /// `handle_request` bails before ever reaching codegen). Needed for a
     /// genuine end-to-end batching test: `handle_request_deferred` must
     /// actually produce a `FuncId` for there to be anything to batch.
+    /// Two real `ADDIU r1, r0, 1` words (offsets 0 and 1) at the start of
+    /// every physical page, followed by the JIT region-boundary sentinel at
+    /// every other word — a genuine short, terminated region, matching how
+    /// real code actually looks (a handful of instructions, then a branch/
+    /// boundary — never "every word is a walkable instruction forever").
+    /// Two instructions, not one: `comp::min_instrs_to_compile()` defaults
+    /// to 2 outside `developer` builds (the build these tests actually run
+    /// under), and a region below that floor is sticky-denylisted rather
+    /// than compiled — confirmed live: an earlier one-instruction version of
+    /// this device made every request get silently denylisted, 0/N ever
+    /// published. Returning ADDIU unconditionally for every address (no
+    /// sentinel at all) was tried before that and confirmed a different
+    /// wrong shape: with `MAX_INSTRS_PER_COMPILE == usize::MAX` (a
+    /// deliberate production setting, not a bug — see that constant's own
+    /// doc comment in `comp.rs`), an all-ADDIU device makes every walk
+    /// consume the entire 1024-word page, compiling a ~1000-instruction
+    /// function instead of the couple of instructions each test actually
+    /// intends — still correct, but ~300x slower per request than
+    /// intended, confirmed live via direct instrumentation during the
+    /// compile-pool work.
     struct AddiuDevice(AtomicU64);
     impl BusDevice for AddiuDevice {
         fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
         fn write8(&self, _addr: u32, _val: u8) -> u32 { crate::traits::BUS_ERR }
         fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
         fn write16(&self, _addr: u32, _val: u16) -> u32 { crate::traits::BUS_ERR }
-        fn read32(&self, _addr: u32) -> BusRead32 {
-            BusRead32::ok((crate::mips_isa::OP_ADDIU << 26) | (1 << 16) | 1)
+        fn read32(&self, addr: u32) -> BusRead32 {
+            let offset_word = (addr % PAGE_SIZE) / 4;
+            if offset_word < 2 {
+                BusRead32::ok((crate::mips_isa::OP_ADDIU << 26) | (1 << 16) | 1)
+            } else {
+                BusRead32::ok(crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
+            }
         }
         fn write32(&self, _addr: u32, _val: u32) -> u32 { crate::traits::BUS_ERR }
         fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
@@ -2106,12 +2734,7 @@ mod tests {
         // immediately).
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
-        // Force batch on regardless of the build-mode default (developer
-        // defaults to off, non-developer to on — this test needs it on to
-        // exercise the queue-drain fallback specifically, not testing the
-        // default itself).
-        q.set_batch_enabled(true);
-        q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
 
         // A real (non-null) gen counter: page.publish() calls current_gen(),
         // which is always safe now (reads the shared NEVER_COMPILABLE_GEN
@@ -2121,7 +2744,12 @@ mod tests {
         let gen_counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &gen_counter as *const AtomicU64);
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 4, compiled_for_fr1: true }, &stats));
+        // offset 0, matching every other AddiuDevice-based test in this
+        // file: AddiuDevice's own read32 only decodes a real ADDIU for word
+        // offsets < 2, sentinel otherwise (see its own doc comment) — offset
+        // 4 (word index 4) would land straight on the sentinel with nothing
+        // to compile at all.
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 0, compiled_for_fr1: true }, &stats));
 
         // 30s, not the original 5s: this test passes in ~0.1s in isolation,
         // but the compile-worker thread genuinely needs real CPU time to get
@@ -2131,7 +2759,7 @@ mod tests {
         // other test's threads competing for the same cores).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while !page.is_entry_valid(4) {
+            while !page.is_entry_valid(0) {
                 assert!(std::time::Instant::now() < deadline, "entry never published — queue-drain fallback did not fire");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -2159,8 +2787,7 @@ mod tests {
         // together) actually looks.
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
-        q.set_batch_enabled(true);
-        q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
 
         const N: usize = 300;
         let gen_counters: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
@@ -2204,13 +2831,75 @@ mod tests {
     }
 
     #[test]
+    fn multi_worker_pool_compiles_and_publishes_every_request() {
+        // Real end-to-end proof that N>1 worker threads actually compile
+        // concurrently and correctly: set_thread_count(4), send far more
+        // distinct-page requests than any single worker could plausibly
+        // have handled alone within the deadline if the "pool" were secretly
+        // still just one thread, and assert every single one gets published
+        // — not just "doesn't deadlock" or "doesn't crash," but genuinely
+        // produces correct output for all of them, exercising the shared
+        // arena (SharedArena::allocate serialized across 4 concurrent
+        // Codegens), the shared queue (crossbeam_queue::ArrayQueue popped
+        // concurrently by 4 threads), and — if the arena ever fills —
+        // real leader-election/barrier contention among genuinely live
+        // worker threads, not the single-worker degenerate case every other
+        // test in this file exercises.
+        let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
+        let mut q = CompileQueue::new();
+        q.set_thread_count(4);
+        assert_eq!(q.thread_count(), 4);
+        // Wire real cpu/jitv2 stand-ins before starting: 2000 requests
+        // across 4 workers sharing one arena is expected to cross
+        // CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES and exercise a real
+        // leader-election flush — run_leader_flush needs both Weaks to
+        // upgrade to do anything (see its own doc comment for what happens
+        // if they can't).
+        let cpu_stub: Arc<dyn Device> = Arc::new(NoopDevice);
+        q.set_cpu(Arc::downgrade(&cpu_stub));
+        let jit_owner = Arc::new(Mutex::new(Jitv2::new(JITV2_INITIAL_PAGE_CAPACITY)));
+        q.set_owner(Arc::downgrade(&jit_owner));
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
+
+        const N: usize = 2000;
+        let gen_counters: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = gen_counters.iter()
+            .enumerate()
+            .map(|(i, counter)| PhysicalCodePage::new(i as Pfn, counter as *const AtomicU64))
+            .collect();
+        let stats = JitStats::default();
+        for page in pages.iter_mut() {
+            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, offset: 0, compiled_for_fr1: true }, &stats));
+        }
+
+        // catch_unwind for the same reason as the other threaded tests in
+        // this file: a deadline timeout must not unwind out of this
+        // function with worker threads still live against `pages` — see
+        // the page-cross test's own comment for the confirmed
+        // use-after-free this guards.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                let published = pages.iter().filter(|p| p.is_entry_valid(0)).count();
+                if published == N {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "only {published}/{N} entries published within the timeout — pool may be stuck");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }));
+        q.stop();
+        result.unwrap();
+    }
+
+    #[test]
     fn compile_queue_send_before_start_still_delivered_after_start() {
         let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();
         assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 0, compiled_for_fr1: true }, &stats));
-        q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
         q.stop();
     }
 
@@ -2233,8 +2922,8 @@ mod tests {
     fn compile_queue_start_is_idempotent() {
         let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
-        q.start(dev.clone(), crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default()));
-        q.start(dev, crate::jitv2::codegen::Codegen::new(), std::sync::Arc::new(JitStats::default())); // must not panic or spawn a second thread
+        q.start(dev.clone(), std::sync::Arc::new(JitStats::default()));
+        q.start(dev, std::sync::Arc::new(JitStats::default())); // must not panic or spawn a second thread
         q.stop();
     }
 

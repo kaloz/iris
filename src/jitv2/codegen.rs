@@ -79,6 +79,25 @@ pub struct Codegen {
     /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
     /// after every compile.
     paged_state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    /// A second handle over the exact same shared arena as `module`'s own
+    /// (opaque, unreachable) provider — see `new_module`'s doc comment.
+    /// Exists purely so `Codegen` can drive non-forced sealing
+    /// (`try_seal_pending`, `set_force_seal`) from outside `module` without
+    /// needing anything back from it — `JITModule` never exposes its own
+    /// provider once constructed.
+    seal_handle: crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+    /// Byte range (arena-relative offsets) each still-unpublished `FuncId`'s
+    /// machine code landed in, recorded by `compile_region_uncommitted`
+    /// right after its `define_function` call, read via
+    /// `seal_handle.take_last_allocation()` — see that call site's own
+    /// comment. `finalize_batch_nonforced` uses this to match
+    /// `try_seal_ready`'s sealed-range results back to the `FuncId`s they
+    /// belong to. Entries
+    /// are removed once a `FuncId` is actually finalized (either forced,
+    /// immediately, or non-forced, once its range comes back sealed) —
+    /// nothing here should ever reference a `FuncId` from a previous
+    /// `reset()`'s arena, so `reset()` clears this too.
+    func_ranges: std::collections::HashMap<cranelift_module::FuncId, (usize, usize)>,
 }
 
 /// Per-instruction emission context: the three values that are the same for
@@ -284,7 +303,7 @@ impl Codegen {
     /// functions live (roughly ~215 bytes/function average), leaving room
     /// for `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s full 1_000_000 functions
     /// (~200MB+ at that rate) plus slack for larger-than-average regions.
-    const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
+    pub(crate) const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
 
     /// Host mmap page granularity `ArenaMemoryProvider` rounds every
     /// function's segment up to (`memory/arena.rs`'s own `align_up(size,
@@ -319,7 +338,24 @@ impl Codegen {
     /// bump-allocates every function into it — one mapping total,
     /// regardless of function count, for as long as it fits within
     /// `ARENA_RESERVE_SIZE`.
-    fn new_module() -> (cranelift_jit::JITModule, std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>) {
+    /// Build a `JITModule` bound to `shared` (an existing shared arena) if
+    /// given, or a brand-new private one-owner arena otherwise. Two handles
+    /// are always built over whichever arena is used: `module_handle` is
+    /// moved into the `JITModule` (which owns its memory provider opaquely,
+    /// by value — see `paged_memory`'s module doc comment — so nothing can
+    /// ever be read back out of it), and `seal_handle` is kept by the
+    /// caller (`Codegen`) so it can drive non-forced sealing
+    /// (`try_seal_pending`) and cross-arena bookkeeping
+    /// (`compile_region_uncommitted`'s range tracking) without needing
+    /// anything back from the module.
+    fn new_module(
+        shared: Option<std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>>,
+        state: Option<std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>>,
+    ) -> (
+        cranelift_jit::JITModule,
+        std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+    ) {
         let mut flag_builder = settings::builder();
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
@@ -327,15 +363,64 @@ impl Codegen {
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
         let mut jit_builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-        let arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(Self::ARENA_RESERVE_SIZE, paged_state.clone())
-            .expect("failed to reserve jitv2 Codegen arena");
-        jit_builder.memory_provider(Box::new(arena));
-        (cranelift_jit::JITModule::new(jit_builder), paged_state)
+        let (shared, paged_state) = match shared {
+            Some(shared) => (shared, state.expect("new_module: shared arena given without its PagedArenaState")),
+            None => {
+                let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(Self::ARENA_RESERVE_SIZE, paged_state.clone())
+                    .expect("failed to reserve jitv2 Codegen arena");
+                (shared, paged_state)
+            }
+        };
+        // Shared only between these two sibling handles (not the whole
+        // arena/pool) — see `PagedArenaMemoryProvider::last_allocation`'s
+        // own doc comment for why this exists: `seal_handle` needs to learn
+        // each individual `allocate()` call's exact range, race-free,
+        // without racing other workers' concurrent allocations the way
+        // reading the shared arena's own live bump cursor would. Only
+        // `module_handle`'s own `allocate()` calls ever write to it (it's
+        // the one actually inside `JITModule`); `seal_handle` only ever
+        // reads via `take_last_allocation`.
+        let last_allocation = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let module_handle = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared.clone(), last_allocation.clone());
+        let seal_handle = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared, last_allocation);
+        jit_builder.memory_provider(Box::new(module_handle));
+        (cranelift_jit::JITModule::new(jit_builder), paged_state, seal_handle)
     }
 
+    /// Standalone `Codegen` with its own private, freshly-reserved arena —
+    /// today's only construction path (inline mode, `equiv_test.rs`,
+    /// `jitv2_lockstep`, this module's own tests). Behaviorally unchanged
+    /// by the shared-arena machinery: with exactly one handle ever over
+    /// this arena, every `finalize()` call's pushed range is always the
+    /// entire contiguous-from-watermark prefix, so `try_seal_ready` always
+    /// seals it immediately.
     pub fn new() -> Self {
-        let (module, paged_state) = Self::new_module();
+        Self::from_module(Self::new_module(None, None))
+    }
+
+    /// `Codegen` built on top of an *already-reserved* shared arena — the
+    /// compile-pool worker constructor (each worker gets its own `Codegen`/
+    /// `JITModule`, but they all share one arena reservation, so `Codegen`
+    /// itself can't be the one to `new_with_size` it) and the `j2 inline`
+    /// mode-switch path (switching modes rebuilds `Codegen`(s) on top of
+    /// whichever arena the outgoing mode's `Codegen` was already using,
+    /// rather than reserving a fresh one and leaking the old — see
+    /// `PagedArenaMemoryProvider::shared`'s own doc comment).
+    pub fn new_with_shared_arena(
+        shared: std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
+        state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    ) -> Self {
+        Self::from_module(Self::new_module(Some(shared), Some(state)))
+    }
+
+    fn from_module(
+        (module, paged_state, seal_handle): (
+            cranelift_jit::JITModule,
+            std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+            crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+        ),
+    ) -> Self {
         Self {
             ctx: module.make_context(),
             module,
@@ -347,6 +432,8 @@ impl Codegen {
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
             paged_state,
+            seal_handle,
+            func_ranges: std::collections::HashMap::new(),
         }
     }
 
@@ -376,6 +463,18 @@ impl Codegen {
         self.paged_state.packing_stats()
     }
 
+    /// The `(shared arena, paged state)` pair this `Codegen`'s own module is
+    /// built on — for a caller that wants to build a *sibling* `Codegen`
+    /// over the exact same arena (`new_with_shared_arena`) rather than
+    /// reserving a fresh one, e.g. a `j2 inline` mode switch reusing the
+    /// outgoing mode's still-live arena instead of leaking it.
+    pub fn shared_arena(&self) -> (
+        std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
+        std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    ) {
+        (self.seal_handle.shared(), self.paged_state.clone())
+    }
+
     /// `(base_address, len)` of the underlying arena's real reservation —
     /// see `PagedArenaState::arena_range`. `j2 hugepages` only.
     #[cfg(feature = "developer")]
@@ -402,12 +501,52 @@ impl Codegen {
     /// place those pointers are ever stored — never published into the real
     /// `page`/`entries` table) in the same operation.
     pub unsafe fn reset(&mut self) {
-        let (new_module, new_paged_state) = Self::new_module();
+        unsafe { self.reset_inner(Self::new_module(None, None)) }
+    }
+
+    /// Same contract as `reset()`, but rebuilds on top of an
+    /// already-reserved shared arena instead of freeing the old one and
+    /// reserving a fresh one — the compile-pool flush-leader path (a fresh
+    /// arena IS reserved once, by the leader, then every worker including
+    /// itself rebuilds onto that same one) and the `j2 inline` mode-switch
+    /// path (see `new_with_shared_arena`'s own doc comment) both want this
+    /// instead of `reset()`'s always-fresh-reservation behavior.
+    ///
+    /// # Safety
+    /// Same as `reset()` — no `JitFn` this `Codegen` ever produced may
+    /// still be reachable/callable anywhere after this returns. Additionally,
+    /// `shared` must not be the same arena this `Codegen` was already using
+    /// (that would make `old_module.free_memory()` below invalidate the very
+    /// arena this call is trying to keep using) — always a *fresh* arena in
+    /// every real caller (the pool flush leader's newly-built one, or the
+    /// other mode's still-live one during a switch).
+    pub unsafe fn reset_with_shared_arena(
+        &mut self,
+        shared: std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
+        state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    ) {
+        unsafe { self.reset_inner(Self::new_module(Some(shared), Some(state))) }
+    }
+
+    unsafe fn reset_inner(
+        &mut self,
+        (new_module, new_paged_state, new_seal_handle): (
+            cranelift_jit::JITModule,
+            std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+            crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+        ),
+    ) {
         let old_module = std::mem::replace(&mut self.module, new_module);
         unsafe { old_module.free_memory(); }
         self.paged_state = new_paged_state;
+        // Replace the old seal_handle too — it's a second handle over the
+        // exact same Arc<Mutex<SharedArena>> the old module's own provider
+        // just freed; holding onto it (or worse, calling try_seal_pending
+        // through it) after that free would touch freed memory.
+        self.seal_handle = new_seal_handle;
         self.ctx = self.module.make_context();
         self.func_id_counter = 0;
+        self.func_ranges.clear();
         #[cfg(feature = "developer")]
         { self.last_code_size = 0; }
         self.last_compile_ran_out_of_memory = false;
@@ -1232,6 +1371,26 @@ impl Codegen {
         // formatting ever), and a minimal one-line notice otherwise —
         // silence here is what let a real problem masquerade as a
         // performance cliff.
+        // define_function's own allocate() call (through the module's own,
+        // opaque provider handle) reports its exact range through the
+        // mailbox both handles share — read via seal_handle right after,
+        // since seal_handle never allocates anything itself and so never
+        // clobbers it. This is how finalize_batch_nonforced later learns
+        // which byte range a given FuncId's machine code landed in, without
+        // needing get_finalized_function pre-finalize (not callable — see
+        // that method's own doc comment) or any change to what
+        // define_function itself does. Race-free under real multi-worker
+        // concurrency because the mailbox is per-Codegen (not pool-wide):
+        // only this Codegen's own module_handle ever writes to it — unlike
+        // an earlier version of this code, which bracketed
+        // seal_handle.position() (the shared arena's own live, pool-wide
+        // bump cursor) before/after this call instead, which raced with
+        // OTHER workers' concurrent allocate() calls moving that same
+        // cursor in between — confirmed live as the cause of a real
+        // stuck-forever compile-pool bug under genuine multi-thread
+        // contention (workers' func_ranges ending up with wrong/overlapping
+        // recorded ranges, so try_seal_ready's sealed results could never
+        // match back to the FuncId that actually owned them).
         if let Err(e) = self.module.define_function(func_id, &mut self.ctx) {
             let is_oom = matches!(e, cranelift_module::ModuleError::Allocation { .. });
             self.last_compile_ran_out_of_memory = is_oom;
@@ -1244,6 +1403,14 @@ impl Codegen {
             return None;
         }
         self.last_compile_ran_out_of_memory = false;
+        let range = self.seal_handle.take_last_allocation()
+            .expect("define_function must have allocated real memory for a successful compile");
+        self.func_ranges.insert(func_id, range);
+        // Reserve this range's seal-queue slot right now — see
+        // push_placeholder's own doc comment for why this can't wait until
+        // finalize time. finalize_batch/finalize_batch_nonforced fill in
+        // the real PublishInfo (patch_pending_publish) once they have one.
+        self.seal_handle.push_placeholder(range.0, range.1);
         // Read code size before clearing context (compiled_code is cleared
         // by clear_context) — same pattern as rex3_jit/compiler.rs and
         // jit/compiler.rs. Captured into a field rather than returned
@@ -1324,10 +1491,87 @@ impl Codegen {
         }
         ids.iter()
             .map(|&id| {
+                let (start, end) = self.func_ranges.remove(&id)
+                    .expect("finalize_batch: id has no reserved seal-queue range — compile_region_uncommitted must run first");
                 let code_ptr = self.module.get_finalized_function(id);
-                unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }
+                let jit_fn = unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) };
+                // Forced: this caller's whole contract is "give me a
+                // callable pointer right now" (compile_region/inline mode),
+                // so the underlying page(s) must actually be sealed to RX
+                // before returning, not just have their placeholder patched
+                // — see patch_pending_publish's own doc comment. No real
+                // page/offset/gen_snap to give (this path hands the raw
+                // JitFn straight back to its caller instead of going
+                // through page.publish()) — a null/zeroed PublishInfo is
+                // fine here since nothing ever reads it back out for this
+                // entry (try_seal_ready's return value is discarded below).
+                let publish = crate::jitv2::paged_memory::PublishInfo {
+                    page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
+                    jit_fn: Some(jit_fn),
+                };
+                self.seal_handle.patch_pending_publish(start, end, publish, true);
+                jit_fn
             })
             .collect()
+    }
+
+    /// Non-forced counterpart to `finalize_batch`, for the async worker:
+    /// finalizes this one `FuncId` (patches relocations — real memory
+    /// writes, must happen before anything seals) and, once
+    /// `finalize_definitions()` returns, resolves its real `JitFn` and
+    /// patches the complete `PublishInfo` into the seal-queue slot
+    /// `compile_region_uncommitted` already reserved for it
+    /// (`push_placeholder`) — see `PagedArenaMemoryProvider::patch_pending_publish`'s
+    /// own doc comment. `publish` is everything except `jit_fn` (the
+    /// caller's own page/offset/gen_snap/instr_count/code_size); `jit_fn`
+    /// is filled in here, immediately after it becomes valid to read.
+    ///
+    /// Returns whatever this call's own seal attempt reported as newly
+    /// sealed — almost always just this one entry's own `PublishInfo` (the
+    /// common case, nothing blocking it), occasionally more (this entry
+    /// happened to complete a longer contiguous run that had been waiting
+    /// on it), or empty if this entry itself is now the one blocked behind
+    /// an earlier gap (retry later: another non-forced call, or the
+    /// seal-quiesce barrier's forced sweep).
+    pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::jitv2::paged_memory::PublishInfo) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+        let (start, end) = *self.func_ranges.get(&id).expect("finalize_batch_nonforced: id has no reserved seal-queue range — compile_region_uncommitted must run first");
+        if self.module.finalize_definitions().is_err() {
+            self.func_ranges.remove(&id);
+            return Vec::new();
+        }
+        self.func_ranges.remove(&id);
+        let code_ptr = self.module.get_finalized_function(id);
+        let publish = crate::jitv2::paged_memory::PublishInfo {
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+            ..publish
+        };
+        self.seal_handle.patch_pending_publish(start, end, publish, false)
+    }
+
+    /// Idle-timeout/seal-quiesce sweep: force-seal whatever is still queued
+    /// (any worker's not-yet-sealed ranges from a prior
+    /// `finalize_batch_nonforced` call) without waiting for a further
+    /// `finalize_definitions()` call to trigger it. Only ever called from
+    /// under the seal-quiesce barrier (`CompileQueue::run_seal_leader` — see
+    /// `SealBarrierState`'s own doc comment for why forcing needs that
+    /// guarantee), so it's safe to seal past whatever's currently queued —
+    /// nothing else can arrive with a lower `start` while every worker is
+    /// parked. Returns every `PublishInfo` this sweep newly sealed,
+    /// regardless of which `Codegen` originally pushed each one — the
+    /// caller just publishes all of them; see `paged_memory::PublishInfo`'s
+    /// own doc comment for why no `FuncId`/`func_ranges` lookup is needed
+    /// here anymore.
+    pub fn force_seal_pending(&mut self) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+        self.seal_handle.try_seal_ready_forced()
+    }
+
+    /// Non-forced counterpart to `force_seal_pending` — re-attempts sealing
+    /// whatever the shared arena's seal queue currently has queued, without
+    /// pushing anything new, and without forcing past a still-open page.
+    /// See `paged_memory::PagedArenaMemoryProvider::try_seal_ready`'s own
+    /// doc comment.
+    pub fn try_seal_ready(&mut self) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+        self.seal_handle.try_seal_ready()
     }
 }
 
@@ -6433,8 +6677,22 @@ mod tests {
 
         codegen.module.define_function(func_id, &mut codegen.ctx).unwrap();
         codegen.module.clear_context(&mut codegen.ctx);
+        // This harness bypasses compile_region_uncommitted entirely (calls
+        // module.define_function directly), so nothing has reserved this
+        // range's seal-queue slot yet — push_placeholder/patch_pending_publish
+        // must be driven by hand, same as Codegen::finalize_batch does
+        // internally, or the memory stays RW forever and the returned
+        // function pointer segfaults on call.
+        let range = codegen.seal_handle.take_last_allocation()
+            .expect("define_function must have allocated real memory");
+        codegen.seal_handle.push_placeholder(range.0, range.1);
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
+        let publish = crate::jitv2::paged_memory::PublishInfo {
+            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+        };
+        codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         // Leak the module so the JIT-compiled code stays valid for the
         // caller — fine for a test, mirrors what a long-lived Codegen would
         // do (code lives as long as the module, which normally lives for
@@ -6509,8 +6767,18 @@ mod tests {
 
         codegen.module.define_function(func_id, &mut codegen.ctx).unwrap();
         codegen.module.clear_context(&mut codegen.ctx);
+        // See compile_preamble_only's own comment on the equivalent lines —
+        // this harness bypasses compile_region_uncommitted too.
+        let range = codegen.seal_handle.take_last_allocation()
+            .expect("define_function must have allocated real memory");
+        codegen.seal_handle.push_placeholder(range.0, range.1);
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
+        let publish = crate::jitv2::paged_memory::PublishInfo {
+            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+        };
+        codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         std::mem::forget(codegen.module);
         unsafe { std::mem::transmute::<*const u8, extern "C" fn(f64, i8) -> i64>(code_ptr) }
     }
@@ -6548,5 +6816,164 @@ mod tests {
             let interp_result = crate::mips_exec::round_f64_to_int_mode(x, rm as u8);
             assert_eq!(jit_result, interp_result, "round_to_int_mode({x}, rm={rm}): jit={jit_result} interp={interp_result}");
         }
+    }
+
+    /// Compiles a single-instruction `ADDIU r1, r0, 1` region at `entry_word`
+    /// via `compile_region_uncommitted` — the smallest region that reliably
+    /// gets a real emitter and a real `FuncId`, for exercising the
+    /// non-forced finalize/idle-sweep path below without needing a real
+    /// `handle_request_deferred`/bus round trip.
+    fn compile_one_addiu(codegen: &mut Codegen, entry_word: WordOffset) -> cranelift_module::FuncId {
+        // Every word besides the entry itself is the JIT region-boundary
+        // sentinel, not the implicit `SLL r0,r0,0` NOP a zeroed word would
+        // decode as — a real one-instruction region, not a walk that keeps
+        // going across the whole page. Using an all-zero page here was
+        // tried first and confirmed the wrong shape: zero is a genuine,
+        // walkable NOP with a real emitter, so an unbounded `analyzer.walk`
+        // would keep extending through the entire 1024-word page, compiling
+        // a ~1000-instruction function per call instead of the one
+        // instruction each test actually intends — still correct, but
+        // ~300x slower per call than intended (confirmed live via direct
+        // instrumentation during the compile-pool work).
+        let mut page = [JIT_REGION_BOUNDARY_SENTINEL; ENTRIES_PER_PAGE];
+        page[entry_word as usize] = (OP_ADDIU << 26) | (1 << 16) | 1;
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, entry_word, 0);
+        assert!(non_empty);
+        let mut instrs_owned = *instrs;
+        codegen.compile_region_uncommitted(&mut instrs_owned, entry_word, true, true)
+            .expect("a plain ADDIU must have a real emitter")
+    }
+
+    fn dummy_publish() -> crate::jitv2::paged_memory::PublishInfo {
+        crate::jitv2::paged_memory::PublishInfo {
+            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0, jit_fn: None,
+        }
+    }
+
+    #[test]
+    fn finalize_batch_nonforced_does_not_seal_a_still_open_page() {
+        // A single small compile's own page is never "vacated" (the bump
+        // cursor sits nowhere near the next page boundary) — a non-forced
+        // finalize must leave it queued, unsealed, exactly like
+        // paged_memory's own non_forced_finalize_lets_a_later_allocation_pack_into_the_same_page
+        // test already proves at the arena level. This is the whole point
+        // of non-forced: it must NOT behave like the forced path.
+        let mut codegen = Codegen::new();
+        let id = compile_one_addiu(&mut codegen, 0);
+        let sealed = codegen.finalize_batch_nonforced(id, dummy_publish());
+        assert!(sealed.is_empty(), "a lone small batch's page is still open — non-forced must not seal it");
+    }
+
+    #[test]
+    fn finalize_batch_nonforced_leaves_gap_blocked_entries_pending() {
+        // Compile two regions but only finalize the SECOND one first
+        // (skipping the first's own finalize_definitions() call) — this
+        // simulates one worker's compile landing in the queue behind
+        // another still-unfinalized range. The second's own finalize must
+        // not report itself sealed (it's blocked behind the first's gap:
+        // its own push_placeholder entry, from compile_one_addiu, is still
+        // unpatched — see paged_memory::PublishInfo's own doc comment for
+        // why an unpatched entry blocks the contiguity scan).
+        let mut codegen = Codegen::new();
+        let first = compile_one_addiu(&mut codegen, 0);
+        let second = compile_one_addiu(&mut codegen, 4);
+
+        let sealed = codegen.finalize_batch_nonforced(second, dummy_publish());
+        assert!(sealed.is_empty(), "second's range must stay blocked behind first's un-patched gap");
+
+        // Finalizing the first now makes the combined range contiguous from
+        // the watermark, but still just two tiny instructions — nowhere
+        // near a full page — so a non-forced finalize still must not seal
+        // either (only force_seal_pending, exercised in the next test,
+        // does that for a still-open page).
+        let sealed = codegen.finalize_batch_nonforced(first, dummy_publish());
+        assert!(sealed.is_empty(), "combined range is contiguous now but still within one still-open page — non-forced must not seal it");
+    }
+
+    #[test]
+    fn force_seal_pending_seals_a_dangling_partial_page() {
+        // The real idle-timeout scenario: a lone small compile, finalized
+        // non-forced (so its page stays open, per the test above), then
+        // force_seal_pending (the ~100ms-idle-timeout sweep) closes it out
+        // anyway — this is what guarantees a partial page never sits
+        // un-dispatchable forever just because it never got big enough to
+        // fill a page on its own.
+        let mut codegen = Codegen::new();
+        let id = compile_one_addiu(&mut codegen, 0);
+        let sealed = codegen.finalize_batch_nonforced(id, dummy_publish());
+        assert!(sealed.is_empty());
+
+        let swept = codegen.force_seal_pending();
+        assert_eq!(swept.len(), 1);
+        assert!(swept[0].jit_fn.is_some());
+
+        // And a second sweep with nothing new pending must be a harmless
+        // no-op, not an error or a duplicate report.
+        let swept_again = codegen.force_seal_pending();
+        assert!(swept_again.is_empty());
+    }
+
+    #[test]
+    fn force_seal_pending_blocks_on_a_range_that_was_compiled_but_never_finalized() {
+        // A compiled-but-never-finalized FuncId still has its push_placeholder
+        // entry sitting in the shared seal queue (reserved at compile time,
+        // not at finalize time — see push_placeholder's own doc comment),
+        // unpatched (jit_fn: None). force_seal_pending must not skip over
+        // it — an unpatched entry blocks the contiguity scan regardless of
+        // `force`, so the sweep must report nothing at all here.
+        let mut codegen = Codegen::new();
+        let _never_finalized = compile_one_addiu(&mut codegen, 0);
+
+        let swept = codegen.force_seal_pending();
+        assert!(swept.is_empty(), "an unpatched placeholder must block the sweep, not be skipped");
+    }
+
+    #[test]
+    fn new_with_shared_arena_lets_two_codegens_pack_into_one_reservation() {
+        // The compile-pool shape: N Codegens, one arena. Two Codegens built
+        // via new_with_shared_arena over the same Arc<Mutex<SharedArena>>
+        // must genuinely share address space — proven here by having each
+        // compile+forced-finalize one function and asserting their packing
+        // stats (read off the one shared PagedArenaState) accumulate
+        // together rather than each starting its own separate reservation.
+        let state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
+
+        let mut a = Codegen::new_with_shared_arena(shared.clone(), state.clone());
+        let mut b = Codegen::new_with_shared_arena(shared, state.clone());
+
+        let (used0, _) = state.packing_stats();
+        assert_eq!(used0, 0);
+
+        let id_a = compile_one_addiu(&mut a, 0);
+        let jit_fn_a = a.finalize_batch(&[id_a]);
+        assert_eq!(jit_fn_a.len(), 1);
+        let (used1, _) = state.packing_stats();
+        assert!(used1 > 0, "a's compile must have consumed real bytes from the shared arena");
+
+        let id_b = compile_one_addiu(&mut b, 4);
+        let jit_fn_b = b.finalize_batch(&[id_b]);
+        assert_eq!(jit_fn_b.len(), 1);
+        let (used2, _) = state.packing_stats();
+        assert!(used2 > used1, "b's compile must have consumed MORE bytes from the SAME shared arena, on top of a's");
+    }
+
+    #[test]
+    fn reset_with_shared_arena_reuses_the_given_arena_not_a_fresh_one() {
+        // reset_with_shared_arena's whole point (vs. plain reset()) is NOT
+        // reserving a new mmap — verify the resulting Codegen's own arena
+        // base address matches the one explicitly handed in, not some new
+        // reservation.
+        let state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
+        let expected_base = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared(shared.clone()).arena_base();
+
+        let mut codegen = Codegen::new(); // starts with its OWN private arena
+        let original_base = codegen.seal_handle.arena_base();
+        assert_ne!(original_base, expected_base, "sanity: Codegen::new()'s own arena must not coincidentally be the same reservation");
+
+        unsafe { codegen.reset_with_shared_arena(shared, state); }
+        assert_eq!(codegen.seal_handle.arena_base(), expected_base, "reset_with_shared_arena must rebuild on top of the given arena, not reserve a fresh one");
     }
 }

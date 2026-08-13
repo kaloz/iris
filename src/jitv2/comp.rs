@@ -231,38 +231,58 @@ pub fn handle_request(
     false
 }
 
-/// One compiled-but-not-yet-finalized artifact, accumulated by
-/// `handle_request_deferred` and consumed by `flush_pending_batch` — the
-/// batched counterpart to `handle_request`'s immediate `page.publish(...)`
-/// call. Carries everything `page.publish` needs except the `JitFn` pointer
-/// itself, since that pointer doesn't exist yet (the whole point of
-/// deferring: it's only valid after the batch's one `finalize_batch` call).
-///
-/// # Safety
-/// `page` must outlive this entry, same requirement as `CompileRequest::page`
-/// (see that field's own doc comment) — the caller (`worker_loop`) only ever
-/// holds these for the brief window between a `consumer.pop()` and the next
-/// flush, well within a single compile-request's already-established
-/// lifetime guarantee.
-pub struct PendingPublish {
-    page: *mut crate::jitv2::PhysicalCodePage,
-    offset: usize,
-    func_id: cranelift_module::FuncId,
-    gen_snap: u64,
-    instr_count: usize,
-    code_size: u32,
-}
-
-unsafe impl Send for PendingPublish {}
+/// How many of this worker's own compiles are sitting gap-blocked in the
+/// shared arena's seal queue right now (fully compiled, finalized, and
+/// patched with a real `PublishInfo` — see `paged_memory::PublishInfo`'s own
+/// doc comment — just not yet sealed because an earlier-allocated range
+/// elsewhere hasn't been patched in yet). Not a `Vec` of entries: once an
+/// entry is pushed/patched into the shared seal queue
+/// (`Codegen::finalize_batch_nonforced`), it is fully self-describing there
+/// — nothing about *which* entry is still needed here, only a rough count to
+/// decide whether `publish_ready_nonforced`/`force_publish_pending` are
+/// worth calling at all. A plain counter can also be conservative in the
+/// harmless direction: `publish_sealed`-derived saturating decrements mean
+/// it can undercount slightly (a sweep triggered by *this* worker's own
+/// gap-blocked entry can incidentally also unblock and publish some *other*
+/// worker's entries, which never incremented this counter — see
+/// `publish_all`'s own doc comment) but never overcounts into a permanent
+/// "stuck thinking there's still something pending" state, since it only
+/// ever grows by exactly 1 per genuinely gap-blocked compile.
+pub type PendingCount = usize;
 
 /// Deferred counterpart to `handle_request`: identical compile-from-snapshot
-/// protocol (walk, codegen), but stops short of finalizing/publishing —
-/// instead of a `page.publish(...)` call, a successful compile is appended
-/// to `pending` as a `PendingPublish` for the caller to finalize later in a
-/// batch (`Codegen::finalize_batch` + `flush_pending_batch`). Every other
-/// outcome (excluded entry, bus-read failure, OOM, real codegen decline) is
-/// handled exactly like `handle_request` — those don't produce a `FuncId` to
-/// defer at all, so there's nothing batching-specific about them.
+/// protocol (walk, codegen) and identical *finalize* timing — this calls
+/// `Codegen::finalize_batch_nonforced` for its own single `FuncId`
+/// immediately after compiling it, same as `handle_request` does via
+/// `compile_region`'s own `finalize_batch` call. The only difference from
+/// `handle_request` is what "finalize" *means* here: non-forced, so it
+/// doesn't necessarily seal the page immediately (see `paged_memory`'s
+/// module doc comment) — this call's own return value decides whether this
+/// offset (and possibly others, unblocked as a side effect) is dispatchable
+/// right now (published immediately, same as `handle_request`) or still
+/// gap-blocked behind another worker's not-yet-finalized range elsewhere in
+/// the shared arena (`*pending` incremented by one, for the caller to retry
+/// via `publish_ready_nonforced`/`force_publish_pending` on a later tick —
+/// see `worker_loop`'s own doc comment). Every other outcome (excluded
+/// entry, bus-read failure, OOM, real codegen decline) is handled exactly
+/// like `handle_request` — those don't produce a `FuncId` to finalize at
+/// all, so there's nothing deferred-specific about them.
+///
+/// Finalizing per-compile like this (rather than accumulating many compiles
+/// into one big batch before ever finalizing any of them) is deliberate: an
+/// earlier version of this function accumulated a whole worker's compiles
+/// into `pending` and only finalized the batch on an external trigger
+/// (arena page-crossing, or the queue going empty) — under real multi-worker
+/// concurrency, a worker that stays continuously busy (queue never goes
+/// empty for it) could accumulate dozens of compiles with none of them ever
+/// finalized, permanently blocking every OTHER worker's later-allocated
+/// ranges from ever sealing (their contiguous-prefix scan can never get
+/// past this worker's still-unfinalized gap) — confirmed live as a genuine
+/// stuck-forever compile-pool bug under real N>1 contention. Finalizing
+/// immediately, every time, removes that failure mode entirely: the only
+/// thing ever deferred now is the mprotect/seal itself, which is exactly
+/// what `paged_memory`'s watermark design is built to tolerate no matter
+/// how long it's deferred.
 ///
 /// Returns the same `bool` as `handle_request` (arena-OOM signal) for the
 /// same reason.
@@ -271,7 +291,7 @@ pub fn handle_request_deferred(
     bus: &Arc<dyn BusDevice>,
     analyzer: &mut Analyzer,
     codegen: &mut Codegen,
-    pending: &mut Vec<PendingPublish>,
+    pending: &mut PendingCount,
     #[cfg(feature = "developer")] stats: &crate::jitv2::JitStats,
 ) -> bool {
     let page = unsafe { &*req.page };
@@ -326,17 +346,52 @@ pub fn handle_request_deferred(
             let code_size = codegen.last_code_size();
             #[cfg(not(feature = "developer"))]
             let code_size = 0;
-            pending.push(PendingPublish { page: req.page, offset, func_id, gen_snap, instr_count, code_size });
+            // Finalize immediately, every compile — see this function's own
+            // doc comment for why deferring finalize itself (rather than
+            // just the seal) was the actual bug. finalize_batch_nonforced
+            // patches this entry's PublishInfo into the seal-queue slot
+            // compile_region_uncommitted already reserved for it
+            // (push_placeholder) and tries to seal — the returned entries
+            // may include this one (the common case — nothing else is
+            // blocking it) and/or other workers' own entries that this
+            // seal attempt happened to unblock too; every entry returned
+            // here is fully self-describing (paged_memory::PublishInfo's
+            // own doc comment) and gets published unconditionally,
+            // regardless of whose compile produced it. If nothing came
+            // back at all, this range is itself gap-blocked behind an
+            // earlier, still-unpatched entry — retry later via the
+            // idle-timeout/pending-threshold sweep.
+            let publish = crate::jitv2::paged_memory::PublishInfo {
+                page: req.page, offset, gen_snap, instr_count, code_size,
+                jit_fn: None,
+            };
+            let sealed = codegen.finalize_batch_nonforced(func_id, publish);
+            if sealed.is_empty() {
+                *pending += 1;
+            } else {
+                publish_all(&sealed);
+            }
             #[cfg(feature = "developer")]
             {
                 // Per-word block-overlap diagnostic (j2 pcp) — counted at
-                // compile time, same as the immediate path, regardless of the
-                // deferred publish. Safe to touch `page` here: publish itself
-                // is deferred, but the include-count is an independent
-                // diagnostic field with no gen/validity contract.
+                // compile time regardless of whether publish happened
+                // immediately or was deferred. Safe to touch `page` here in
+                // either case — the include-count is an independent
+                // diagnostic field with no gen/validity contract. Also count
+                // fallback words/regions and the successful-compile total —
+                // same bookkeeping `handle_request`'s own success arm does,
+                // needed here too since `j2 status`/`j2 stats` read these
+                // process-wide counters regardless of which path compiled.
+                let mut fb = 0u64;
                 for instr in crate::jitv2::analyzer::instrs_linear(&instrs_owned) {
                     page.note_block_include(instr.word as usize);
+                    if instr.is_fallback { fb += 1; }
                 }
+                if fb > 0 {
+                    stats.fallback_words.fetch_add(fb, std::sync::atomic::Ordering::Relaxed);
+                    stats.fallback_regions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                stats.compiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         None if codegen.last_compile_ran_out_of_memory() => {
@@ -360,27 +415,52 @@ pub fn handle_request_deferred(
     false
 }
 
-/// Finalize and publish every `PendingPublish` accumulated so far — the
-/// deferred counterpart to `handle_request`'s immediate `page.publish(...)`.
-/// `codegen.finalize_batch` does the one `finalize_definitions()` call this
-/// whole batch has been building up to; each pending entry's own `gen_snap`
-/// re-check inside `page.publish` (same as the immediate path) safely drops
-/// any entry whose page mutated since it was compiled, exactly as it always
-/// has — batching doesn't change that safety property, only when the
-/// finalize/publish happens. Clears `pending` on return regardless of
-/// per-entry outcome; a no-op (and no `finalize_definitions()` call at all,
-/// via `finalize_batch`'s own empty-slice short circuit) when `pending` is
-/// already empty.
-pub fn flush_pending_batch(codegen: &mut Codegen, pending: &mut Vec<PendingPublish>) {
-    if pending.is_empty() {
-        return;
-    }
-    let func_ids: Vec<cranelift_module::FuncId> = pending.iter().map(|p| p.func_id).collect();
-    let jit_fns = codegen.finalize_batch(&func_ids);
-    for (entry, jit_fn) in pending.drain(..).zip(jit_fns) {
+/// Publish every entry a seal sweep just returned, unconditionally — each
+/// `PublishInfo` is fully self-describing (see its own doc comment), so
+/// there's no `FuncId`/`Codegen` lookup needed here, and no reason to
+/// filter: every entry `try_seal_ready`/`try_seal_ready_forced` hands back
+/// is, by construction, freshly sealed and ready to dispatch. May include
+/// entries pushed by a *different* worker than the one that triggered this
+/// particular sweep — that's fine and expected (see this function's own
+/// callers' doc comments).
+fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
+    for entry in sealed {
         let page = unsafe { &*entry.page };
+        let jit_fn = entry.jit_fn.expect("publish_all: a sealed entry must always carry a resolved JitFn");
         page.publish(entry.offset, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size);
     }
+}
+
+/// Non-forced retry sweep for the async worker's idle-timeout scheme (see
+/// `worker_loop`'s own doc comment): re-attempts sealing whatever the
+/// shared arena's seal queue currently has queued (this worker's own
+/// gap-blocked entries — see `PendingCount`'s own doc comment — or another
+/// worker's) and publishes everything that comes back. Decrements `*pending`
+/// by how many entries this sweep actually published, saturating at 0 since
+/// a sweep triggered by this worker's own gap-blocked entry can incidentally
+/// publish other workers' entries too, which never incremented this
+/// worker's own counter.
+pub fn publish_ready_nonforced(codegen: &mut Codegen, pending: &mut PendingCount) {
+    if *pending == 0 {
+        return;
+    }
+    let sealed = codegen.try_seal_ready();
+    *pending = pending.saturating_sub(sealed.len());
+    publish_all(&sealed);
+}
+
+/// Idle-timeout counterpart: force-seal whatever the shared arena's seal
+/// queue still has queued without waiting for a further contiguous-prefix
+/// match — see `Codegen::force_seal_pending`'s own doc comment. Same
+/// saturating-decrement/publish-everything contract as
+/// `publish_ready_nonforced`.
+pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) {
+    if *pending == 0 {
+        return;
+    }
+    let sealed = codegen.force_seal_pending();
+    *pending = pending.saturating_sub(sealed.len());
+    publish_all(&sealed);
 }
 
 #[cfg(feature = "jitv2_corpus_dump")]
@@ -597,7 +677,7 @@ mod tests {
 
     /// Same `stats`-hiding wrapper as `handle_request_for_test`, for the
     /// deferred path.
-    fn handle_request_deferred_for_test(req: &CompileRequest, bus: &Arc<dyn BusDevice>, analyzer: &mut Analyzer, codegen: &mut Codegen, pending: &mut Vec<PendingPublish>) -> bool {
+    fn handle_request_deferred_for_test(req: &CompileRequest, bus: &Arc<dyn BusDevice>, analyzer: &mut Analyzer, codegen: &mut Codegen, pending: &mut PendingCount) -> bool {
         #[cfg(feature = "developer")]
         {
             let stats = crate::jitv2::JitStats::default();
@@ -610,7 +690,16 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_deferred_accumulates_pending_without_publishing() {
+    fn handle_request_deferred_leaves_a_lone_small_compile_pending_until_its_page_seals() {
+        // Non-forced sealing never seals a still-open page — even with a
+        // solo arena and exactly one compile, nothing else will ever grow
+        // `position` into a new page on its own (see
+        // Codegen::finalize_batch_nonforced_does_not_seal_a_still_open_page's
+        // own test, at the arena level). handle_request_deferred must
+        // therefore leave this offset pending, exactly as the idle-timeout/
+        // force-seal machinery (force_publish_pending) expects to find it —
+        // this isn't "gap-blocked behind another worker," just "not yet a
+        // whole page's worth."
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -618,42 +707,15 @@ mod tests {
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
-        let mut pending = Vec::new();
+        let mut pending: PendingCount = 0;
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
-        assert_eq!(pending.len(), 1, "a successful deferred compile must accumulate exactly one PendingPublish");
-        assert!(!page.is_entry_valid(4), "must not be published until flush_pending_batch runs");
-    }
+        assert_eq!(pending, 1, "a lone small compile's page is still open — non-forced sealing must not publish it yet");
+        assert!(!page.is_entry_valid(4), "must not be published until something actually seals its page");
 
-    #[test]
-    fn flush_pending_batch_publishes_every_accumulated_entry() {
-        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
-        let counter = AtomicU64::new(0);
-        let mut page_a = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        let mut page_b = PhysicalCodePage::new(1, &counter as *const AtomicU64);
-        let req_a = CompileRequest { page: &mut page_a as *mut PhysicalCodePage, offset: 4, compiled_for_fr1: true };
-        let req_b = CompileRequest { page: &mut page_b as *mut PhysicalCodePage, offset: 8, compiled_for_fr1: true };
-
-        let mut analyzer = Analyzer::new();
-        let mut codegen = Codegen::new();
-        let mut pending = Vec::new();
-        handle_request_deferred_for_test(&req_a, &bus, &mut analyzer, &mut codegen, &mut pending);
-        handle_request_deferred_for_test(&req_b, &bus, &mut analyzer, &mut codegen, &mut pending);
-        assert_eq!(pending.len(), 2);
-
-        flush_pending_batch(&mut codegen, &mut pending);
-
-        assert!(pending.is_empty(), "flush_pending_batch must drain pending on return");
-        assert!(page_a.is_entry_valid(4), "first batched entry must be published");
-        assert!(page_b.is_entry_valid(8), "second batched entry must be published");
-    }
-
-    #[test]
-    fn flush_pending_batch_on_empty_pending_is_a_harmless_noop() {
-        let mut codegen = Codegen::new();
-        let mut pending: Vec<PendingPublish> = Vec::new();
-        flush_pending_batch(&mut codegen, &mut pending); // must not panic
-        assert!(pending.is_empty());
+        force_publish_pending(&mut codegen, &mut pending);
+        assert_eq!(pending, 0, "the idle-timeout force-seal sweep must finish the job");
+        assert!(page.is_entry_valid(4), "now published, once forced");
     }
 
     #[test]
@@ -665,10 +727,10 @@ mod tests {
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
-        let mut pending = Vec::new();
+        let mut pending: PendingCount = 0;
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
-        assert!(pending.is_empty(), "an empty-region (boundary) entry produces no FuncId to defer");
+        assert_eq!(pending, 0, "an empty-region (boundary) entry produces no FuncId to defer");
         assert!(page.is_denylisted(0));
     }
 
@@ -682,33 +744,9 @@ mod tests {
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
-        let mut pending = Vec::new();
+        let mut pending: PendingCount = 0;
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
         assert!(page.try_schedule(4), "scheduled bit must be cleared even though publish itself is deferred");
-    }
-
-    #[test]
-    fn flush_pending_batch_skips_an_entry_whose_page_mutated_since_compile() {
-        // Same gen_snap staleness check `page.publish` already applies on
-        // the immediate path — batching must not weaken it: an entry
-        // compiled against gen N, flushed after the page bumped to gen N+1,
-        // must be silently dropped rather than published against stale
-        // content.
-        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
-        let counter = AtomicU64::new(0);
-        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 4, compiled_for_fr1: true };
-
-        let mut analyzer = Analyzer::new();
-        let mut codegen = Codegen::new();
-        let mut pending = Vec::new();
-        handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
-        assert_eq!(pending.len(), 1);
-
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // page "mutates"
-
-        flush_pending_batch(&mut codegen, &mut pending);
-        assert!(!page.is_entry_valid(4), "a batch entry compiled against a stale gen must not be published");
     }
 }
