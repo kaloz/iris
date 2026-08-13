@@ -5571,6 +5571,18 @@ fn emit_daddi(ctx: &mut EmitCtx) {
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
+/// DADDIU rt, rs, imm: rt = rs + sext(imm16) (wrapping, no trap) — mirrors
+/// `MipsExecutor::exec_daddiu`'s `wrapping_add`. Same relationship to
+/// `emit_daddi` that `emit_addiu` has to `emit_addi` (drop the overflow
+/// check, wrap instead), at native 64-bit width like `emit_daddi` (no 32-bit
+/// truncate/sign-extend step, unlike `emit_addiu`).
+fn emit_daddiu(ctx: &mut EmitCtx) {
+    let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let imm = field_imm16_sext(ctx.builder, ctx.raw);
+    let result = ctx.builder.ins().iadd(rs_val, imm);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
 fn emit_andi(ctx: &mut EmitCtx) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
     let imm = field_imm16_zext(ctx.builder, ctx.raw);
@@ -6218,6 +6230,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
         OP_ADDI => Some(emit_addi),
         OP_ADDIU => Some(emit_addiu),
         OP_DADDI => Some(emit_daddi),
+        OP_DADDIU => Some(emit_daddiu),
         OP_SLTI => Some(emit_slti),
         OP_SLTIU => Some(emit_sltiu),
         OP_ANDI => Some(emit_andi),

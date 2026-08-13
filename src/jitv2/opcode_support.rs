@@ -264,6 +264,11 @@ mod tests {
     }
 
     #[test]
+    fn daddiu_has_emitter() {
+        assert!(has_emitter(i_type(OP_DADDIU, 1, 2, 5)));
+    }
+
+    #[test]
     fn lwl_has_emitter() {
         assert!(has_emitter(i_type(OP_LWL, 1, 2, 0)));
     }
@@ -322,11 +327,10 @@ mod tests {
     #[test]
     fn category_toggle_bulk_sets_and_clears() {
         let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Note: category_enabled(ALU) is *not* true by default — a few ALU-category
-        // kinds (Nop/Syscall/Break: exception-only, never emitted; Daddiu: a
-        // pre-existing has_jitv2_emitter coverage gap, see opcode_support's history)
-        // have no emitter at all, so "fully on" was never the starting state for
-        // this category. Check individual supported kinds instead.
+        // Note: category_enabled(ALU) is *not* true by default — Nop/Syscall/Break
+        // are ALU-category but exception-only (never dispatched through codegen at
+        // all), so "fully on" was never the starting state for this category. Check
+        // individual supported kinds instead.
         assert!(instr_enabled(InstrKind::Addu));
         assert!(instr_enabled(InstrKind::Sll));
 

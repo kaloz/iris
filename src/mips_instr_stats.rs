@@ -269,7 +269,7 @@ impl InstrKind {
             | Movz | Movn | Movci
             | Tge | Tgeu | Tlt | Tltu | Teq | Tne | Sync
             | Tgei | Tgeiu | Tlti | Tltiu | Teqi | Tnei
-            | Addi | Addiu | Daddi | Slti | Sltiu | Andi | Ori | Xori | Lui
+            | Addi | Addiu | Daddi | Daddiu | Slti | Sltiu | Andi | Ori | Xori | Lui
             | Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld
             | Lwl | Lwr | Ldl | Ldr
             | Sb | Sh | Sw | Sd

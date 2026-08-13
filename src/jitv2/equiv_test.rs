@@ -1333,6 +1333,15 @@ mod tests {
     }
 
     #[test]
+    fn daddiu_matches_interpreter() {
+        alu_imm_case(crate::mips_isa::OP_DADDIU, 10, 20);
+        // 64-bit wraparound is NOT a trap for DADDIU (unlike DADDI) — confirms
+        // the emitter is genuinely wrapping, not DADDI with a different opcode byte.
+        alu_imm_case(crate::mips_isa::OP_DADDIU, 0xFFFF_FFFF_FFFF_FFFF, 1);
+        alu_imm_case(crate::mips_isa::OP_DADDIU, 5, 0x8000); // negative immediate
+    }
+
+    #[test]
     fn andi_ori_xori_match_interpreter() {
         for op in [crate::mips_isa::OP_ANDI, crate::mips_isa::OP_ORI, crate::mips_isa::OP_XORI] {
             alu_imm_case(op, 0xFFFF_FFFF_FFFF_0000, 0xFFFF); // imm is zero-extended, not sign-extended
