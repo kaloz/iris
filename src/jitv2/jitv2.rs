@@ -456,7 +456,7 @@ pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
 /// flushing well before the arena's own exhaustion error could ever fire —
 /// that error path (`comp::handle_request`'s exhaustion match arm) stays as
 /// a belt-and-suspenders backstop, not the primary trigger.
-pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 128 * 1024 * 1024;
+pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -2249,6 +2249,26 @@ mod tests {
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
 
+    /// Pins `comp::MAX_INSTRS_PER_COMPILE` to an explicit value for the
+    /// lifetime of the guard, restoring the prior value on drop (including
+    /// on panic/unwind) — tests must never rely on whatever the process-wide
+    /// default happens to be, since it's a single global shared with every
+    /// other test in this binary (potentially running concurrently) and with
+    /// production code's own default.
+    struct MaxInstrsGuard(usize);
+    impl MaxInstrsGuard {
+        fn set(n: usize) -> Self {
+            let prev = crate::jitv2::comp::max_instrs_per_compile();
+            crate::jitv2::comp::set_max_instrs_per_compile(n);
+            Self(prev)
+        }
+    }
+    impl Drop for MaxInstrsGuard {
+        fn drop(&mut self) {
+            crate::jitv2::comp::set_max_instrs_per_compile(self.0);
+        }
+    }
+
     /// Proves `park_at_barrier`'s park/wake protocol directly, with real
     /// spawned threads simulating N=3 workers — independent of `worker_loop`,
     /// since a real single-worker (`thread_count == 1`) integration can
@@ -2784,7 +2804,11 @@ mod tests {
         // all — this was tried first and confirmed the wrong shape for this
         // test; distinct pages avoids that entirely and matches how real
         // page-cross-worthy traffic (many distinct hot pages arriving close
-        // together) actually looks.
+        // together) actually looks. Pinned explicitly rather than relying on
+        // the ambient default (which no longer happens to be usize::MAX in
+        // production) so this reasoning stays true regardless of future
+        // default changes.
+        let _max_instrs_guard = MaxInstrsGuard::set(usize::MAX);
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));

@@ -36,19 +36,33 @@ use crate::traits::BusDevice;
 /// anywhere from 1 to 16 instructions (the tail past the nominal budget
 /// comes from a branch's mandatory delay slot counting toward the total but
 /// not the budget itself), clustering 8-11, with only a handful ever
-/// reaching 16. `usize::MAX` here is deliberate, not "as large as
-/// possible": any value at or above `ENTRIES_PER_PAGE` (1024 words/page) is
-/// already equivalent to no budget at all, since the walk was always going
-/// to decline rather than compile a region longer than fits on one
-/// physical page anyway (module doc: "runs off the page... declines the
-/// whole region") — the page boundary, not this constant, is the real
-/// ceiling from here on (same as `Analyzer::walk`'s own unbounded case).
-/// Both `Analyzer::walk_bounded` and `Codegen::compile_region` were already
-/// written generically against `max_instrs` (fallthrough-edge wiring for a
-/// multi-instruction straight-line region already exists, per
-/// `compile_region`'s Pass 2), so this is still a config change, not a
-/// redesign — just the last one for this knob.
-const MAX_INSTRS_PER_COMPILE: usize = usize::MAX;
+/// reaching 16. Defaults to 128 — real regions cluster 8-11 instructions, so
+/// this is a generous headroom rather than a tight cap, chosen to bound the
+/// rare pathological case (long branch-free/self-chaining-delay-slot runs)
+/// where an unbounded walk would otherwise let the analyzer grow one region
+/// arbitrarily large, producing a single huge, slow-to-compile Cranelift
+/// function and a single huge arena allocation for it. Any value at or
+/// above `ENTRIES_PER_PAGE` (1024 words/page) is equivalent to no budget at
+/// all, since the walk was always going to decline rather than compile a
+/// region longer than fits on one physical page anyway (module doc: "runs
+/// off the page... declines the whole region") — the page boundary, not
+/// this constant, is the real ceiling past that point (same as
+/// `Analyzer::walk`'s own unbounded case). `j2 max-instrs [N]` tunes this at
+/// runtime (e.g. to shrink compiled regions further for debugging/bisection,
+/// or raise it back toward `usize::MAX`); both `Analyzer::walk_bounded` and
+/// `Codegen::compile_region` were already written generically against
+/// `max_instrs` (fallthrough-edge wiring for a multi-instruction
+/// straight-line region already exists, per `compile_region`'s Pass 2), so
+/// this is just a config read, not a redesign.
+static MAX_INSTRS_PER_COMPILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(128);
+
+pub fn set_max_instrs_per_compile(n: usize) {
+    MAX_INSTRS_PER_COMPILE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn max_instrs_per_compile() -> usize {
+    MAX_INSTRS_PER_COMPILE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Minimum walked-region instruction count a compile must reach to actually
 /// get compiled — regions shorter than this are sticky-denylisted instead,
@@ -147,7 +161,7 @@ pub fn handle_request(
     #[cfg(feature = "jitv2_corpus_dump")]
     dump_corpus_snapshot(page, req.offset, &words);
 
-    let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, MAX_INSTRS_PER_COMPILE);
+    let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
     if !non_empty {
         page.denylist(offset); // entry offset itself is excluded (§6.4)
         #[cfg(feature = "developer")]
@@ -322,7 +336,7 @@ pub fn handle_request_deferred(
     #[cfg(feature = "jitv2_corpus_dump")]
     dump_corpus_snapshot(page, req.offset, &words);
 
-    let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, MAX_INSTRS_PER_COMPILE);
+    let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
     if !non_empty {
         page.denylist(offset);
         #[cfg(feature = "developer")]

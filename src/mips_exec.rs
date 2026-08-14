@@ -9302,7 +9302,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|alu|fpu|branch|loadstore|cop0|batch|opt|min-instrs|min-calls|lockstep|flush>".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|hugepages|flush>".to_string()); }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -9545,6 +9545,24 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                                     writeln!(writer, "j2 min-instrs: {}", crate::jitv2::comp::min_instrs_to_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 min-instrs [N]".to_string()),
+                            },
+                        }
+                    }
+                    "max-instrs" => {
+                        // Same sticky-denylist caveat as min-instrs: applies
+                        // to future compile decisions only, doesn't
+                        // retroactively affect anything already compiled or
+                        // denylisted under the old budget.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 max-instrs: {}", crate::jitv2::comp::max_instrs_per_compile()).unwrap();
+                            }
+                            Some(n) => match n.parse::<usize>() {
+                                Ok(n) => {
+                                    crate::jitv2::comp::set_max_instrs_per_compile(n);
+                                    writeln!(writer, "j2 max-instrs: {}", crate::jitv2::comp::max_instrs_per_compile()).unwrap();
+                                }
+                                Err(_) => return Err("Usage: j2 max-instrs [N]".to_string()),
                             },
                         }
                     }
@@ -10010,7 +10028,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                             }
                         }
                     }
-                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|batch [on|off]|opt [none|speed]|min-instrs [N]|min-calls [N]|lockstep|hugepages>".to_string()),
+                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|fallback [on|off|<category>]|instrs|threads|opt [none|speed]|min-instrs [N]|max-instrs [N]|min-calls [N]|lockstep|hugepages|flush>".to_string()),
                 }
                 Ok(())
             }
