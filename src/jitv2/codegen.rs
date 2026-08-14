@@ -1222,7 +1222,17 @@ impl Codegen {
                 let skip_nop_dispatch = false;
                 #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
                 let skip_nop_dispatch = raw == 0;
-                if !skip_nop_dispatch {
+                // LUI+ORI/ADDIU 32-bit-immediate fusion (see
+                // try_emit_fused_lui's doc comment) — `extra_skip` is 1 when
+                // it applied (fold word+1 into this write, fall through to
+                // word+2 instead) or 0 otherwise (ordinary single-word LUI,
+                // or any other opcode).
+                let extra_skip = if raw & 0xFC00_0000 == (crate::mips_isa::OP_LUI << 26) {
+                    try_emit_fused_lui(&mut ctx, instrs, word)
+                } else {
+                    0
+                };
+                if extra_skip == 0 && !skip_nop_dispatch {
                     if let Some(emit) = lookup_semantics(raw) {
                         emit(&mut ctx);
                     } else {
@@ -1241,9 +1251,18 @@ impl Codegen {
                 #[cfg(feature = "jitv2_lockstep")]
                 if ls_bracket && !region_ending { emit_lockstep_compare_seq(&mut ctx); }
 
-                let fallthrough_word = word + 1;
+                // `extra_skip == 1` (LUI fused with word+1's ORI/ADDIU):
+                // word+1's own semantics were already folded into the
+                // combined write above, so the edge that matters here is
+                // word+1's fallthrough (whether word+2 continues into the
+                // region), not the LUI's own — `word` alone never had a
+                // fallthrough_exit computed against word+2 at all, since the
+                // analyzer walked LUI as an ordinary single-word Sequential.
+                // `extra_skip == 0`: ordinary single-word case, unchanged.
+                let last_fused_word = word + extra_skip;
+                let fallthrough_word = last_fused_word + 1;
                 let plain_fallthrough = |ctx: &mut EmitCtx| {
-                    match instrs[word as usize].fallthrough_exit {
+                    match instrs[last_fused_word as usize].fallthrough_exit {
                         Some(_) => {
                             // Region ends here — mirrors handle_exec_complete's
                             // `pc += 4` (§3.3 "plain boundary").
@@ -5954,6 +5973,100 @@ fn emit_lui(ctx: &mut EmitCtx) {
     let imm32 = ((ctx.raw & 0xFFFF) << 16) as i32 as i64;
     let result = ctx.builder.ins().iconst(ir::types::I64, imm32);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
+/// Detect the 32-bit-immediate-materialization idiom `lui rX,hi; {ori,addiu}
+/// rX,rX,lo` — jitv2's counterpart to the interpreter's `opcodefusion`
+/// (`exec_lui_imm32`/`exec_lui_simm32`, mips_exec.rs). `lui_raw`/`next_raw`
+/// are the two adjacent words (word, word+1); returns the combined 32-bit
+/// value (sign-extended to i64, matching `emit_lui`'s own result type) if
+/// `next_raw` is same-register ORI or ADDIU, `None` otherwise. ORI can't
+/// carry (pure OR of disjoint hi/lo halves); ADDIU's sign-extending add can
+/// carry into bit 16 when lo16's sign bit is set, so this replicates
+/// `exec_addiu`'s wrapping-add semantics exactly, not just an OR — same
+/// split the interpreter's own decode-time combine makes.
+fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
+    let rt = field_rt(lui_raw);
+    let next_op = (next_raw >> 26) & 0x3F;
+    let next_rs = field_rs(next_raw);
+    let next_rt = field_rt(next_raw);
+    if next_rs != rt || next_rt != rt {
+        return None;
+    }
+    if next_op == crate::mips_isa::OP_ORI {
+        let hi = (lui_raw & 0xFFFF) << 16;
+        let lo = next_raw & 0xFFFF;
+        Some((hi | lo) as i32 as i64)
+    } else if next_op == crate::mips_isa::OP_ADDIU {
+        let hi = ((lui_raw & 0xFFFF) << 16) as i32;
+        let lo = (next_raw & 0xFFFF) as i16 as i32;
+        Some(hi.wrapping_add(lo) as i64)
+    } else {
+        None
+    }
+}
+
+/// Fast path for `emit_lui`'s LUI+ORI/ADDIU fusion: if the next word
+/// (`word + 1`) is a same-register ORI/ADDIU forming the idiom above, write
+/// the combined constant directly and report the extra word count to skip
+/// (1, i.e. jump to `word + 2` instead of `word + 1`) — `0` if it doesn't
+/// apply and the caller must fall back to plain `emit_lui` + ordinary
+/// word+1 fallthrough.
+///
+/// Excluded (returns `0` unconditionally) under three conditions, mirroring
+/// `try_emit_fused_nop_slot`'s own gating logic and rationale:
+///
+/// - `jitv2_lockstep`/`developer`: same reasoning as the NOP fusion — a
+///   verification/tracing build needs the LUI and ORI/ADDIU to remain two
+///   separately dispatched, separately addressable instructions (lockstep's
+///   live per-instruction compare would otherwise materialize `core.pc =
+///   word+1` and compare against the *unfused* interpreter's post-LUI-only
+///   state, which the fused JIT side never produces — a spurious mismatch,
+///   not a real divergence; `developer`'s dt trace/breakpoints need the pair
+///   individually addressable exactly like the opcodefusion feature's own
+///   Cargo.toml doc comment already accepts for the interpreter).
+/// - `word + 1` is off the end of the page (`entries_per_page` boundary):
+///   nothing to peek at, and 0xFFC-adjacent words have their own hazards
+///   this function doesn't need to reason about — just don't fuse.
+/// - **`instrs[word + 1].is_branch_target`**: the ORI/ADDIU is independently
+///   reachable — something in this region branches/jumps directly to it,
+///   skipping the LUI. That arrival needs the real, un-fused ORI/ADDIU to
+///   run (`word + 1` keeps its own normal Cranelift block regardless — pass
+///   1 allocates blocks for every visited head independent of any fusion
+///   decision made here in pass 2 — so that arrival is still correct); what
+///   must never happen is the LUI's own block *also* running the combined
+///   write and then falling through into that same block a second time,
+///   double-applying the ORI/ADDIU. Skipping fusion whenever word+1 is a
+///   branch target sidesteps the ambiguity entirely rather than trying to
+///   make the fused LUI conditionally skip only for non-branch-target
+///   arrivals (impossible — block choice is a single static edge, not a
+///   per-arrival runtime branch).
+#[cfg_attr(any(feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
+fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> u16 {
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    {
+        let _ = (instrs, word);
+        0
+    }
+    #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+    {
+        let next_word = word + 1;
+        if next_word as usize >= ENTRIES_PER_PAGE {
+            return 0;
+        }
+        let next = &instrs[next_word as usize];
+        if !next.visited || next.is_slot_only || next.is_fallback || next.is_branch_target {
+            return 0;
+        }
+        match fused_lui_imm32(ctx.raw, next.raw) {
+            Some(combined) => {
+                let result = ctx.builder.ins().iconst(ir::types::I64, combined);
+                emit_write_gpr(ctx, field_rt(ctx.raw), result);
+                1
+            }
+            None => 0,
+        }
+    }
 }
 
 /// How a loaded value's width is extended to fill the 64-bit GPR — mirrors

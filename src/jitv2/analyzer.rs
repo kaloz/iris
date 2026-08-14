@@ -407,6 +407,22 @@ pub struct CompiledInstr {
     /// successor never has this set and stays a plain fallthrough.
     /// Meaningless when `visited` is `false`.
     pub is_branch_fallback_successor: bool,
+    /// `true` iff this word is the explicit `target` of some `Branch`/`Jump`
+    /// in the region — i.e. reachable by an edge other than falling straight
+    /// off the previous word. Set at the two `finish_visit` sites that
+    /// recurse into a branch/jump's resolved `target` (never for the
+    /// not-taken/past-the-slot `offset + 2` edge, which is ordinary
+    /// sequential flow, not a jump destination). Codegen consults this
+    /// before fusing a `Sequential` instruction with its immediate successor
+    /// (LUI+ORI/ADDIU 32-bit-immediate materialization, `opcodefusion`'s
+    /// jitv2 counterpart): fusing must never let the producer's own block
+    /// skip past a word that something else can jump directly into, since
+    /// that arrival needs the *un-fused* instruction to run — this flag is
+    /// exactly "would fusing orphan a real predecessor of word+1". Distinct
+    /// from `is_slot_only`'s narrower "reached only as a mandatory,
+    /// never-independently-targeted delay slot" — a branch target is the
+    /// opposite case, explicitly and independently reachable.
+    pub is_branch_target: bool,
 }
 
 impl CompiledInstr {
@@ -421,7 +437,7 @@ impl CompiledInstr {
 
 impl Default for CompiledInstr {
     fn default() -> Self {
-        Self { visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false }
+        Self { visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false, is_branch_target: false }
     }
 }
 
@@ -572,6 +588,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: Some(StopReason::ForeignPageSlot),
             is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
+            is_branch_target: false,
         };
         return true;
     }
@@ -591,6 +608,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
+        is_branch_target: false,
     };
     true
 }
@@ -671,6 +689,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: None, is_slot_only: false,
             is_fallback: true, is_branch_fallback_successor: false,
+            is_branch_target: false,
         };
         budget.remaining -= 1;
         // Same fall-through recursion as Sequential (finish_visit's Sequential
@@ -746,6 +765,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false,
+        is_branch_target: false,
     };
     budget.remaining -= 1;
 
@@ -795,7 +815,15 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
             }
             match target {
                 Some(t) => {
-                    if !visit(instrs, page, page_base, t, budget) {
+                    if visit(instrs, page, page_base, t, budget) {
+                        // Set after visit() returns, never before: a fresh
+                        // first-visit for `t` (Classify::Excluded's own
+                        // CompiledInstr construction, or the plain-head
+                        // construction below) fully overwrites
+                        // instrs[t], which would silently clobber this
+                        // flag if it were set beforehand.
+                        instrs[t as usize].is_branch_target = true;
+                    } else {
                         let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                         instrs[offset as usize].taken_exit = Some(reason);
                     }
@@ -807,7 +835,11 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
             // Unconditional — no not-taken arm, only the taken_exit edge.
             match target {
                 Some(t) => {
-                    if !visit(instrs, page, page_base, t, budget) {
+                    if visit(instrs, page, page_base, t, budget) {
+                        // See the Branch arm above for why this is set
+                        // after visit() returns, not before.
+                        instrs[t as usize].is_branch_target = true;
+                    } else {
                         let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                         instrs[offset as usize].taken_exit = Some(reason);
                     }

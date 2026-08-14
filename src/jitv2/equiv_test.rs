@@ -1404,6 +1404,101 @@ mod tests {
         assert_jit_matches_interpreter(instr2, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
+    /// `try_emit_fused_lui` (codegen.rs): `lui r2,0x1234; ori r2,r2,0x5678`
+    /// must produce the same combined r2 as running the two instructions
+    /// unfused, and must still fall through correctly to whatever follows
+    /// the ORI (word 2 here, a marker ADDIU) — proving the fused LUI's edge
+    /// targets word+2, not word+1 (which was folded in, not independently
+    /// re-executed).
+    #[test]
+    fn lui_ori_fuses_and_matches_interpreter() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = vec![
+            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)),
+            (2, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // marker: proves word 2 still ran
+        ];
+        assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, 3, 3);
+        let jit = run_jit_page(&page, [0u64; 32], pc, 0, 3, &[]).expect("region must compile");
+        assert_eq!(jit.gpr[2], 0x1234_5678, "fused LUI+ORI must combine hi/lo exactly");
+        assert_eq!(jit.gpr[5], 1, "word 2 (past the fused pair) must still run");
+    }
+
+    /// Same as `lui_ori_fuses_and_matches_interpreter`, but ADDIU — whose
+    /// sign-extending add can carry into bit 16 when the low half's sign bit
+    /// is set (unlike ORI's pure OR), so this specifically exercises that
+    /// carry path (`lo16 = 0xFFFF` = -1) matching `exec_addiu`'s
+    /// wrapping-add semantics exactly.
+    #[test]
+    fn lui_addiu_fuses_with_carry_and_matches_interpreter() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = vec![
+            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::mips_isa::OP_ADDIU, 2, 2, 0xFFFF)), // lo16 = -1, carries out of bit 16
+            (2, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+        ];
+        assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, 3, 3);
+        let jit = run_jit_page(&page, [0u64; 32], pc, 0, 3, &[]).expect("region must compile");
+        // 0x1234_0000 + (-1) = 0x1233_FFFF (borrows out of bit 16, matching a
+        // real wrapping add rather than a plain OR of the two halves).
+        assert_eq!(jit.gpr[2], 0x1233_FFFF, "fused LUI+ADDIU must carry, not just OR, the halves");
+    }
+
+    /// Correctness guard for the `is_branch_target` exclusion
+    /// (`try_emit_fused_lui`'s doc comment): when something in the region
+    /// jumps directly to the word right after an LUI, that word must NOT be
+    /// silently folded away — the branch's own arrival needs the real,
+    /// independently-addressable ORI to run.
+    ///
+    /// Modeled on `backward_branch_loop_body_matches_interpreter`'s
+    /// loop-with-sentinel shape. Layout: word 0 `lui r2,0x1234` (fusion
+    /// candidate — entry, runs once), word 1 `ori r2,r2,0x5678` (its
+    /// would-be fusion partner, ALSO the loop body / branch target: word 2
+    /// increments r4 on every pass so the test can tell how many times word
+    /// 1 actually ran), word 2 `addiu r4,r4,1`, words 3-4 nop padding
+    /// (mirroring the reference test's own spacing), word 5 BNE r1,r0,imm
+    /// looping back to word 1 while r1 (seeded directly via `gpr`,
+    /// independent of r2/the LUI) hasn't hit zero, word 6 delay slot
+    /// decrementing r1, word 7 boundary sentinel.
+    ///
+    /// If fusion incorrectly triggered on word 0 (ignoring
+    /// `is_branch_target`), word 1 would never compile as its own
+    /// independently-reachable block the way the loop back-edge needs —
+    /// except `block_for_word` always allocates it regardless (pass 1 is
+    /// unconditional); what fusion getting this wrong would actually corrupt
+    /// is r2 (case where the *entry* arrival's LUI folds word 1's ORI into
+    /// itself AND word 1 still runs again on every backward-branch pass,
+    /// double-applying the ORI on the first iteration) — caught by comparing
+    /// against the interpreter's fully-unfused r2 exactly.
+    #[test]
+    fn lui_not_fused_when_next_word_is_a_branch_target() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let target_word: i32 = 1; // loop back to word 1 (the ORI), not word 0 (the LUI)
+        let imm16 = (target_word - (5 + 1)) as i16 as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 2; // loop counter, independent of r2
+        let page = vec![
+            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)),
+            (2, make_i(crate::mips_isa::OP_ADDIU, 4, 4, 1)), // counts word-1 passes
+            (3, 0),
+            (4, 0),
+            (5, make_i(crate::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
+            (6, make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // delay slot: r1 -= 1
+            (7, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        // word0 (1) + 3 passes of word1..word6 (6 each: r1 starts at 2, BNE
+        // tests-then-slot-decrements each pass — taken at r1=2, taken at
+        // r1=1, not-taken at r1=0 but the slot still dispatches regardless,
+        // matching branch_delay_slot_always_executes_regardless_of_taken) =
+        // 1 + 6*3 = 19.
+        let steps = 1 + 6 * 3;
+        assert_jit_matches_interpreter_page(&page, gpr, pc, 0, steps, /*max_instrs=*/16);
+        let jit = run_jit_page(&page, gpr, pc, 0, 16, &[]).expect("region must compile");
+        assert_eq!(jit.gpr[2], 0x1234_5678, "r2 must match the fully-unfused LUI+ORI result even though word 0 is also a branch-target predecessor's LUI");
+        assert_eq!(jit.gpr[4], 3, "word 1 (the ORI) must run exactly once per loop pass, not be silently skipped or double-applied");
+    }
+
     #[test]
     fn lw_matches_interpreter_basic() {
         let mut gpr = [0u64; 32];
