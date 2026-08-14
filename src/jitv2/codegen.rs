@@ -1209,11 +1209,26 @@ impl Codegen {
                 #[cfg(feature = "jitv2_lockstep")]
                 if ls_live { emit_lockstep_step(&mut ctx, true); }
 
-                if let Some(emit) = lookup_semantics(raw) {
-                    emit(&mut ctx);
-                } else {
-                    let emit = lookup_cp1_semantics(raw).expect("checked above");
-                    emit(&mut ctx, fr_mode);
+                // A real NOP (`raw == 0`, i.e. `SLL $0,$0,0`) has no
+                // architectural effect at all — `emit_sll` would still emit
+                // a real read/shift/sextend under this crate's opt_level=none
+                // (see try_emit_fused_nop_slot's doc comment on why that
+                // matters), all of it dead since emit_write_gpr already skips
+                // the store for rd==0. Skip the dispatch entirely outside
+                // jitv2_lockstep/developer, which still need the real
+                // dispatch above (emit_lockstep_step's bracketing) to run for
+                // per-instruction verification/tracing to mean anything.
+                #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+                let skip_nop_dispatch = false;
+                #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+                let skip_nop_dispatch = raw == 0;
+                if !skip_nop_dispatch {
+                    if let Some(emit) = lookup_semantics(raw) {
+                        emit(&mut ctx);
+                    } else {
+                        let emit = lookup_cp1_semantics(raw).expect("checked above");
+                        emit(&mut ctx, fr_mode);
+                    }
                 }
 
                 // region_ending: emit_lockstep_compare_seq does nothing useful
@@ -4215,12 +4230,22 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     #[cfg(feature = "jitv2_lockstep")]
     emit_lockstep_step(ctx, true);
 
-    if let Some(emit) = lookup_semantics(slot_raw) {
-        emit(ctx);
-    } else {
-        let emit = lookup_cp1_semantics(slot_raw)
-            .expect("slot instruction must have a semantics emitter (checked in compile_region)");
-        emit(ctx, fr_mode);
+    // slot_raw == 0 only reaches here under jitv2_lockstep/developer (the
+    // try_emit_fused_nop_slot fast path in emit_branch_or_jump/emit_regjump
+    // already intercepts a NOP slot everywhere else) — same dead-dispatch
+    // skip as the head-instruction loop above, gated the same way.
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    let skip_nop_dispatch = false;
+    #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+    let skip_nop_dispatch = slot_raw == 0;
+    if !skip_nop_dispatch {
+        if let Some(emit) = lookup_semantics(slot_raw) {
+            emit(ctx);
+        } else {
+            let emit = lookup_cp1_semantics(slot_raw)
+                .expect("slot instruction must have a semantics emitter (checked in compile_region)");
+            emit(ctx, fr_mode);
+        }
     }
 
     // Compare before the pc/bd restore below overwrites the fields the
