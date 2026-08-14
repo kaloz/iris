@@ -5111,8 +5111,15 @@ impl BusDevice for Rex3 {
         dlog_dev!(LogModule::Rex3, "REX3 Write8: Offset {:04x} Val {:02x}", offset, val);
 
         if is_dcb {
-            dlog_dev!(LogModule::Dcb, "DCB Write8: Offset {:04x} Val {:02x} -> dcb_write({:08x})", offset, val, val as u32);
-            self.dcb_write((val as u32) << ((offset & 3) << 3));
+            // DCBDATA0/1 is a fixed-address, auto-incrementing DCB port, not a
+            // byte-addressable register: the DCB protocol left-justifies any
+            // narrower-than-32-bit CPU store into the MSB of the transferred
+            // word, regardless of which low address bits the CPU used to
+            // issue the access. Shifting by the offset instead of the fixed
+            // access width mis-frames every 8-bit CMAP/XMAP/RAMDAC/VC2 write
+            // whose address isn't already MSB-aligned.
+            dlog_dev!(LogModule::Dcb, "DCB Write8: Offset {:04x} Val {:02x} -> dcb_write({:08x})", offset, val, (val as u32) << 24);
+            self.dcb_write((val as u32) << 24);
             return BUS_OK;
         }
         eprintln!("REX3 Write8: unhandled offset {:04x} val {:02x}", offset, val);
@@ -5145,8 +5152,10 @@ impl BusDevice for Rex3 {
         dlog_dev!(LogModule::Rex3, "REX3 Write16: Offset {:04x} Val {:04x}", offset, val);
 
         if is_dcb {
-            dlog_dev!(LogModule::Dcb, "DCB Write16: Offset {:04x} Val {:04x} -> dcb_write({:08x})", offset, val, (val as u32) << ((offset & 2) << 3));
-            self.dcb_write((val as u32) << ((offset & 2) << 3));
+            // Same fixed-address DCB port framing as write8() above: a 16-bit
+            // CPU store always occupies the top half of the DCB word.
+            dlog_dev!(LogModule::Dcb, "DCB Write16: Offset {:04x} Val {:04x} -> dcb_write({:08x})", offset, val, (val as u32) << 16);
+            self.dcb_write((val as u32) << 16);
             return BUS_OK;
         }
         eprintln!("REX3 Write16: unhandled offset {:04x} val {:04x}", offset, val);
