@@ -471,6 +471,43 @@ mod tests {
         Some(CoreSnapshot::capture(&exec.core))
     }
 
+    /// Same as `run_jit_page`, but also returns `core.hot.cycles` (not part
+    /// of `CoreSnapshot` — see its doc comment) for tests that specifically
+    /// need to check the cycle count, e.g. `try_emit_fused_nop_slot`'s
+    /// branch+NOP fusion (`codegen.rs`), which must still advance `cycles`
+    /// by exactly 2 per fused pair even though it skips the slot's normal
+    /// per-instruction dispatch.
+    fn run_jit_page_with_cycles(page: &[(u16, u32)], gpr: [u64; 32], pc: u64, entry_word: u16, max_instrs: usize, mem_init: &[(u64, u32)]) -> Option<(CoreSnapshot, u64)> {
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in page {
+            page_words[word as usize] = raw;
+        }
+
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, page_base, max_instrs);
+        assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
+        let mut instrs_owned = *walked;
+
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, false)?;
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(word, raw) in page {
+            mem.set_word(page_base as u64 + (word as u64) * 4, raw);
+            mem.set_word(phys_base + (word as u64) * 4, raw);
+        }
+        for &(addr, val) in mem_init { mem.set_word(addr, val); }
+        exec.install_jit_hooks();
+
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+
+        Some((CoreSnapshot::capture(&exec.core), exec.core.hot.cycles))
+    }
+
     /// Multi-page, `step()`-driven equivalence harness. Unlike `run_jit_page`
     /// (one pre-compiled single-page region), this loads instructions at
     /// arbitrary virtual addresses spanning several physical pages and drives
@@ -2064,6 +2101,27 @@ mod tests {
         assert_eq!(jit.gpr[5], 1, "slot must execute");
     }
 
+    /// `try_emit_fused_nop_slot` (codegen.rs): a real NOP (`raw == 0`) in a
+    /// J/JAL's delay slot must skip the full `emit_slot_semantics`
+    /// bracketing entirely (only outside `jitv2_lockstep`/`developer`, where
+    /// the fast path is disabled — see that function's doc comment) while
+    /// still landing on the right target and advancing `core.hot.cycles` by
+    /// exactly 2 (branch + slot), matching the interpreter's own
+    /// `exec_j_nop`-style fusion cycle count for the same pair.
+    #[test]
+    fn j_with_nop_slot_fuses_and_still_advances_cycles_by_two() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = vec![(0u16, make_j(crate::mips_isa::OP_J, 7)), (1, 0)]; // word 1: real NOP
+        let (jit, cycles) = run_jit_page_with_cycles(&page, [0u64; 32], pc, 0, 1, &[])
+            .expect("J+NOP region must compile");
+        let expected_target = (pc & 0xFFFF_FFFF_F000_0000) | (7 * 4);
+        assert_eq!(jit.pc, expected_target, "J's target must still be correct with a fused NOP slot");
+        #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+        assert_eq!(cycles, 2, "fused branch+NOP pair must still advance cycles by exactly 2");
+        #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+        assert_eq!(cycles, 2, "unfused branch+NOP pair (lockstep/developer) must also advance cycles by exactly 2");
+    }
+
     /// Regression test: `exec_decoded`'s JIT dispatch gate probes a PC for
     /// compilation when `core.jit_trigger` is set (or it's word-offset 4, or
     /// already published) — set by the interpreter's own
@@ -2596,6 +2654,21 @@ mod tests {
             .expect("JR region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute");
         assert_eq!(jit.pc, gpr[1], "pc must be the register's own value, unmodified");
+    }
+
+    /// Same fusion coverage as `j_with_nop_slot_fuses_and_still_advances_cycles_by_two`,
+    /// for the `emit_regjump` call site (JR's own top-level slot, not the
+    /// nested-branch-in-slot path).
+    #[test]
+    fn jr_with_nop_slot_fuses_and_still_advances_cycles_by_two() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_5000;
+        let page = vec![(0u16, make_r(crate::mips_isa::OP_SPECIAL, 1, 0, 0, 0, crate::mips_isa::FUNCT_JR)), (1, 0)]; // word 1: real NOP
+        let (jit, cycles) = run_jit_page_with_cycles(&page, gpr, pc, 0, 1, &[])
+            .expect("JR+NOP region must compile");
+        assert_eq!(jit.pc, gpr[1], "pc must be the register's own value, unmodified, with a fused NOP slot");
+        assert_eq!(cycles, 2, "fused branch+NOP pair must still advance cycles by exactly 2");
     }
 
     // ---- Branches and jumps at the 0xFFC page boundary ------

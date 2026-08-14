@@ -3282,22 +3282,24 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
     }
 
     let slot_raw = instrs[slot_word as usize].raw;
-    // Recurse into the slot's own emission with ctx.raw/ctx.word switched to
-    // the slot's — restored after, mirroring emit_slot_semantics' own
-    // core.pc save/restore around the same call.
-    ctx.raw = slot_raw;
-    ctx.word = slot_word;
-    let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode, target_addr);
-    ctx.raw = raw;
-    ctx.word = word;
-    if slot_terminated {
-        // A nested branch/regjump in this slot already exited (wrote its
-        // own final core.pc and returned) — this RegJump's own target
-        // (read from a register *before* the slot ran, per exec_jr/
-        // exec_jalr's ordering) never takes effect; the nested transfer
-        // superseded it, exactly like real hardware's "innermost dispatched
-        // branch_delay wins" nested-delay-slot semantics.
-        return;
+    if !try_emit_fused_nop_slot(ctx, slot_raw) {
+        // Recurse into the slot's own emission with ctx.raw/ctx.word switched
+        // to the slot's — restored after, mirroring emit_slot_semantics' own
+        // core.pc save/restore around the same call.
+        ctx.raw = slot_raw;
+        ctx.word = slot_word;
+        let slot_terminated = emit_slot_semantics(ctx, instrs, fr_mode, target_addr);
+        ctx.raw = raw;
+        ctx.word = word;
+        if slot_terminated {
+            // A nested branch/regjump in this slot already exited (wrote its
+            // own final core.pc and returned) — this RegJump's own target
+            // (read from a register *before* the slot ran, per exec_jr/
+            // exec_jalr's ordering) never takes effect; the nested transfer
+            // superseded it, exactly like real hardware's "innermost
+            // dispatched branch_delay wins" nested-delay-slot semantics.
+            return;
+        }
     }
 
     emit_runtime_pc_exit(ctx, target_addr);
@@ -3770,6 +3772,9 @@ fn emit_branch_or_jump(
     // likewise arms the slot's target before the branch's own commit,
     // using whichever destination the condition resolved to).
     let emit_slot = |ctx: &mut EmitCtx, target: Value| -> bool {
+        if try_emit_fused_nop_slot(ctx, slot_raw) {
+            return false;
+        }
         ctx.raw = slot_raw;
         ctx.word = slot_word;
         let terminated = emit_slot_semantics(ctx, instrs, fr_mode, target);
@@ -4059,6 +4064,57 @@ fn emit_target_edge(
 /// emit its own condition-test/exit-wiring after this call would trigger
 /// whenever the slot itself branches, since nothing in this module used to
 /// need a slot to ever end the block early.
+/// Fast path for the single most common delay slot in practice: a real NOP
+/// (`raw == 0`, i.e. `SLL $0,$0,0`) — compiler-inserted after nearly every
+/// branch/jump that doesn't have useful slot-fill work. Mirrors the
+/// interpreter's own `exec_jr_nop`/`exec_j_nop`/`exec_beq_nop`/etc. fusion
+/// (mips_exec.rs): skip the slot dispatch entirely — no `in_delay_slot`
+/// flag, no `core.pc` save/store/restore, no BD bookkeeping, no dev-trace/bp
+/// hook — since a NOP has no architectural effect and (being `raw == 0`) can
+/// never itself be a nested branch/jump/regjump, never raises an exception,
+/// and is never worth single-stepping to. Only `emit_increment_cycles` runs
+/// here, once more, to keep `core.hot.cycles` advancing by one per retired
+/// instruction — the branch/jump itself already got its own increment from
+/// `compile_region`'s per-head-instruction loop (line ~1110) before this
+/// runs, so this call accounts for the fused slot only, giving the pair a
+/// combined +2 without this function double-counting the branch's own +1.
+///
+/// This compiled unit's `opt_level = "none"` (see
+/// `rules/jit/cranelift-opt-levelnone-is-the-right-trade-for-throughput-jits.md`)
+/// means none of `emit_slot_semantics`' bracketing IR would otherwise be
+/// eliminated even though a NOP's own semantics emitter (`emit_sll` with
+/// `rd == 0`, skipped by `emit_write_gpr`) is already free — every load/
+/// store in the bracketing becomes real native code, so skipping it here is
+/// a real, not just theoretical, win.
+///
+/// Excluded under `jitv2_lockstep` (needs the slot individually
+/// step-bracketed to compare against the interpreter reference) and
+/// `developer` (needs the slot individually addressable for `dt`
+/// tracing/breakpoints) — both fall back to the full `emit_slot_semantics`
+/// path unconditionally, matching every other verification/tracing
+/// exclusion in this module.
+///
+/// Returns `true` if fused (caller must skip calling `emit_slot_semantics`
+/// at all — there is no block-terminating case here, unlike that function,
+/// so callers don't need to check for early-return the way they do for its
+/// `bool` result), `false` if the slot needs the normal path.
+#[cfg_attr(any(feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
+fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, slot_raw: u32) -> bool {
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    {
+        let _ = slot_raw;
+        false
+    }
+    #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+    {
+        if slot_raw != 0 {
+            return false;
+        }
+        emit_increment_cycles(ctx);
+        true
+    }
+}
+
 fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], fr_mode: FrMode, delay_slot_target: Value) -> bool {
     let slot_raw = ctx.raw;
     let slot_word = ctx.word;
